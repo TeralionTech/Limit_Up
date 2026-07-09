@@ -1,0 +1,347 @@
+"""Runner — 把 filter.py 主流程包成 background thread，讓 FastAPI/APScheduler 觸發。
+
+單一 process 內只有 1 個 Runner instance (single-instance guard)。
+外部 (API endpoint) 透過 runner 讀 state / progress / holdings。
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Dict, Optional
+
+from config import Config, load_config
+
+logger = logging.getLogger(__name__)
+
+
+class Phase(str, Enum):
+    IDLE = "idle"                    # 未啟動
+    LOGIN = "login"                  # 登入中
+    FETCH_UNIVERSE = "fetch_universe"  # 抓股票母體
+    FETCH_LIMIT_UPS = "fetch_limit_ups"  # 抓漲停價
+    SUBSCRIBE = "subscribe"          # 訂閱 WS
+    FILTERING = "filtering"          # 8:30-9:00 篩選
+    LIVE_SUBSCRIBE = "live_subscribe"  # 常駐收 tick (SKIP_TRADER=true or 9:00 後才啟動)
+    TRADING = "trading"              # 9:00-13:24 交易 (SKIP_TRADER=false)
+    FINISHED = "finished"            # 收盤結束
+    ERROR = "error"                  # 出錯
+
+
+class Runner:
+    """單一 process 常駐 runner。API 透過 shared state 讀 progress/state。"""
+
+    _instance: Optional["Runner"] = None
+    _instance_lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "Runner":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = Runner()
+            return cls._instance
+
+    def __init__(self):
+        self.cfg: Optional[Config] = None
+        self.phase: Phase = Phase.IDLE
+        self.error_msg: str = ""
+
+        # 主流程 handles
+        self.sdk = None
+        self.universe: list = []
+        self.limit_ups: Dict[str, float] = {}
+        self.state = None                # state.State
+        self.subscriber = None
+        self.trader = None
+        self.recorder = None
+        self.order_client = None
+
+        # Progress tracking
+        self._limit_up_progress: Dict[str, int] = {"done": 0, "total": 0, "ok": 0, "fail": 0}
+        self._started_at: Optional[datetime] = None
+        # API runtime 調參 (例 first_trade_min_lots) — 蓋過 .env，重啟 runner 也保留
+        self._param_overrides: Dict[str, object] = {}
+
+        # 執行 thread
+        self._main_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    # ─── 對外 API ────────────────────────────────────────────
+
+    def start(self) -> bool:
+        """啟動主流程 background thread。回 True = 已啟動 / False = 已在跑."""
+        if self._main_thread and self._main_thread.is_alive():
+            logger.warning("[runner] 已在跑，忽略 start()")
+            return False
+        self._stop_event.clear()
+        self.phase = Phase.IDLE
+        self.error_msg = ""
+        self._started_at = datetime.now()
+        self._main_thread = threading.Thread(target=self._main, name="runner-main", daemon=True)
+        self._main_thread.start()
+        logger.info("[runner] main thread started")
+        return True
+
+    def stop(self):
+        """通知主流程停止 + 平倉 (若已進 trading 階段)."""
+        logger.info("[runner] stop() 被呼叫")
+        self._stop_event.set()
+        # 各元件單獨 stop (順序: trader → subscriber → recorder → order_client)
+        if self.trader:
+            try:
+                self.trader.stop(do_final_close=True)
+            except Exception as e:
+                logger.warning(f"[runner] trader.stop 例外: {e}")
+        if self.subscriber:
+            try:
+                self.subscriber.stop()
+            except Exception as e:
+                logger.warning(f"[runner] subscriber.stop 例外: {e}")
+        if self.recorder:
+            try:
+                self.recorder.close()
+            except Exception:
+                pass
+        if self.order_client:
+            try:
+                self.order_client.close()
+            except Exception:
+                pass
+
+    def is_running(self) -> bool:
+        return self._main_thread is not None and self._main_thread.is_alive()
+
+    def set_param_override(self, key: str, value):
+        """API runtime 調參 — 立即生效 (cfg 是 trader 共用的同一物件)。"""
+        self._param_overrides[key] = value
+        if self.cfg is not None:
+            setattr(self.cfg, key, value)
+        logger.info(f"[runner] param override: {key} = {value}")
+
+    def get_status(self) -> dict:
+        """給 API /api/status 用的整體狀態 snapshot."""
+        stats = self.state.stats() if self.state else {}
+        return {
+            "phase": self.phase.value,
+            "is_running": self.is_running(),
+            "started_at": self._started_at.isoformat() if self._started_at else None,
+            "now": datetime.now().isoformat(timespec="seconds"),
+            "error": self.error_msg,
+            "limit_up_progress": dict(self._limit_up_progress),
+            "universe_size": len(self.universe),
+            "filter_stats": stats,
+            "watchlist_size": len([1 for s in (self.state.marked if self.state else set())]),
+            "recorder_tick_count": self.recorder.count() if self.recorder else 0,
+        }
+
+    # ─── 主流程 ─────────────────────────────────────────────
+
+    def _main(self):
+        """runner main — 從 login 到 trading 收盤."""
+        try:
+            self._run_all_phases()
+        except Exception as e:
+            logger.exception(f"[runner] 主流程例外: {e}")
+            self.phase = Phase.ERROR
+            self.error_msg = str(e)
+
+    def _run_all_phases(self):
+        # 讀 config + 套 API runtime overrides
+        self.cfg = load_config()
+        for k, v in self._param_overrides.items():
+            setattr(self.cfg, k, v)
+
+        # Phase 1: Login
+        self.phase = Phase.LOGIN
+        from filter import login_fubon
+        self.sdk, _ = login_fubon(self.cfg)
+
+        # Phase 2: Universe
+        self.phase = Phase.FETCH_UNIVERSE
+        from universe import get_universe, fetch_limit_ups
+        self.universe = get_universe(self.sdk, self.cfg.universe)
+        if not self.universe:
+            raise RuntimeError("universe 空")
+
+        # Phase 3: Limit ups (慢 — 12-15 分鐘) — 有當日 cache 就秒讀
+        self.phase = Phase.FETCH_LIMIT_UPS
+        self._limit_up_progress = {"done": 0, "total": len(self.universe), "ok": 0, "fail": 0}
+        self.limit_ups = self._load_or_fetch_limit_ups()
+        if not self.limit_ups:
+            raise RuntimeError("limit_ups 全 fail")
+
+        # Phase 4: Subscribe
+        self.phase = Phase.SUBSCRIBE
+        from state import State
+        from recorder import TickRecorder
+        from subscriber import Subscriber
+        self.state = State(bid_drop_ratio=self.cfg.bid_drop_ratio)
+        output_dir = Path(__file__).parent / "output"
+        output_dir.mkdir(exist_ok=True)
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.recorder = TickRecorder(output_dir / f"{today}_ticks.jsonl")
+
+        from filter import make_on_book_handler
+        unsub_ref = {"fn": None}
+        on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
+
+        self.subscriber = Subscriber(
+            sdk=self.sdk,
+            universe=[s for s in self.universe if s in self.limit_ups],
+            on_book=on_book,
+            login_cfg=self.cfg,
+            recorder=self.recorder,
+            batch_size=self.cfg.batch_size,
+            batch_rotate_sec=self.cfg.batch_rotate_sec,
+            socket_count=self.cfg.socket_count,
+            debug=self.cfg.debug,
+        )
+        self.subscriber.start()
+        unsub_ref["fn"] = self.subscriber.request_unsubscribe   # unmark 淘汰 → 立即退訂
+
+        # Phase 5: 篩選 (8:30-9:00)
+        # 若現在時間 >= END_TIME (例: 9:00 後手動啟動)，wait_until_end_time 內部
+        # 會 log warning 立即 return，不阻塞。
+        self.phase = Phase.FILTERING
+        from filter import wait_until_end_time, write_output
+        wait_until_end_time(self.state, self.cfg)
+        write_output(self.state, self.cfg)
+
+        watchlist = [row["symbol"] for row in self.state.snapshot()]
+        logger.info(f"[runner] 篩選階段結束，watchlist {len(watchlist)} 檔")
+
+        # 9:00 轉場: 只留 marked 股票 — 其餘全退訂，watchlist 加訂 trades
+        if watchlist:
+            self.subscriber.keep_only(watchlist)
+            self.subscriber.subscribe_trades_for(watchlist)
+        else:
+            logger.warning("[runner] watchlist 空 — 不退訂 (留全母體訂閱供查詢)")
+
+        # ── 分岔: SKIP_TRADER 決定進 LIVE_SUBSCRIBE 或 TRADING ──
+
+        if self.cfg.skip_trader:
+            logger.info("[runner] SKIP_TRADER=true → 進 LIVE_SUBSCRIBE (subscriber 常駐收 tick，"
+                        "不下單。第二個分頁可查任何股票 tick)")
+            self.phase = Phase.LIVE_SUBSCRIBE
+            self._live_subscribe_loop()
+            # 收盤 / user 手動 stop 都會跳出
+            self.subscriber.stop()
+            self.recorder.close()
+            self.phase = Phase.FINISHED
+            logger.info("[runner] LIVE_SUBSCRIBE 結束")
+            return
+
+        if not watchlist:
+            logger.info("[runner] 篩選結果空 + SKIP_TRADER=false → 直接 finished")
+            self.subscriber.stop()
+            self.recorder.close()
+            self.phase = Phase.FINISHED
+            return
+
+        # Phase 6: Trading (9:00-13:24) — 純監控，不下單
+        self.phase = Phase.TRADING
+        from trader import Trader
+        self.trader = Trader(
+            watchlist=watchlist,
+            limit_ups=self.limit_ups,
+            cfg=self.cfg,
+            recorder=self.recorder,
+            state=self.state,                                   # 第一盤淘汰同步 unmark
+            unsub_fn=self.subscriber.request_unsubscribe,       # + 退訂
+        )
+        # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
+        self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
+        self.trader.start()
+
+        from filter import _wait_until
+        _wait_until(self.cfg.trading_end_time, self.trader, self.cfg)
+
+        # Phase 7: 收盤
+        self.trader.stop()
+        self.subscriber.stop()
+        self.recorder.close()
+        self.phase = Phase.FINISHED
+        logger.info("[runner] 收盤結束")
+
+    def _live_subscribe_loop(self):
+        """LIVE_SUBSCRIBE — 保持 subscriber 常駐，直到 stop event 或 TRADING_END_TIME.
+        subscriber 內部 rotation loop 會持續跑 (每 30s 換一批 subscribe)，這裡只是
+        主 thread 停在這裡等 stop signal，避免 runner main thread 結束把 subscriber 一起收掉。
+        """
+        from datetime import time as _time
+        import time as _t
+        # 直到 TRADING_END_TIME (預設 13:24) 或 stop event
+        end_hh, end_mm, end_ss = map(int, self.cfg.trading_end_time.split(":"))
+        end_target = _time(end_hh, end_mm, end_ss)
+        last_log = 0
+        while not self._stop_event.is_set():
+            now = datetime.now().time()
+            if now >= end_target:
+                logger.info(f"[runner] TRADING_END_TIME {self.cfg.trading_end_time} 到 — LIVE_SUBSCRIBE 結束")
+                return
+            # 每 60s 印一次 heartbeat (跟 subscriber heartbeat 分開，更 high-level)
+            if _t.time() - last_log >= 60:
+                stats = self.subscriber.get_tick_stats() if self.subscriber else {}
+                logger.info(f"[runner LIVE] tick 累計 books={stats.get('books_count',0)} "
+                            f"trades={stats.get('trades_count',0)}")
+                last_log = _t.time()
+            self._stop_event.wait(1)
+
+    def _load_or_fetch_limit_ups(self) -> Dict[str, float]:
+        """有當日 cache → 秒讀，否則抓完寫 cache. cache path = output/YYYY-MM-DD_limit_ups.json"""
+        import json as _json
+        output_dir = Path(__file__).parent / "output"
+        output_dir.mkdir(exist_ok=True)
+        today = datetime.now().strftime("%Y-%m-%d")
+        cache_file = output_dir / f"{today}_limit_ups.json"
+
+        # 讀 cache
+        if cache_file.exists():
+            try:
+                with cache_file.open(encoding="utf-8") as f:
+                    cached = _json.load(f)
+                if isinstance(cached, dict) and len(cached) > 0:
+                    logger.info(f"[runner] 讀 cache limit_ups: {cache_file.name} "
+                                f"({len(cached)} 檔) — 跳過 REST 抓取")
+                    self._limit_up_progress = {
+                        "done": len(cached), "total": len(cached),
+                        "ok": len(cached), "fail": 0,
+                    }
+                    return {k: float(v) for k, v in cached.items()}
+            except Exception as e:
+                logger.warning(f"[runner] cache 讀失敗 ({e})，改走 REST 重抓")
+
+        # cache miss → 抓 + 存
+        logger.info(f"[runner] 無當日 cache，開始抓 {len(self.universe)} 檔漲停價 (12-15 分鐘)...")
+        result = self._fetch_limit_ups_with_progress()
+
+        if result:
+            try:
+                with cache_file.open("w", encoding="utf-8") as f:
+                    _json.dump(result, f, ensure_ascii=False, indent=2)
+                logger.info(f"[runner] cache 已寫 {cache_file.name} ({len(result)} 檔)")
+            except Exception as e:
+                logger.warning(f"[runner] cache 寫失敗: {e}")
+        return result
+
+    def _fetch_limit_ups_with_progress(self) -> Dict[str, float]:
+        """跟 universe.fetch_limit_ups 一樣但更新 progress 讓 API 讀."""
+        stock = self.sdk.marketdata.rest_client.stock
+        result: Dict[str, float] = {}
+        for i, sym in enumerate(self.universe, 1):
+            if self._stop_event.is_set():
+                break
+            try:
+                resp = stock.intraday.ticker(symbol=sym)
+                up = resp.get("limitUpPrice") or resp.get("limit_up")
+                if up:
+                    result[sym] = float(up)
+                    self._limit_up_progress["ok"] += 1
+                else:
+                    self._limit_up_progress["fail"] += 1
+            except Exception:
+                self._limit_up_progress["fail"] += 1
+            self._limit_up_progress["done"] = i
+        return result
