@@ -1,0 +1,17 @@
+[Unit]
+Description=Hit Limit Up - Limit-up monitoring system (port 8100)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=teralion1
+WorkingDirectory=/opt/hit_limit_up/repo/hit_limit_up
+ExecStart=/opt/hit_limit_up/venv/bin/python server.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# log 走 journald: journalctl -u hit-limit-up -f
+
+[Install]
+WantedBy=multi-user.target
