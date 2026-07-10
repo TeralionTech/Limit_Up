@@ -19,11 +19,6 @@ class Config:
     password: str
     pfx_path: str
     pfx_password: str
-    # 富邦副帳號 (選填 — 用來多開 sockets 監控更多股票，等同「借另一個人的帳號」)
-    account_id_2: str = ""
-    password_2: str = ""
-    pfx_path_2: str = ""
-    pfx_password_2: str = ""
     # 監控範圍
     universe: str          # "twse" / "tpex" / "twse+tpex"
     batch_size: int        # 每批訂閱檔數 (每 socket 上限 200)
@@ -41,6 +36,12 @@ class Config:
     bid_decline_minutes: int  # 連續遞減幾分鐘 = discard
     bid_decline_sample_sec: int  # 每 N 秒抓一次 bid 五檔總量 sample
     skip_trader: bool      # true → 篩選完不進 trader，改成常駐收 tick (LIVE_SUBSCRIBE)
+    # 富邦副帳號 (選填 — 多開 sockets 監控更多股票)
+    # dataclass 規則: 有預設值的欄位必須放最後
+    account_id_2: str = ""
+    password_2: str = ""
+    pfx_path_2: str = ""
+    pfx_password_2: str = ""
 
 
 def load_config() -> Config:

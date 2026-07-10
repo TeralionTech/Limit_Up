@@ -122,7 +122,8 @@ info "安裝 systemd unit (User=$(whoami))..."
 sed "s/^User=.*/User=$(whoami)/" $APP_DIR/deploy/hit-limit-up.service | \
     $SUDO tee /etc/systemd/system/hit-limit-up.service >/dev/null
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now hit-limit-up
+$SUDO systemctl enable hit-limit-up
+$SUDO systemctl restart hit-limit-up   # 更新部署也要生效，一律 restart
 sleep 2
 $SUDO systemctl status hit-limit-up --no-pager -l | head -12
 
