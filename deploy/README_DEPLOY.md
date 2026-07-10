@@ -1,4 +1,4 @@
-# hit_limit_up 部署到 teralion1 VPS
+# hit_limit_up 部署到 VPS (root@45.76.222.150)
 
 目標: `https://limitup.teraliontech.com` (與 day_trade_system 同機、同一個 cloudflare tunnel 不同 hostname)
 
@@ -12,22 +12,22 @@
 
 ```powershell
 # 建目錄
-ssh teralion1 "mkdir -p /opt/hit_limit_up/secrets /opt/hit_limit_up/certs /opt/hit_limit_up/wheels /opt/hit_limit_up/dist_upload"
-# 若 /opt/hit_limit_up 不存在會失敗 → 先: ssh teralion1 "sudo mkdir -p /opt/hit_limit_up && sudo chown \$USER /opt/hit_limit_up"
+ssh root@45.76.222.150 "mkdir -p /opt/hit_limit_up/secrets /opt/hit_limit_up/certs /opt/hit_limit_up/wheels /opt/hit_limit_up/dist_upload"
+# 若 /opt/hit_limit_up 不存在會失敗 → 先: ssh root@45.76.222.150 "sudo mkdir -p /opt/hit_limit_up && sudo chown \$USER /opt/hit_limit_up"
 
 # 1. .env (上傳後記得改 PFX 路徑，見下)
-scp .env teralion1:/opt/hit_limit_up/secrets/.env
+scp .env root@45.76.222.150:/opt/hit_limit_up/secrets/.env
 
 # 2. 兩帳號 PFX 憑證
-scp O100596041.pfx teralion1:/opt/hit_limit_up/certs/
-scp <副帳號.pfx>   teralion1:/opt/hit_limit_up/certs/
+scp O100596041.pfx root@45.76.222.150:/opt/hit_limit_up/certs/
+scp <副帳號.pfx>   root@45.76.222.150:/opt/hit_limit_up/certs/
 
 # 3. fubon_neo manylinux whl
-scp <path-to>\fubon_neo-*-manylinux*.whl teralion1:/opt/hit_limit_up/wheels/
+scp <path-to>\fubon_neo-*-manylinux*.whl root@45.76.222.150:/opt/hit_limit_up/wheels/
 
 # 4. 前端 dist (VPS 沒 node 才需要；先本機 build)
 cd frontend; npm run build; cd ..
-scp -r frontend/dist/* teralion1:/opt/hit_limit_up/dist_upload/
+scp -r frontend/dist/* root@45.76.222.150:/opt/hit_limit_up/dist_upload/
 ```
 
 ### 改 `.env` (SSH 進去改，或上傳前先改)
@@ -43,10 +43,10 @@ SKIP_TRADER=false        # trader 已是純監控 (不下單)，開了才有模�
 ## Step 2 — VPS 端: 跑 deploy script
 
 ```bash
-ssh teralion1
+ssh root@45.76.222.150
 # 第一次: 先拿 script (repo 還沒 clone)
 curl -fsSL https://raw.githubusercontent.com/TeralionTech/twse_day_trade/limit_up/hit_limit_up/deploy/deploy_vps.sh -o /tmp/deploy_vps.sh
-# (private repo curl 拿不到的話: 本機 scp deploy/deploy_vps.sh teralion1:/tmp/)
+# (private repo curl 拿不到的話: 本機 scp deploy/deploy_vps.sh root@45.76.222.150:/tmp/)
 chmod +x /tmp/deploy_vps.sh
 /tmp/deploy_vps.sh
 ```

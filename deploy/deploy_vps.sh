@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hit_limit_up VPS 部署 script — 在 teralion1 VPS 上執行
+# hit_limit_up VPS 部署 script — 在 VPS (root@45.76.222.150) 上執行
 #
 # 用法:
 #   ./deploy_vps.sh [fubon_neo_whl路徑]
@@ -23,13 +23,17 @@ info()  { echo -e "\033[1;34m[deploy]\033[0m $*"; }
 warn()  { echo -e "\033[1;33m[warn]\033[0m $*"; }
 die()   { echo -e "\033[1;31m[error]\033[0m $*"; exit 1; }
 
+# root 直接跑就不用 sudo
+SUDO="sudo"
+[[ $EUID -eq 0 ]] && SUDO=""
+
 # ─── 0. 環境檢查 ─────────────────────────────────────────────
 info "檢查環境..."
 
 TZ_NOW=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)
 if [[ "$TZ_NOW" != "Asia/Taipei" ]]; then
     warn "Timezone 是 $TZ_NOW 不是 Asia/Taipei — APScheduler 8:00 cron 會跑錯時間!"
-    warn "修正: sudo timedatectl set-timezone Asia/Taipei"
+    warn "修正: $SUDO timedatectl set-timezone Asia/Taipei"
     read -rp "仍要繼續? [y/N] " ans; [[ "$ans" == "y" ]] || exit 1
 fi
 
@@ -46,8 +50,8 @@ fi
 # ─── 1. 目錄 + clone/pull ────────────────────────────────────
 if [[ ! -d $BASE ]]; then
     info "建 $BASE (需要 sudo)..."
-    sudo mkdir -p $BASE
-    sudo chown "$USER" $BASE
+    $SUDO mkdir -p $BASE
+    $SUDO chown "$USER" $BASE
 fi
 mkdir -p $BASE/secrets $BASE/certs $BASE/wheels
 
@@ -114,12 +118,13 @@ if grep -qE 'PFX_PATH=.*[A-Z]:[\\/]' $BASE/secrets/.env; then
 fi
 
 # ─── 5. systemd unit ─────────────────────────────────────────
-info "安裝 systemd unit..."
-sudo cp $APP_DIR/deploy/hit-limit-up.service /etc/systemd/system/hit-limit-up.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now hit-limit-up
+info "安裝 systemd unit (User=$(whoami))..."
+sed "s/^User=.*/User=$(whoami)/" $APP_DIR/deploy/hit-limit-up.service | \
+    $SUDO tee /etc/systemd/system/hit-limit-up.service >/dev/null
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable --now hit-limit-up
 sleep 2
-sudo systemctl status hit-limit-up --no-pager -l | head -12
+$SUDO systemctl status hit-limit-up --no-pager -l | head -12
 
 # ─── 6. 驗證 ─────────────────────────────────────────────────
 info "打 API 驗證..."
@@ -137,7 +142,7 @@ info "════ 最後一步: cloudflared 加 ingress (手動) ════"
 if [[ -f /etc/cloudflared/config.yml ]]; then
     echo "現有 /etc/cloudflared/config.yml:"
     echo "----------------------------------------"
-    sudo cat /etc/cloudflared/config.yml
+    $SUDO cat /etc/cloudflared/config.yml
     echo "----------------------------------------"
     cat <<'EOF'
 在 ingress: 列表的 catch-all (http_status:404) **之前** 插入:
@@ -147,7 +152,7 @@ if [[ -f /etc/cloudflared/config.yml ]]; then
 
 然後:
   cloudflared tunnel route dns <tunnel名或UUID> limitup.teraliontech.com
-  sudo systemctl restart cloudflared    # day_trade_system 斷線 <1 秒
+  systemctl restart cloudflared    # day_trade_system 斷線 <1 秒
 EOF
 else
     cat <<'EOF'
