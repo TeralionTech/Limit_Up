@@ -16,6 +16,9 @@ from config import Config, load_config
 
 logger = logging.getLogger(__name__)
 
+# 漲停價抓取:每趟重試之間等多久 (讓交易所繼續把當日漲停價上架)
+_LIMIT_UP_RETRY_SLEEP_SEC = 20
+
 
 class Phase(str, Enum):
     IDLE = "idle"                    # 未啟動
@@ -313,8 +316,9 @@ class Runner:
             except Exception as e:
                 logger.warning(f"[runner] cache 讀失敗 ({e})，改走 REST 重抓")
 
-        # cache miss → 抓 + 存
-        logger.info(f"[runner] 無當日 cache，開始抓 {len(self.universe)} 檔漲停價 (12-15 分鐘)...")
+        # cache miss → 抓 (含重試補齊) + 存
+        logger.info(f"[runner] 無當日 cache，開始抓 {len(self.universe)} 檔漲停價 "
+                    f"(盤前分批上架，會重試補齊到 {self.cfg.limit_up_fetch_deadline})...")
         result = self._fetch_limit_ups_with_progress()
 
         if result:
@@ -327,21 +331,82 @@ class Runner:
         return result
 
     def _fetch_limit_ups_with_progress(self) -> Dict[str, float]:
-        """跟 universe.fetch_limit_ups 一樣但更新 progress 讓 API 讀."""
+        """抓每檔當日漲停價，更新 progress 讓 API/前端讀。
+
+        兩個關鍵設計:
+        1. **節流** — 富邦日內行情 REST 限 300/min。之前一趟 1943 檔 130 秒打完 (~900/min) 撞限流，
+           配額榨乾後後段全被擋 (回空 response)，只成功 746 檔。故每次呼叫間插 sleep，
+           把速率壓到 ≤ cfg.limit_up_max_per_min (預設 250)。
+        2. **重試到截止** — 對還沒抓到的股票反覆重試 (含被限流擋掉的、盤前才上架的)，
+           直到全部補齊，或時間到 LIMIT_UP_FETCH_DEADLINE (盤前試撮 8:30 前留 buffer)。
+        """
         stock = self.sdk.marketdata.rest_client.stock
+        total = len(self.universe)
+        deadline = self._parse_time_hhmm(self.cfg.limit_up_fetch_deadline)
+        # 節流間隔: 每次呼叫後等這麼久，把速率壓在上限內
+        throttle_sec = 60.0 / max(1, self.cfg.limit_up_max_per_min)
+        logger.info(f"[runner] 漲停價抓取節流 ≤{self.cfg.limit_up_max_per_min}/min "
+                    f"(每次呼叫間隔 {throttle_sec:.3f}s)")
+
         result: Dict[str, float] = {}
-        for i, sym in enumerate(self.universe, 1):
-            if self._stop_event.is_set():
-                break
-            try:
-                resp = stock.intraday.ticker(symbol=sym)
-                up = resp.get("limitUpPrice") or resp.get("limit_up")
+        missing = list(self.universe)
+        attempt = 0
+
+        while missing and not self._stop_event.is_set():
+            attempt += 1
+            still_missing: list = []
+            for sym in missing:
+                if self._stop_event.is_set():
+                    break
+                up = self._query_limit_up(stock, sym)
                 if up:
-                    result[sym] = float(up)
-                    self._limit_up_progress["ok"] += 1
+                    result[sym] = up
                 else:
-                    self._limit_up_progress["fail"] += 1
-            except Exception:
-                self._limit_up_progress["fail"] += 1
-            self._limit_up_progress["done"] = i
+                    still_missing.append(sym)
+                # progress: done 在單趟內從 已成功數 長到 total
+                self._limit_up_progress["ok"] = len(result)
+                self._limit_up_progress["fail"] = total - len(result)
+                self._limit_up_progress["done"] = len(result) + len(still_missing)
+                # 節流 (可被 stop_event 立即中斷)
+                self._stop_event.wait(throttle_sec)
+            missing = still_missing
+            logger.info(f"[runner] 漲停價抓取 第 {attempt} 趟 — 成功 {len(result)}/{total}，"
+                        f"還缺 {len(missing)}")
+
+            if not missing or self._stop_event.is_set():
+                break
+            # 到抓取截止時間就停止補齊 (盤前試撮前)
+            if deadline is not None and datetime.now().time() >= deadline:
+                logger.warning(f"[runner] 到抓取截止 {self.cfg.limit_up_fetch_deadline}，"
+                               f"仍缺 {len(missing)} 檔 → 停止重試 (今日監控 {len(result)} 檔)")
+                break
+            logger.info(f"[runner] {_LIMIT_UP_RETRY_SLEEP_SEC}s 後重試剩餘 {len(missing)} 檔 "
+                        f"(等交易所繼續上架漲停價)...")
+            self._stop_event.wait(_LIMIT_UP_RETRY_SLEEP_SEC)
+
+        self._limit_up_progress["done"] = total
+        self._limit_up_progress["ok"] = len(result)
+        self._limit_up_progress["fail"] = total - len(result)
         return result
+
+    def _query_limit_up(self, stock, sym: str):
+        """查單檔漲停價 — 回 float 或 None (空值/例外都回 None，交給重試補)。"""
+        try:
+            resp = stock.intraday.ticker(symbol=sym)
+            up = resp.get("limitUpPrice") or resp.get("limit_up")
+            return float(up) if up else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_time_hhmm(s: str):
+        """'08:28' / '08:28:00' → datetime.time；格式錯回 None (不啟用截止)。"""
+        from datetime import time as _time
+        try:
+            parts = [int(x) for x in s.split(":")]
+            while len(parts) < 3:
+                parts.append(0)
+            return _time(parts[0], parts[1], parts[2])
+        except Exception:
+            logger.warning(f"[runner] LIMIT_UP_FETCH_DEADLINE 格式錯 ({s!r}) — 不啟用重試截止")
+            return None

@@ -3,8 +3,8 @@
 用法:
     python verify.py
 
-跑 3 個測試 (~30 秒)，任何一步 fail 會清楚指出問題:
-    1. Login  — 確認 4 個憑證欄位對
+跑 4 個測試 (~30 秒)，任何一步 fail 會清楚指出問題:
+    1. Login  — 主帳號 + 副帳號 (若 .env 有設) 都驗，兩者執行時都會開 socket
     2. REST  — 拿股票清單 + 對 sample 5 檔拿漲停價
     3. WS    — 訂閱 1 檔看能否連線 (盤外可能沒 tick，只驗連線)
 
@@ -29,6 +29,46 @@ def _fail(msg):  logger.error(f"✗ {msg}")
 def _info(msg):  logger.info(f"  {msg}")
 
 
+def _login_account(FubonSDK, account_id, password, pfx_path, pfx_password, label):
+    """登入單一帳號 + init_realtime。成功回 sdk instance，失敗回 None (並印原因)。
+
+    PFX 密碼空字串要傳 3 參數 (跟 Alex fubon_adapter.py:96-99 對齊)。
+    """
+    sdk = FubonSDK()
+    try:
+        if pfx_password == "":
+            accounts = sdk.login(account_id, password, pfx_path)
+        else:
+            accounts = sdk.login(account_id, password, pfx_path, pfx_password)
+    except Exception as e:
+        _fail(f"{label} login raise 例外: {e}")
+        _info("常見原因: PFX 憑證密碼錯 / 帳密錯 / 憑證過期")
+        return None
+
+    # Fubon 回 Result 物件 — 用 .is_success 判斷 (Alex 也這樣)
+    if not accounts:
+        _fail(f"{label} login 回空 — 帳密可能錯")
+        return None
+    is_success = getattr(accounts, "is_success", None)
+    if is_success is False:
+        _fail(f"{label} login is_success=False, message={getattr(accounts, 'message', '?')}")
+        return None
+
+    data = getattr(accounts, "data", None) or []
+    _ok(f"{label} Login 成功 (is_success={is_success}) — 帳戶數 {len(data)}")
+    for i, a in enumerate(data[:5]):
+        _info(f"{label} 帳戶 #{i+1}: {getattr(a, 'account', '?')} "
+              f"分行 {getattr(a, 'branch_no', '?')}")
+
+    try:
+        sdk.init_realtime()
+        _ok(f"{label} init_realtime OK")
+    except Exception as e:
+        _fail(f"{label} init_realtime 失敗: {e}")
+        return None
+    return sdk
+
+
 def main():
     # ─── 1. 讀 .env ─────────────────────────────────────
     print("\n=== [1/4] 讀 .env ===")
@@ -43,7 +83,7 @@ def main():
         _fail(f"config 錯誤: {e}")
         return 1
 
-    # ─── 2. Login ────────────────────────────────────────
+    # ─── 2. Login (主帳號 + 副帳號若有設) ────────────────
     print("\n=== [2/4] 富邦 Login ===")
     try:
         from fubon_neo.sdk import FubonSDK
@@ -51,43 +91,22 @@ def main():
         _fail("fubon_neo 未安裝 — pip install .../fubon_neo-...whl")
         return 1
 
-    sdk = FubonSDK()
-    try:
-        # PFX 密碼空字串要傳 3 參數 (跟 Alex fubon_adapter.py:96-99 對齊)
-        if cfg.pfx_password == "":
-            accounts = sdk.login(cfg.account_id, cfg.password, cfg.pfx_path)
-        else:
-            accounts = sdk.login(cfg.account_id, cfg.password,
-                                 cfg.pfx_path, cfg.pfx_password)
-    except Exception as e:
-        _fail(f"login raise 例外: {e}")
-        _info("  常見原因: PFX 憑證密碼錯 / 帳密錯 / 憑證過期")
+    # 主帳號 — 後面 REST/WS 測試都用這個 sdk
+    sdk = _login_account(FubonSDK, cfg.account_id, cfg.password,
+                         cfg.pfx_path, cfg.pfx_password, label="主帳號")
+    if sdk is None:
         return 1
 
-    # Fubon 回 Result 物件 — 用 .is_success 判斷 (Alex 也這樣)
-    if not accounts:
-        _fail("login 回空 — 帳密可能錯")
-        return 1
-    is_success = getattr(accounts, "is_success", None)
-    if is_success is False:
-        _fail(f"login is_success=False, message={getattr(accounts, 'message', '?')}")
-        return 1
-    _ok(f"Login 成功 (is_success={is_success})")
-    try:
-        data = getattr(accounts, "data", None) or []
-        _info(f"  帳戶數: {len(data)}")
-        for i, a in enumerate(data[:5]):
-            _info(f"  帳戶 #{i+1}: {getattr(a, 'account', '?')} "
-                  f"分行 {getattr(a, 'branch_no', '?')}")
-    except Exception:
-        pass
-
-    try:
-        sdk.init_realtime()
-        _ok("init_realtime OK")
-    except Exception as e:
-        _fail(f"init_realtime 失敗: {e}")
-        return 1
+    # 副帳號 (選填) — 執行時 subscriber 會用它多開 5 個 socket，一定要一起驗，
+    # 否則副帳號憑證錯也不會被發現，直到開盤 socket 開不起來、覆蓋率砍半。
+    if cfg.account_id_2:
+        sdk2 = _login_account(FubonSDK, cfg.account_id_2, cfg.password_2,
+                              cfg.pfx_path_2, cfg.pfx_password_2, label="副帳號")
+        if sdk2 is None:
+            _fail("副帳號 login 失敗 — 開盤時副帳號 5 個 socket 會開不起來 (覆蓋率砍半)")
+            return 1
+    else:
+        _info("(未設副帳號，只驗主帳號)")
 
     # ─── 3. REST — 拿股票清單 + sample 漲停價 ───────────
     print("\n=== [3/4] REST API 測試 ===")
