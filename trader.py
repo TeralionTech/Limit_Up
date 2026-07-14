@@ -47,6 +47,7 @@ class Holding:
         self.first_fail_reason = ""      # 非空 = 第一盤淘汰原因
         # 盤中追蹤
         self.pulled_reason = ""
+        self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
         self.prev_bid1_size: Optional[int] = None   # 上一個 tick 的委買一量 (tick 間比較)
         self.last_bid1_price = 0.0
         self.last_bid1_size = 0
@@ -126,9 +127,11 @@ class Trader:
         # === 盤中追蹤: 兩個撤單條件 ===
         if h.status == Holding.TRACKING:
             # 條件 1: 委買一量在兩 tick 之間減少 1/2 以上
-            if h.prev_bid1_size and bid1_size < h.prev_bid1_size * 0.5:
+            #   暖機: 第 3 筆成交後才判 — 避免開盤瞬間拿「盤前累積量」當基準造成誤撤。
+            #   (prev_bid1_size 每 tick 都更新，到第 3 筆成交時基準已是盤後即時量)
+            if h.trade_count >= 3 and h.prev_bid1_size and bid1_size < h.prev_bid1_size * 0.5:
                 self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid1_size})")
-            # 條件 2: 委買一價格不是漲停價
+            # 條件 2: 委買一價格不是漲停價 (即時判，不受暖機影響)
             elif bid1_price < h.limit_up - 0.001:
                 self._pull(h, f"price_below_limit ({bid1_price} < {h.limit_up})")
 
@@ -144,6 +147,7 @@ class Trader:
         if price <= 0:
             return
         h.last_trade_price = price
+        h.trade_count += 1               # 累計每一筆成交 (委買量減半檢查暖機用)
 
         # === 第一盤: 開盤第一筆成交 ===
         if not h.first_trade_seen:
