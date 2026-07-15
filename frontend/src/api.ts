@@ -22,6 +22,20 @@ export const api = {
   getTraderParams: () => req<{ first_trade_min_lots: number }>('/api/trader/params'),
   setTraderParams: (p: { first_trade_min_lots: number }) =>
     req<{ ok: boolean }>('/api/trader/params', { method: 'POST', body: JSON.stringify(p) }),
+  // ─── 交易 (模擬/真實) ───
+  tradingStatus: () => req<TradingStatus>('/api/trading/status'),
+  tradingConnect: (p: TradingConnectReq) =>
+    req<{ status: string }>('/api/trading/connect', { method: 'POST', body: JSON.stringify(p) }),
+  tradingDisconnect: () =>
+    req<{ ok: boolean }>('/api/trading/disconnect', { method: 'POST' }),
+  tradingMode: (mode: 'sim' | 'real') =>
+    req<{ ok: boolean }>('/api/trading/mode', { method: 'POST', body: JSON.stringify({ mode }) }),
+  tradingParams: (p: { total_budget?: number; per_symbol_budget?: number }) =>
+    req<{ ok: boolean }>('/api/trading/params', { method: 'POST', body: JSON.stringify(p) }),
+  tradingArm: (armed: boolean) =>
+    req<{ ok: boolean }>('/api/trading/arm', { method: 'POST', body: JSON.stringify({ armed }) }),
+  tradingCloseAll: () =>
+    req<{ ok: boolean; sold_symbols: number }>('/api/trading/close_all', { method: 'POST' }),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -87,8 +101,21 @@ export interface TraderSummary {
   n_pulled?: number
   n_first_failed?: number
   min_lots?: number
+  trading?: TradingStatus | null
   first_stage?: FirstStageRow[]
   tracking?: TrackingRow[]
+}
+
+// 該檔交易 state (real mode; sim 為 null)
+export interface SymbolTrade {
+  target_lots: number
+  order_no: string
+  order_kind: string       // pre_limit / market_buy / market_sell
+  order_status: string     // '' / pending / cancelled / rejected / done
+  filled_lots: number
+  avg_price: number
+  stopped_reason: string
+  exited: boolean
 }
 
 export interface FirstStageRow {
@@ -105,6 +132,7 @@ export interface FirstStageRow {
     price: number; qty: number; lots: number; ts: string
   } | null
   fail_reason: string
+  trade?: SymbolTrade | null
 }
 
 export interface TrackingRow {
@@ -117,6 +145,35 @@ export interface TrackingRow {
   ask1_size: number
   status: 'tracking' | 'pulled'
   pulled_reason: string
+  warning?: string
   last_trade_price: number
   last_book_ts: string
+  trade?: SymbolTrade | null
+}
+
+// ─── 交易 (模擬/真實) ───
+
+export interface TradingStatus {
+  mode: 'sim' | 'real'
+  armed: boolean
+  connecting: boolean
+  connect_error: string
+  connected: boolean
+  healthy: boolean
+  account_masked: string
+  is_test: boolean
+  error: string
+  params: { total_budget: number; per_symbol_budget: number }
+  budget_used: number
+  n_symbols: number
+  n_positions: number
+}
+
+export interface TradingConnectReq {
+  account_id: string
+  password: string
+  pfx_password?: string
+  is_test?: boolean
+  pfx_b64: string
+  pfx_filename?: string
 }

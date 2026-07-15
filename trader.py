@@ -1,20 +1,25 @@
-"""Trader — 9:00 開盤後模擬監控 (做多)。
+"""Trader — 9:00 開盤後監控 (做多);session 為 real+armed 時同步掛真單。
 
-兩階段 (對應前端模擬執行頁兩區塊):
+兩階段 (對應前端模擬/真實執行頁兩區塊):
 
   第一盤檢查 (block 1) — 每檔 watchlist 股票收「開盤第一筆」:
-    - 首筆 books: 委賣一出現單子 → unmark 丟棄 (+ 退訂)
-    - 首筆 trades: 成交量 < first_trade_min_lots 張 (前端可調) → unmark 丟棄 (+ 退訂)
+    - 首筆 books: 委賣一出現單子 → unmark 丟棄 (+ 退訂 + 撤委託)
+    - 首筆 trades: 成交量 < first_trade_min_lots 張 (前端可調) → unmark 丟棄 (+ 退訂 + 撤委託)
     - 兩者都通過 → 進入盤中追蹤 (status=tracking)
+      [real] 首筆成交到達時: 預掛單未(全)成交 → 撤剩餘留已成交;通過檢查 → 市價單追差額
 
   盤中追蹤 (block 2) — 通過第一盤的標的:
     - 顯示 委買一價 / 委買一量
     - 狀態 "追蹤" → "撤單" 條件 (單一):
         委買一量在兩個 tick 之間減少 1/2 以上 (第 3 筆成交後才開始判)
       (原「委買一價格不是漲停價」條件已移除 — 盤中市價單佔五檔第一列且 price=0 會誤判)
+      [real] 撤單同步撤掉該檔 pending 委託
+    - [real] 任一檔委賣出現 → 立刻出場 (撤委託 + 市價賣出全部已成交)
+    - 警示 (不動作): 委買一量每 BID_DECLINE_SAMPLE_SEC 取樣,
+      連續 BID_DECLINE_MINUTES 分鐘遞減 → warning 顯示於前端
     - 撤單後**持續收資料** (不退訂，狀態停在撤單)
 
-純監控 — 不下單 (含模擬單也不下)。
+session=None (模擬模式) = 純監控,零下單 — 行為與加入交易功能前完全相同。
 """
 from __future__ import annotations
 
@@ -49,6 +54,11 @@ class Holding:
         self.pulled_reason = ""
         self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
         self.prev_bid1_size: Optional[int] = None   # 上一個 tick 的委買一量 (tick 間比較)
+        # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
+        self.warning = ""
+        self._sample_ts = 0.0            # 上次取樣時間 (epoch)
+        self._sample_size: Optional[int] = None
+        self._decline_count = 0
         self.last_bid1_price = 0.0
         self.last_bid1_size = 0
         self.last_ask1_price = 0.0
@@ -61,13 +71,15 @@ class Trader:
     """9:00 之後的主控。"""
 
     def __init__(self, watchlist, limit_ups, cfg,
-                 recorder=None, state=None, unsub_fn: Optional[Callable] = None):
+                 recorder=None, state=None, unsub_fn: Optional[Callable] = None,
+                 session=None):
         """
         watchlist: List[str] — filter 結束時的 marked 名單
         limit_ups: Dict[str, float] — 每檔漲停價
         cfg: config.Config (first_trade_min_lots 可被 API 在 runtime 改)
         state: state.State — 第一盤淘汰要同步 unmark (可 None)
         unsub_fn: callable(symbol) — 第一盤淘汰要退訂 (可 None)
+        session: trading_session.TradingSession — real+armed 時同步掛真單 (可 None = 純監控)
         """
         self.holdings: Dict[str, Holding] = {
             s: Holding(s, limit_ups.get(s, 0.0)) for s in watchlist
@@ -76,15 +88,17 @@ class Trader:
         self.recorder = recorder
         self.state = state
         self.unsub_fn = unsub_fn
+        self.session = session
         self._stop = threading.Event()
-        logger.info(f"[trader] 建立 — 純監控 {len(self.holdings)} 檔 "
+        live = bool(session and session.is_live())
+        logger.info(f"[trader] 建立 — {'真實交易' if live else '純監控'} {len(self.holdings)} 檔 "
                     f"(第一盤最小成交 {cfg.first_trade_min_lots} 張)")
 
     # ─── 對外 API ──────────────────────────────────────────
 
     def start(self):
-        """純監控 — 無下單 thread，邏輯全在 on_book/on_trade handlers。"""
-        logger.info("[trader] 純監控模式啟動 (不下單)")
+        """無獨立 thread — 邏輯全在 on_book/on_trade handlers (下單動作交給 session)。"""
+        logger.info("[trader] 啟動 (下單與否由 session mode/armed 決定)")
 
     def stop(self, do_final_close: bool = True):
         self._stop.set()
@@ -100,6 +114,8 @@ class Trader:
         bid1_size = int(_pick(bids[0], "size") or 0) if bids else 0
         ask1_price = float(_pick(asks[0], "price") or 0) if asks else 0.0
         ask1_size = int(_pick(asks[0], "size") or 0) if asks else 0
+        # 委賣「任一檔」有量 (市價賣單 price=0 也算真賣單)
+        asks_any = any(int(_pick(a, "size") or 0) > 0 for a in asks) if asks else False
 
         # 最新快照 — 淘汰/撤單後也持續更新 (資料持續收)
         h.last_bid1_price = bid1_price
@@ -107,6 +123,14 @@ class Trader:
         h.last_ask1_price = ask1_price
         h.last_ask1_size = ask1_size
         h.last_book_ts = datetime.now().isoformat(timespec="seconds")
+
+        # === [real] 委賣出現 → 立刻出場 (撤委託 + 市價賣出全部已成交) ===
+        # exited flag 在 session 內防重複;has_exposure 先擋掉無單無倉的檔避免每 tick 開 thread
+        if asks_any and self.session is not None and self.session.has_exposure(symbol):
+            self.session.exit_position(symbol, "ask_appeared")
+
+        # === 警示: 委買量持續遞減 (取樣式,只顯示不動作) ===
+        self._update_decline_warning(h, bid1_size)
 
         # === 第一盤: 開盤第一筆 books ===
         if not h.first_books_seen:
@@ -136,6 +160,27 @@ class Trader:
 
         h.prev_bid1_size = bid1_size
 
+    def _update_decline_warning(self, h: Holding, bid1_size: int):
+        """每 BID_DECLINE_SAMPLE_SEC 取樣一次委買一量;
+        連續 BID_DECLINE_MINUTES 個樣本遞減 → 設 warning (顯示用,不動作)。"""
+        import time as _t
+        now = _t.time()
+        if now - h._sample_ts < self.cfg.bid_decline_sample_sec:
+            return
+        h._sample_ts = now
+        if h._sample_size is not None:
+            if bid1_size < h._sample_size:
+                h._decline_count += 1
+            else:
+                h._decline_count = 0
+                if h.warning:
+                    h.warning = ""      # 回升 → 解除警示
+        h._sample_size = bid1_size
+        if h._decline_count >= self.cfg.bid_decline_minutes and not h.warning:
+            h.warning = (f"委買量連續 {h._decline_count} 次取樣遞減 "
+                         f"(每 {self.cfg.bid_decline_sample_sec}s 一次)")
+            logger.warning(f"[trader] ⚠ {h.symbol} {h.warning}")
+
     def on_trade(self, symbol: str, trade_data: dict):
         h = self.holdings.get(symbol)
         if h is None:
@@ -158,13 +203,17 @@ class Trader:
                 "ts": datetime.now().isoformat(timespec="seconds"),
             }
             if h.status == Holding.DISCARDED_FIRST:
-                return   # books 那邊已淘汰，只補記錄
+                return   # books 那邊已淘汰，只補記錄 (委託已在 _fail_first 撤)
             # 檢查: 成交量 < 最小張數 (cfg 值 API 可 runtime 調) → 淘汰
             if lots < self.cfg.first_trade_min_lots:
                 self._fail_first(h, f"first_trade_qty_too_small "
                                     f"({lots} 張 < {self.cfg.first_trade_min_lots})")
                 return
             self._maybe_enter_tracking(h)
+            # [real] 首筆成交資訊到達且通過檢查: 預掛單未(全)成交 → 撤剩餘、
+            # 留已成交,再市價單追差額 (session 內背景 thread 處理)
+            if self.session is not None:
+                self.session.on_first_trade(symbol, passed_first_check=True)
 
     # ─── 狀態轉換 ──────────────────────────────────────────
 
@@ -178,9 +227,15 @@ class Trader:
                         f"(成交 {h.first_trade.get('price')} × {h.first_trade.get('lots')} 張) → 追蹤")
 
     def _fail_first(self, h: Holding, reason: str):
-        """第一盤檢查淘汰 — 同 filter unmark: 永久丟棄 + 退訂。"""
+        """第一盤檢查淘汰 — 同 filter unmark: 永久丟棄 + 退訂 + [real] 撤委託。"""
         h.status = Holding.DISCARDED_FIRST
         h.first_fail_reason = reason
+        # [real] 已掛委託 → 撤;還沒掛 → session 標 stopped 不再下 (no-op when sim)
+        if self.session is not None:
+            try:
+                self.session.cancel_symbol_orders(h.symbol, f"first_check: {reason}")
+            except Exception as e:
+                logger.error(f"[trader] {h.symbol} 撤委託失敗: {e}")
         # 同步 filter state (FilterPage 丟棄清單看得到) + 退訂
         if self.state:
             try:
@@ -195,9 +250,14 @@ class Trader:
         logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}")
 
     def _pull(self, h: Holding, reason: str):
-        """盤中撤單 — 只標狀態。持續收資料 (不退訂)。"""
+        """盤中撤單 — 標狀態 + [real] 撤該檔 pending 委託。持續收資料 (不退訂)。"""
         h.status = Holding.PULLED
         h.pulled_reason = reason
+        if self.session is not None:
+            try:
+                self.session.cancel_symbol_orders(h.symbol, reason)
+            except Exception as e:
+                logger.error(f"[trader] {h.symbol} 撤委託失敗: {e}")
         logger.warning(f"[trader] {h.symbol} 撤單 — {reason}")
 
     # ─── summary (API / 前端兩區塊) ────────────────────────
@@ -208,6 +268,8 @@ class Trader:
         for s, h in self.holdings.items():
             # 「開盤即鎖」徽章 (8:30 首筆真實報價就漲停) — 看強勢股是否更會留到最後
             first_tick = self.state.is_first_tick(s) if self.state else False
+            # [real] 該檔交易 state (委託/成交/出場) — sim 模式為 None
+            trade = self.session.get_symbol_state(s) if self.session else None
             first_stage.append({
                 "symbol": s,
                 "limit_up": h.limit_up,
@@ -216,6 +278,7 @@ class Trader:
                 "first_books": h.first_books or None,
                 "first_trade": h.first_trade or None,
                 "fail_reason": h.first_fail_reason,
+                "trade": trade,
             })
             if h.status in (Holding.TRACKING, Holding.PULLED):
                 tracking.append({
@@ -228,8 +291,10 @@ class Trader:
                     "ask1_size": h.last_ask1_size,
                     "status": h.status,
                     "pulled_reason": h.pulled_reason,
+                    "warning": h.warning,
                     "last_trade_price": h.last_trade_price,
                     "last_book_ts": h.last_book_ts,
+                    "trade": trade,
                 })
         n_track = sum(1 for h in self.holdings.values() if h.status == Holding.TRACKING)
         n_pulled = sum(1 for h in self.holdings.values() if h.status == Holding.PULLED)
@@ -240,6 +305,7 @@ class Trader:
             "n_pulled": n_pulled,
             "n_first_failed": n_failed,
             "min_lots": self.cfg.first_trade_min_lots,
+            "trading": self.session.status() if self.session else None,
             "first_stage": sorted(first_stage, key=lambda x: x["symbol"]),
             "tracking": sorted(tracking, key=lambda x: x["symbol"]),
         }

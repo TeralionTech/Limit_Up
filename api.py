@@ -137,3 +137,111 @@ def set_trader_params(p: TraderParams):
         r.set_param_override("first_trade_min_lots", p.first_trade_min_lots)
         applied["first_trade_min_lots"] = p.first_trade_min_lots
     return {"ok": True, "applied": applied}
+
+
+# ─── 交易 (模擬/真實執行頁) ──────────────────────────────────
+# pfx 憑證用 base64 JSON 傳 (避免 multipart 需額外裝 python-multipart)
+
+
+class TradingConnectReq(BaseModel):
+    account_id: str
+    password: str
+    pfx_password: str = ""
+    is_test: bool = False
+    pfx_b64: str            # .pfx 檔案內容 base64
+    pfx_filename: str = "trading.pfx"
+
+
+@router.post("/trading/connect")
+def trading_connect(req: TradingConnectReq):
+    """存憑證 + 背景連線券商。前端輪詢 /api/trading/status 看結果。
+    帳密只進記憶體 (連線用完即丟);.pfx 存 certs/uploaded/ (chmod 600)。"""
+    import base64
+    import os
+    import re
+    from pathlib import Path
+
+    r = Runner.get()
+    if r.session.connecting:
+        raise HTTPException(400, "連線進行中")
+
+    # 存 pfx (檔名消毒,固定放 certs/uploaded/)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", req.pfx_filename) or "trading.pfx"
+    upload_dir = Path(__file__).parent.parent.parent / "certs" / "uploaded"
+    if not upload_dir.parent.exists():                     # 非 VPS 佈局 → 存 app 目錄下
+        upload_dir = Path(__file__).parent / "certs_uploaded"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    pfx_path = upload_dir / safe_name
+    try:
+        pfx_path.write_bytes(base64.b64decode(req.pfx_b64))
+        os.chmod(pfx_path, 0o600)
+    except Exception as e:
+        raise HTTPException(400, f"憑證存檔失敗: {e}")
+
+    output_dir = Path(__file__).parent / "output"
+    r.session.connect_async(req.account_id.strip(), req.password,
+                            str(pfx_path), req.pfx_password,
+                            req.is_test, output_dir)
+    return {"status": "connecting"}
+
+
+@router.get("/trading/status")
+def trading_status():
+    return Runner.get().session.status()
+
+
+@router.post("/trading/disconnect")
+def trading_disconnect():
+    Runner.get().session.disconnect()
+    return {"ok": True}
+
+
+class TradingModeReq(BaseModel):
+    mode: str    # "sim" / "real"
+
+
+@router.post("/trading/mode")
+def trading_mode(req: TradingModeReq):
+    try:
+        Runner.get().session.set_mode(req.mode)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "mode": req.mode}
+
+
+class TradingParamsReq(BaseModel):
+    total_budget: Optional[float] = None
+    per_symbol_budget: Optional[float] = None
+
+
+@router.post("/trading/params")
+def trading_params(req: TradingParamsReq):
+    try:
+        Runner.get().session.set_params(req.total_budget, req.per_symbol_budget)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+class TradingArmReq(BaseModel):
+    armed: bool
+
+
+@router.post("/trading/arm")
+def trading_arm(req: TradingArmReq):
+    """kill switch — 開啟前 pre-flight (real mode + 連線健康 + 預算已設)。"""
+    try:
+        Runner.get().session.set_armed(req.armed)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "armed": req.armed}
+
+
+@router.post("/trading/close_all")
+def trading_close_all():
+    """🚨 緊急全平: 撤所有 pending + 市價賣出全部持倉。"""
+    try:
+        sold = Runner.get().session.close_all()
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "sold_symbols": sold}

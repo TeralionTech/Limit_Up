@@ -28,6 +28,7 @@ class Config:
     limit_up_fetch_deadline: str  # "08:28" — 漲停價抓取重試截止 (盤前試撮 8:30 前留 buffer)
     limit_up_max_per_min: int  # 250 — 漲停價 REST 抓取節流上限 (富邦日內行情限 300/min，留 margin)
     final_check_start: str  # "08:59:00" — 此時起 bid 減半 final check (之前只記錄 max)
+    pre_order_time: str    # "08:59:58" — 真實模式預掛漲停價限價單時點 (final check 窗口也到此為止)
     bid_drop_ratio: float   # final check 減半閾值 (預設 0.5)
     debug: bool
     # === Trading (9:00 後 trader 用) ===
@@ -87,6 +88,7 @@ def load_config() -> Config:
         limit_up_fetch_deadline=os.environ.get("LIMIT_UP_FETCH_DEADLINE", "08:28").strip(),
         limit_up_max_per_min=int(os.environ.get("LIMIT_UP_MAX_PER_MIN", "250")),
         final_check_start=os.environ.get("FINAL_CHECK_START", "08:59:00").strip(),
+        pre_order_time=os.environ.get("PRE_ORDER_TIME", "08:59:58").strip(),
         bid_drop_ratio=float(os.environ.get("BID_DROP_RATIO", "0.5")),
         debug=os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes"),
         # Trading

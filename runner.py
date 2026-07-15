@@ -61,6 +61,11 @@ class Runner:
         self.recorder = None
         self.order_client = None
 
+        # 交易會話 (模擬/真實) — singleton 屬性,活過每日 runner 重啟。
+        # 連線/armed 由 /api/trading/* 控制;預設 sim + 未 armed (絕不自動下單)。
+        from trading_session import TradingSession
+        self.session = TradingSession()
+
         # Progress tracking
         self._limit_up_progress: Dict[str, int] = {"done": 0, "total": 0, "ok": 0, "fail": 0}
         self._started_at: Optional[datetime] = None
@@ -202,7 +207,19 @@ class Runner:
             debug=self.cfg.debug,
         )
         self.subscriber.start()
-        unsub_ref["fn"] = self.subscriber.request_unsubscribe   # unmark 淘汰 → 立即退訂
+
+        # unmark 淘汰 → 立即退訂 + 撤該檔預掛/pending 委託 (session 未 armed 時為 no-op)
+        def _unsub_and_cancel(symbol: str):
+            self.subscriber.request_unsubscribe(symbol)
+            try:
+                self.session.cancel_symbol_orders(symbol, "unmarked")
+            except Exception as e:
+                logger.warning(f"[runner] 撤 {symbol} 委託失敗: {e}")
+        unsub_ref["fn"] = _unsub_and_cancel
+
+        # 預掛限價單 timer (08:59:58) — real mode + armed 才會真的下;
+        # 對「當下還在 marked 清單」的標的掛漲停價限價買單 (搶開盤集合競價排隊)。
+        self._start_pre_order_timer()
 
         # Phase 5: 篩選 (8:30-9:00)
         # 若現在時間 >= END_TIME (例: 9:00 後手動啟動)，wait_until_end_time 內部
@@ -243,7 +260,7 @@ class Runner:
             self.phase = Phase.FINISHED
             return
 
-        # Phase 6: Trading (9:00-13:24) — 純監控，不下單
+        # Phase 6: Trading (9:00-13:24) — 監控;session 為 real+armed 時掛真單
         self.phase = Phase.TRADING
         from trader import Trader
         self.trader = Trader(
@@ -253,6 +270,7 @@ class Runner:
             recorder=self.recorder,
             state=self.state,                                   # 第一盤淘汰同步 unmark
             unsub_fn=self.subscriber.request_unsubscribe,       # + 退訂
+            session=self.session,                               # 交易會話 (sim = 純監控)
         )
         # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
         self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
@@ -261,12 +279,48 @@ class Runner:
         from filter import _wait_until
         _wait_until(self.cfg.trading_end_time, self.trader, self.cfg)
 
-        # Phase 7: 收盤
+        # Phase 7: 收盤 — 撤所有未成交委託 (不賣持倉,留倉隔日; 使用者定案 2026-07-16)
+        try:
+            self.session.cancel_all_pending("trading_end")
+        except Exception as e:
+            logger.warning(f"[runner] 收盤撤單例外: {e}")
         self.trader.stop()
         self.subscriber.stop()
         self.recorder.close()
         self.phase = Phase.FINISHED
         logger.info("[runner] 收盤結束")
+
+    def _start_pre_order_timer(self):
+        """背景 thread: 等到 PRE_ORDER_TIME (08:59:58) → 對當下 marked 清單預掛限價單。
+        現在時間已過 PRE_ORDER_TIME → 不掛 (只在正常 8:00 流程有效)。"""
+        from datetime import time as _time_cls
+
+        def _timer():
+            try:
+                hh, mm, ss = map(int, self.cfg.pre_order_time.split(":"))
+                target = _time_cls(hh, mm, ss)
+            except Exception:
+                logger.warning(f"[runner] PRE_ORDER_TIME 格式錯 ({self.cfg.pre_order_time!r}) — 停用預掛")
+                return
+            if datetime.now().time() >= target:
+                logger.info("[runner] 已過 PRE_ORDER_TIME — 跳過預掛")
+                return
+            while not self._stop_event.is_set():
+                if datetime.now().time() >= target:
+                    break
+                self._stop_event.wait(0.2)
+            if self._stop_event.is_set():
+                return
+            marked = self.state.get_marked_list() if self.state else []
+            if not marked:
+                logger.info("[runner] PRE_ORDER_TIME 到但 marked 清單空 — 不預掛")
+                return
+            try:
+                self.session.place_pre_orders(marked, self.limit_ups, self._stop_event)
+            except Exception as e:
+                logger.exception(f"[runner] 預掛例外: {e}")
+
+        threading.Thread(target=_timer, name="pre-order-timer", daemon=True).start()
 
     def _live_subscribe_loop(self):
         """LIVE_SUBSCRIBE — 保持 subscriber 常駐，直到 stop event 或 TRADING_END_TIME.

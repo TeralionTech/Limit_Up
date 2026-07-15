@@ -70,7 +70,7 @@ export default function App() {
         <div className="max-w-6xl mx-auto px-4 flex gap-1">
           <TabBtn active={tab === 'filter'} onClick={() => setTab('filter')}>① 篩選</TabBtn>
           <TabBtn active={tab === 'quote'} onClick={() => setTab('quote')}>② 股票資料</TabBtn>
-          <TabBtn active={tab === 'sim'} onClick={() => setTab('sim')}>③ 模擬執行</TabBtn>
+          <TabBtn active={tab === 'sim'} onClick={() => setTab('sim')}>③ 模擬/真實執行</TabBtn>
         </div>
       </header>
 
