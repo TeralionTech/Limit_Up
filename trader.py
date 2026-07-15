@@ -9,9 +9,9 @@
 
   盤中追蹤 (block 2) — 通過第一盤的標的:
     - 顯示 委買一價 / 委買一量
-    - 狀態 "追蹤" → "撤單" 條件:
-        1. 委買一量在兩個 tick 之間減少 1/2 以上
-        2. 委買一價格不是漲停價
+    - 狀態 "追蹤" → "撤單" 條件 (單一):
+        委買一量在兩個 tick 之間減少 1/2 以上 (第 3 筆成交後才開始判)
+      (原「委買一價格不是漲停價」條件已移除 — 盤中市價單佔五檔第一列且 price=0 會誤判)
     - 撤單後**持續收資料** (不退訂，狀態停在撤單)
 
 純監控 — 不下單 (含模擬單也不下)。
@@ -124,16 +124,15 @@ class Trader:
             h.prev_bid1_size = bid1_size
             return
 
-        # === 盤中追蹤: 兩個撤單條件 ===
+        # === 盤中追蹤: 撤單條件 (只剩量減半) ===
+        # 註: 原「委買一跌下漲停」條件已移除 — 盤中市價單會佔五檔第一列且 price=0
+        # (例 0.00 × 1561, 漲停價買單在第二列), 拿 bids[0] 價格比會誤判跌下漲停。
         if h.status == Holding.TRACKING:
-            # 條件 1: 委買一量在兩 tick 之間減少 1/2 以上
+            # 委買一量在兩 tick 之間減少 1/2 以上
             #   暖機: 第 3 筆成交後才判 — 避免開盤瞬間拿「盤前累積量」當基準造成誤撤。
             #   (prev_bid1_size 每 tick 都更新，到第 3 筆成交時基準已是盤後即時量)
             if h.trade_count >= 3 and h.prev_bid1_size and bid1_size < h.prev_bid1_size * 0.5:
                 self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid1_size})")
-            # 條件 2: 委買一價格不是漲停價 (即時判，不受暖機影響)
-            elif bid1_price < h.limit_up - 0.001:
-                self._pull(h, f"price_below_limit ({bid1_price} < {h.limit_up})")
 
         h.prev_bid1_size = bid1_size
 
