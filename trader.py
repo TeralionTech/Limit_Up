@@ -207,10 +207,13 @@ class Trader:
         first_stage = []
         tracking = []
         for s, h in self.holdings.items():
+            # 「開盤即鎖」徽章 (8:30 首筆真實報價就漲停) — 看強勢股是否更會留到最後
+            first_tick = self.state.is_first_tick(s) if self.state else False
             first_stage.append({
                 "symbol": s,
                 "limit_up": h.limit_up,
                 "status": h.status,
+                "first_tick": first_tick,
                 "first_books": h.first_books or None,
                 "first_trade": h.first_trade or None,
                 "fail_reason": h.first_fail_reason,
@@ -219,6 +222,7 @@ class Trader:
                 tracking.append({
                     "symbol": s,
                     "limit_up": h.limit_up,
+                    "first_tick": first_tick,
                     "bid1_price": h.last_bid1_price,
                     "bid1_size": h.last_bid1_size,
                     "ask1_price": h.last_ask1_price,

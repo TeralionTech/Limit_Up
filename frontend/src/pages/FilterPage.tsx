@@ -39,16 +39,53 @@ export default function FilterPage() {
           </h2>
           {!watch || watch.marked.length === 0 ? (
             <div className="text-gray-400 text-sm py-6 text-center">尚無標記</div>
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              {watch.marked.map(sym => (
-                <span key={sym}
-                      className="inline-block bg-green-50 border border-green-300 text-green-800 px-3 py-1 rounded text-sm font-mono">
-                  {sym}
-                </span>
-              ))}
-            </div>
-          )}
+          ) : (() => {
+            const firstTickSet = new Set(watch.first_tick_marked ?? [])
+            const fromStart = watch.marked.filter(s => firstTickSet.has(s))
+            const rest = watch.marked.filter(s => !firstTickSet.has(s))
+            return (
+              <div className="space-y-4">
+                {/* 塊 1: 開盤即鎖 — 8:30 第一筆報價就漲停的強勢股 */}
+                <div>
+                  <h3 className="text-sm font-semibold text-red-700 mb-2">
+                    🔒 開盤即鎖漲停 ({fromStart.length})
+                    <span className="ml-1 font-normal text-xs text-gray-400 cursor-help"
+                          title="8:30 試撮第一筆真實報價就已鎖漲停 (委買一=漲停、無賣單) 的標的">ⓘ</span>
+                  </h3>
+                  {fromStart.length === 0 ? (
+                    <div className="text-gray-400 text-xs py-2">無</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {fromStart.map(sym => (
+                        <span key={sym}
+                              className="inline-block bg-red-50 border border-red-400 text-red-800 px-3 py-1 rounded text-sm font-mono font-semibold">
+                          🔒 {sym}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {/* 塊 2: 盤中鎖上 — 其餘標記 */}
+                <div>
+                  <h3 className="text-sm font-semibold text-green-700 mb-2">
+                    盤中鎖上 ({rest.length})
+                  </h3>
+                  {rest.length === 0 ? (
+                    <div className="text-gray-400 text-xs py-2">無</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {rest.map(sym => (
+                        <span key={sym}
+                              className="inline-block bg-green-50 border border-green-300 text-green-800 px-3 py-1 rounded text-sm font-mono">
+                          {sym}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
         </div>
 
         <div className="bg-white rounded-lg shadow p-4">

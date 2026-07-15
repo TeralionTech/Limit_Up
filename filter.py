@@ -123,6 +123,11 @@ def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
             except Exception as e:
                 logger.warning(f"[filter] 退訂 {symbol} 失敗: {e}")
 
+    # 「開盤即鎖」判定 — 記錄哪些 symbol 已看過第一筆真實報價 (委買非空)。
+    # 空簿 tick (訂閱瞬間的空 snapshot) 不算首筆。每 symbol 只綁一個 socket，
+    # 同 symbol tick 序列單執行緒，closure set 安全。
+    seen_first_quote: set = set()
+
     def _on_book(symbol: str, bids: list, asks: list):
         # 永久淘汰的股票 — 退訂生效前的殘餘 tick 直接略過
         if state.is_discarded(symbol):
@@ -140,12 +145,19 @@ def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
         # 「只有委買單」= asks 每一檔都沒單
         asks_empty = all(int(_pick(a, "size") or 0) == 0 for a in asks) if asks else True
 
+        # 這筆是不是該股的「第一筆真實報價」(委買非空才算)
+        is_first_quote = bool(bids) and symbol not in seen_first_quote
+        if bids:
+            seen_first_quote.add(symbol)
+
         if not state.is_marked(symbol):
             # Mark 條件: 只有委買單 + bid1 == 漲停 (浮點寬鬆)
             if bids and bid1_price >= limit_up - 0.001 and asks_empty:
-                if state.mark(symbol, bid1_price, bid1_size, limit_up):
+                if state.mark(symbol, bid1_price, bid1_size, limit_up,
+                              first_tick=is_first_quote):
+                    tag = " [開盤即鎖]" if is_first_quote else ""
                     logger.info(f"✓ MARK {symbol} @ {bid1_price} × {bid1_size} 張 "
-                                f"(漲停 {limit_up}) 無賣單")
+                                f"(漲停 {limit_up}) 無賣單{tag}")
             return
 
         # === 已 marked → unmark 檢查 (unmark 一律永久淘汰 + 退訂) ===

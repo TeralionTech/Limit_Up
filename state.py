@@ -24,6 +24,8 @@ class State:
         self._lock = Lock()
         self.marked: Set[str] = set()
         self.discarded: Set[str] = set()                 # unmark 過 = 永久淘汰
+        # 「開盤即鎖」— 第一筆真實報價 (委買非空) 就滿足 mark 條件的強勢股 (顯示/分析用)
+        self.first_tick_limit_up: Set[str] = set()
         self.history: Dict[str, List[dict]] = {}         # symbol → [event, ...]
         # mark 之後追蹤該 symbol 看過的 bid1 max size (只在 8:30–8:59 更新)
         self._max_bid_size: Dict[str, int] = {}
@@ -31,9 +33,13 @@ class State:
 
     # ─── Mark / Unmark ─────────────────────────────────────
 
-    def mark(self, symbol: str, bid_price: float, bid1_size: int, limit_up: float) -> bool:
+    def mark(self, symbol: str, bid_price: float, bid1_size: int, limit_up: float,
+             first_tick: bool = False) -> bool:
         """Mark 一檔為「試撮已鎖漲停」。回 True = 新標記。
-        已淘汰 (discarded) 的股票不能 re-mark → 回 False。"""
+        已淘汰 (discarded) 的股票不能 re-mark → 回 False。
+
+        first_tick=True: 該股第一筆真實報價 (委買非空) 就滿足 mark 條件 =「開盤即鎖」強勢股。
+        """
         with self._lock:
             if symbol in self.discarded:
                 return False
@@ -41,12 +47,15 @@ class State:
             self.marked.add(symbol)
             if was_new:
                 self._max_bid_size[symbol] = max(bid1_size, 0)
+                if first_tick:
+                    self.first_tick_limit_up.add(symbol)
                 self.history.setdefault(symbol, []).append({
                     "event": "mark",
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "bid_price": bid_price,
                     "bid1_size": bid1_size,
                     "limit_up": limit_up,
+                    "first_tick": first_tick,
                 })
             return was_new
 
@@ -129,7 +138,11 @@ class State:
     def snapshot(self) -> List[dict]:
         with self._lock:
             return [
-                {"symbol": s, "history": list(self.history.get(s, []))}
+                {
+                    "symbol": s,
+                    "first_tick_limit_up": s in self.first_tick_limit_up,
+                    "history": list(self.history.get(s, [])),
+                }
                 for s in sorted(self.marked)
             ]
 
@@ -163,6 +176,16 @@ class State:
         """給 API 用 — 當前 marked symbols (sorted)."""
         with self._lock:
             return sorted(self.marked)
+
+    def get_first_tick_marked_list(self) -> List[str]:
+        """給 API 用 — 當前 marked 中「開盤即鎖」的 symbols (sorted)."""
+        with self._lock:
+            return sorted(self.marked & self.first_tick_limit_up)
+
+    def is_first_tick(self, symbol: str) -> bool:
+        """該股是否「開盤即鎖」(第一筆真實報價就漲停) — trader/SimPage 徽章用."""
+        with self._lock:
+            return symbol in self.first_tick_limit_up
 
     def get_discarded_list(self) -> List[dict]:
         """給 API 用 — 永久淘汰的股票 + 各自 unmark 原因."""

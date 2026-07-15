@@ -63,12 +63,13 @@ def get_filter_progress():
 
 @router.get("/filter/watchlist")
 def get_watchlist():
-    """當前標記 + 丟棄清單."""
+    """當前標記 + 丟棄清單。first_tick_marked = marked 中「開盤即鎖」(首筆真實報價就漲停) 子集."""
     r = Runner.get()
     if not r.state:
-        return {"marked": [], "discarded": []}
+        return {"marked": [], "first_tick_marked": [], "discarded": []}
     return {
         "marked": r.state.get_marked_list(),
+        "first_tick_marked": r.state.get_first_tick_marked_list(),
         "discarded": r.state.get_discarded_list(),
     }
 

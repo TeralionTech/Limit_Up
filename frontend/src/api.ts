@@ -61,6 +61,7 @@ export interface FilterProgress {
 
 export interface Watchlist {
   marked: string[]
+  first_tick_marked?: string[]   // marked 中「開盤即鎖」(首筆真實報價就漲停) 子集
   discarded: Array<{ symbol: string; reason: string; ts: string }>
 }
 
@@ -93,6 +94,7 @@ export interface TraderSummary {
 export interface FirstStageRow {
   symbol: string
   limit_up: number
+  first_tick?: boolean   // 「開盤即鎖」徽章
   status: 'waiting' | 'discarded_first' | 'tracking' | 'pulled'
   first_books: {
     bid1_price: number; bid1_size: number
@@ -108,6 +110,7 @@ export interface FirstStageRow {
 export interface TrackingRow {
   symbol: string
   limit_up: number
+  first_tick?: boolean   // 「開盤即鎖」徽章
   bid1_price: number
   bid1_size: number
   ask1_price: number

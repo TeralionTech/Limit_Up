@@ -150,7 +150,10 @@ function FirstStageTr({ row }: { row: FirstStageRow }) {
   const priceAtLimit = ft && Math.abs(ft.price - row.limit_up) < 0.001
   return (
     <tr className="border-b">
-      <td className="py-1.5 px-2 font-mono font-semibold">{row.symbol}</td>
+      <td className="py-1.5 px-2 font-mono font-semibold">
+        {row.symbol}
+        {row.first_tick && <span title="開盤即鎖 (8:30 首筆報價就漲停)" className="ml-1">🔒</span>}
+      </td>
       <td className="py-1.5 px-2 text-right font-mono text-red-600">{row.limit_up?.toFixed(2)}</td>
       <td className="py-1.5 px-2 text-right font-mono">
         {fb ? `${fb.bid1_price?.toFixed(2)} × ${fb.bid1_size}` : <Wait />}
@@ -188,7 +191,10 @@ function TrackingTr({ row }: { row: TrackingRow }) {
   const bidAtLimit = Math.abs(row.bid1_price - row.limit_up) < 0.001
   return (
     <tr className={`border-b ${row.status === 'pulled' ? 'bg-red-50' : ''}`}>
-      <td className="py-1.5 px-2 font-mono font-semibold">{row.symbol}</td>
+      <td className="py-1.5 px-2 font-mono font-semibold">
+        {row.symbol}
+        {row.first_tick && <span title="開盤即鎖 (8:30 首筆報價就漲停)" className="ml-1">🔒</span>}
+      </td>
       <td className="py-1.5 px-2 text-right font-mono text-red-600">{row.limit_up?.toFixed(2)}</td>
       <td className={`py-1.5 px-2 text-right font-mono ${bidAtLimit ? '' : 'text-orange-600 font-bold'}`}>
         {row.bid1_price?.toFixed(2)}
