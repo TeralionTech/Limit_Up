@@ -70,6 +70,9 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - **盤中市價單在五檔顯示 price=0 且佔第一列**(真正限價檔位從第二列起)—
   拿 `bids[0]` 價格做判斷會誤判 (歷史教訓: 6243 誤撤事件)
 - 行情 REST rate limit: 日內行情 300/min (`LIMIT_UP_MAX_PER_MIN=250` 節流);歷史 K 線 60/min
+- **交易 API 速率上限**(llms-full.txt 明定):**下單 50/秒**、批次下單 10/秒、
+  帳務查詢 5/秒、連線數 10。本專案送單全過 session 全域閘門
+  (硬底線 0.02s;市價追單另用 `ORDER_MIN_INTERVAL_SEC=0.2` + 必等委託結果)
 
 ## 本專案架構速覽
 

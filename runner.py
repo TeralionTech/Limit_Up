@@ -161,6 +161,13 @@ class Runner:
         for k, v in self._param_overrides.items():
             setattr(self.cfg, k, v)
 
+        # 交易會話策略參數 (500 上限 / 送單間隔 / 13:23 撤單時點)
+        self.session.configure(
+            max_stock_price=self.cfg.max_stock_price,
+            order_min_interval_sec=self.cfg.order_min_interval_sec,
+            cancel_pending_time=self.cfg.cancel_pending_time,
+        )
+
         # Phase 1: Login
         self.phase = Phase.LOGIN
         from filter import login_fubon
@@ -220,6 +227,8 @@ class Runner:
         # 預掛限價單 timer (08:59:58) — real mode + armed 才會真的下;
         # 對「當下還在 marked 清單」的標的掛漲停價限價買單 (搶開盤集合競價排隊)。
         self._start_pre_order_timer()
+        # 13:23 (CANCEL_PENDING_TIME) 撤所有未成交委託 timer (持倉不動、留倉)
+        self._start_cancel_pending_timer()
 
         # Phase 5: 篩選 (8:30-9:00)
         # 若現在時間 >= END_TIME (例: 9:00 後手動啟動)，wait_until_end_time 內部
@@ -305,10 +314,15 @@ class Runner:
             if datetime.now().time() >= target:
                 logger.info("[runner] 已過 PRE_ORDER_TIME — 跳過預掛")
                 return
+            # 精準等到時點 (最後 1 秒改 10ms 細顆粒,誤差 ~10ms)
             while not self._stop_event.is_set():
-                if datetime.now().time() >= target:
+                now = datetime.now()
+                remaining = (now.replace(hour=target.hour, minute=target.minute,
+                                         second=target.second, microsecond=0) - now
+                             ).total_seconds()
+                if remaining <= 0:
                     break
-                self._stop_event.wait(0.2)
+                self._stop_event.wait(0.01 if remaining < 1 else remaining - 0.5)
             if self._stop_event.is_set():
                 return
             marked = self.state.get_marked_list() if self.state else []
@@ -321,6 +335,33 @@ class Runner:
                 logger.exception(f"[runner] 預掛例外: {e}")
 
         threading.Thread(target=_timer, name="pre-order-timer", daemon=True).start()
+
+    def _start_cancel_pending_timer(self):
+        """背景 thread: CANCEL_PENDING_TIME (13:23) 到 → 撤所有未成交委託 (持倉不動)。"""
+        from datetime import time as _time_cls
+
+        def _timer():
+            try:
+                hh, mm, ss = map(int, self.cfg.cancel_pending_time.split(":"))
+                target = _time_cls(hh, mm, ss)
+            except Exception:
+                logger.warning(f"[runner] CANCEL_PENDING_TIME 格式錯 "
+                               f"({self.cfg.cancel_pending_time!r}) — 停用 13:23 撤單")
+                return
+            if datetime.now().time() >= target:
+                return
+            while not self._stop_event.is_set():
+                if datetime.now().time() >= target:
+                    break
+                self._stop_event.wait(1)
+            if self._stop_event.is_set():
+                return
+            try:
+                self.session.cancel_all_pending("cancel_pending_time")
+            except Exception as e:
+                logger.exception(f"[runner] 13:23 撤單例外: {e}")
+
+        threading.Thread(target=_timer, name="cancel-pending-timer", daemon=True).start()
 
     def _live_subscribe_loop(self):
         """LIVE_SUBSCRIBE — 保持 subscriber 常駐，直到 stop event 或 TRADING_END_TIME.
