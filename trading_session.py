@@ -180,10 +180,11 @@ class TradingSession:
                 self.broker = None
 
     def set_mode(self, mode: str):
+        """切模式。切 real **不**要求先連線 — 切過去才看得到連線表單
+        (連線要求放這裡會跟前端「real 模式才顯示表單」互鎖)。
+        真正的安全閘門在 set_armed (連線健康 + 預算才准開始交易)。"""
         if mode not in ("sim", "real"):
             raise ValueError("mode 必須是 sim 或 real")
-        if mode == "real" and not self._broker_ready():
-            raise RuntimeError("切真實模式前要先連線券商")
         with self._lock:
             self.mode = mode
             if mode == "sim":
