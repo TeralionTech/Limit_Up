@@ -36,6 +36,11 @@ export const api = {
     req<{ ok: boolean }>('/api/trading/arm', { method: 'POST', body: JSON.stringify({ armed }) }),
   tradingCloseAll: () =>
     req<{ ok: boolean; sold_symbols: number }>('/api/trading/close_all', { method: 'POST' }),
+  tradingOrders: () => req<{ orders: OrderRow[] }>('/api/trading/orders'),
+  tradingCancelOrder: (order_no: string) =>
+    req<{ ok: boolean }>('/api/trading/cancel_order', {
+      method: 'POST', body: JSON.stringify({ order_no }),
+    }),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -176,4 +181,17 @@ export interface TradingConnectReq {
   is_test?: boolean
   pfx_b64: string
   pfx_filename?: string
+}
+
+// 委託總表 row (真實模式;右鍵可刪 pending 單)
+export interface OrderRow {
+  order_no: string
+  symbol: string
+  action: 'buy' | 'sell'
+  kind: string             // pre_limit / market_buy / market_sell
+  lots: number
+  price: number            // 0 = 市價
+  status: 'pending' | 'filled' | 'cancelled' | 'rejected'
+  filled_lots: number
+  ts: string
 }

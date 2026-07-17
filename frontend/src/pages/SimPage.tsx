@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useState } from 'react'
-import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade } from '../api'
+import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade, OrderRow } from '../api'
 
 export default function SimPage() {
   const [sum, setSum] = useState<TraderSummary | null>(null)
@@ -295,6 +295,9 @@ function TradingPanel() {
   // 預算
   const [totalBudget, setTotalBudget] = useState('')
   const [perBudget, setPerBudget] = useState('')
+  // 委託總表 + 右鍵選單
+  const [orders, setOrders] = useState<OrderRow[]>([])
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; order: OrderRow } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -302,12 +305,28 @@ function TradingPanel() {
       try {
         const s = await api.tradingStatus()
         if (!cancelled) setTs(s)
+        if (s.mode === 'real') {
+          const o = await api.tradingOrders()
+          if (!cancelled) setOrders(o.orders)
+        }
       } catch { /* ignore */ }
     }
     tick()
     const id = window.setInterval(tick, 2000)
     return () => { cancelled = true; window.clearInterval(id) }
   }, [])
+
+  // 點任何地方關掉右鍵選單
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = () => setCtxMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('contextmenu', close, { capture: true })
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('contextmenu', close, { capture: true })
+    }
+  }, [ctxMenu])
 
   // 帶入後端已設的預算 (只在欄位還空時)
   useEffect(() => {
@@ -362,6 +381,15 @@ function TradingPanel() {
     if (!window.confirm('🚨 緊急全平?\n撤所有未成交委託 + 市價賣出全部持倉!')) return
     try { const r = await api.tradingCloseAll(); flash(`✓ 全平完成 (賣出 ${r.sold_symbols} 檔)`) }
     catch (e: any) { flash(`✗ ${e.message}`) }
+  }
+
+  async function cancelOrder(o: OrderRow) {
+    setCtxMenu(null)
+    if (!window.confirm(`刪單 ${o.order_no}?\n${o.symbol} ${o.action === 'buy' ? '買' : '賣'} ${o.lots} 張`)) return
+    try {
+      await api.tradingCancelOrder(o.order_no)
+      flash(`✓ 已刪單 ${o.order_no}`)
+    } catch (e: any) { flash(`✗ ${e.message}`) }
   }
 
   const isReal = ts?.mode === 'real'
@@ -470,9 +498,112 @@ function TradingPanel() {
               </span>
             </div>
           )}
+
+          {/* 委託狀態表 — 右鍵可刪 pending 單 */}
+          {orders.length > 0 && (
+            <div>
+              <h3 className="text-sm font-semibold text-gray-700 mb-1">
+                📋 委託狀態 ({orders.length})
+                <span className="ml-2 font-normal text-xs text-gray-400">在委託列上按右鍵可刪單</span>
+              </h3>
+              <div className="overflow-x-auto max-h-64 overflow-y-auto bg-white rounded border">
+                <table className="w-full text-xs">
+                  <thead className="text-gray-500 border-b bg-gray-50 sticky top-0">
+                    <tr>
+                      <th className="text-left py-1.5 px-2">時間</th>
+                      <th className="text-left py-1.5 px-2">委託書號</th>
+                      <th className="text-left py-1.5 px-2">標的</th>
+                      <th className="text-left py-1.5 px-2">買賣</th>
+                      <th className="text-left py-1.5 px-2">種類</th>
+                      <th className="text-right py-1.5 px-2">價格</th>
+                      <th className="text-right py-1.5 px-2">張數</th>
+                      <th className="text-right py-1.5 px-2">已成交</th>
+                      <th className="text-left py-1.5 px-2">狀態</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {orders.map(o => (
+                      <tr key={o.order_no}
+                          onContextMenu={e => {
+                            e.preventDefault()
+                            setCtxMenu({ x: e.clientX, y: e.clientY, order: o })
+                          }}
+                          className={`border-b last:border-b-0 cursor-context-menu ${
+                            o.status === 'pending' ? 'bg-blue-50/50' : ''}`}>
+                        <td className="py-1 px-2 text-gray-500">{o.ts.slice(11)}</td>
+                        <td className="py-1 px-2 font-mono">{o.order_no}</td>
+                        <td className="py-1 px-2 font-mono font-semibold">{o.symbol}</td>
+                        <td className={`py-1 px-2 font-medium ${
+                          o.action === 'buy' ? 'text-red-600' : 'text-green-700'}`}>
+                          {o.action === 'buy' ? '買' : '賣'}
+                        </td>
+                        <td className="py-1 px-2">{orderKindLabel(o.kind)}</td>
+                        <td className="py-1 px-2 text-right font-mono">
+                          {o.price > 0 ? o.price.toFixed(2) : '市價'}
+                        </td>
+                        <td className="py-1 px-2 text-right font-mono">{o.lots}</td>
+                        <td className="py-1 px-2 text-right font-mono">{o.filled_lots}</td>
+                        <td className="py-1 px-2"><OrderStatusBadge status={o.status} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </>
       )}
+
+      {/* 右鍵選單 */}
+      {ctxMenu && (
+        <div className="fixed z-50 bg-white border rounded shadow-lg py-1 text-sm"
+             style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+          <div className="px-3 py-1 text-xs text-gray-400 border-b">
+            {ctxMenu.order.symbol} ・ {ctxMenu.order.order_no}
+          </div>
+          <button
+            disabled={ctxMenu.order.status !== 'pending'}
+            onClick={() => cancelOrder(ctxMenu.order)}
+            className={`block w-full text-left px-3 py-1.5 ${
+              ctxMenu.order.status === 'pending'
+                ? 'text-red-600 hover:bg-red-50'
+                : 'text-gray-300 cursor-not-allowed'}`}>
+            🗑 刪單{ctxMenu.order.status !== 'pending' ? ` (${orderStatusText(ctxMenu.order.status)})` : ''}
+          </button>
+        </div>
+      )}
     </section>
+  )
+}
+
+
+function orderKindLabel(kind: string): string {
+  const m: Record<string, string> = {
+    pre_limit: '預掛限價', market_buy: '市價買', market_sell: '市價賣',
+  }
+  return m[kind] || kind
+}
+
+
+function orderStatusText(s: string): string {
+  const m: Record<string, string> = {
+    pending: '排隊中', filled: '已成交', cancelled: '已撤', rejected: '被拒',
+  }
+  return m[s] || s
+}
+
+
+function OrderStatusBadge({ status }: { status: string }) {
+  const cls: Record<string, string> = {
+    pending: 'bg-blue-100 text-blue-700',
+    filled: 'bg-green-100 text-green-700',
+    cancelled: 'bg-gray-100 text-gray-500',
+    rejected: 'bg-red-100 text-red-700',
+  }
+  return (
+    <span className={`px-1.5 py-0.5 rounded ${cls[status] || 'bg-gray-100'}`}>
+      {orderStatusText(status)}
+    </span>
   )
 }
 

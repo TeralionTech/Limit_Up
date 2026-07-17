@@ -245,3 +245,23 @@ def trading_close_all():
     except RuntimeError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "sold_symbols": sold}
+
+
+@router.get("/trading/orders")
+def trading_orders():
+    """委託總表 (真實模式) — 新的在前。前端委託狀態表 + 右鍵刪單用。"""
+    return {"orders": Runner.get().session.get_orders()}
+
+
+class CancelOrderReq(BaseModel):
+    order_no: str
+
+
+@router.post("/trading/cancel_order")
+def trading_cancel_order(req: CancelOrderReq):
+    """手動刪單 (前端右鍵選單)。"""
+    try:
+        Runner.get().session.cancel_order_by_no(req.order_no)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}

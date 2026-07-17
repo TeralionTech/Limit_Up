@@ -67,6 +67,8 @@ class TradingSession:
         # per-symbol state
         self.trades: Dict[str, SymbolTrade] = {}
         self._processed_fills: set = set()   # 去重 key
+        # 委託總表 (前端委託狀態顯示 + 右鍵刪單) — key=order_no, 插入序
+        self.order_log: Dict[str, dict] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
@@ -103,6 +105,28 @@ class TradingSession:
             if wait > 0:
                 time.sleep(wait)
             self._last_send = time.monotonic()
+
+    def _log_order(self, order_no: str, symbol: str, action: str, kind: str,
+                   lots: int, price: float):
+        """記進委託總表 (前端顯示用)。caller 不必持鎖。"""
+        with self._lock:
+            self.order_log[order_no] = {
+                "order_no": order_no,
+                "symbol": symbol,
+                "action": action,          # buy / sell
+                "kind": kind,              # pre_limit / market_buy / market_sell
+                "lots": lots,
+                "price": price,            # 0 = 市價
+                "status": "pending",       # pending / filled / cancelled / rejected
+                "filled_lots": 0,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            }
+
+    def _mark_order(self, order_no: str, status: str):
+        with self._lock:
+            row = self.order_log.get(order_no)
+            if row is not None and row["status"] == "pending":
+                row["status"] = status
 
     # ─── 連線 ──────────────────────────────────────────────
 
@@ -254,6 +278,7 @@ class TradingSession:
                     st.order_no = order_no
                     st.order_kind = "pre_limit"
                     st.order_status = "pending"
+                self._log_order(order_no, sym, "buy", "pre_limit", lots, limit_up)
             except Exception as e:
                 logger.error(f"[session] {sym} 預掛失敗 (不重試,9:00 市價追會救): {e}")
                 with self._lock:
@@ -332,6 +357,7 @@ class TradingSession:
                     st.order_no = new_no
                     st.order_kind = "market_buy"
                     st.order_status = "pending"
+                self._log_order(new_no, symbol, "buy", "market_buy", shortfall, 0)
                 logger.warning(f"[session] {symbol} 市價追 {shortfall} 張 → 委託成功 "
                                f"(第 {attempt} 次)")
                 return
@@ -363,6 +389,7 @@ class TradingSession:
                 st.order_no = ""
                 st.stopped_reason = st.stopped_reason or reason
                 self.budget_used -= unfilled * limit_up * 1000
+            self._mark_order(order_no, "cancelled")
             logger.warning(f"[session] {symbol} 撤單 ({reason})")
         except Exception as e:
             logger.error(f"[session] {symbol} 撤單失敗: {e}")
@@ -389,7 +416,8 @@ class TradingSession:
             for attempt in range(1, 4):
                 self._gate(self.order_min_interval)
                 try:
-                    self.broker.place_market_sell(symbol, lots, reason)
+                    sell_no = self.broker.place_market_sell(symbol, lots, reason)
+                    self._log_order(sell_no, symbol, "sell", "market_sell", lots, 0)
                     logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
                     return
                 except Exception as e:
@@ -422,7 +450,8 @@ class TradingSession:
             if lots > 0:
                 self._gate()
                 try:
-                    self.broker.place_market_sell(sym, lots, "close_all")
+                    sell_no = self.broker.place_market_sell(sym, lots, "close_all")
+                    self._log_order(sell_no, sym, "sell", "market_sell", lots, 0)
                     with self._lock:
                         self.trades[sym].exited = True
                     sold += 1
@@ -440,6 +469,12 @@ class TradingSession:
             if key in self._processed_fills:
                 return
             self._processed_fills.add(key)
+            # 委託總表同步 (前端顯示)
+            row = self.order_log.get(fill["order_no"])
+            if row is not None:
+                row["filled_lots"] += fill["lots"]
+                if row["filled_lots"] >= row["lots"]:
+                    row["status"] = "filled"
             st = self.trades.get(fill["symbol"])
             if st is None:
                 logger.warning(f"[session] 未知標的成交回報: {fill}")
@@ -459,12 +494,46 @@ class TradingSession:
         """委託回報 — 交易所拒單時標 rejected (place_order 同步成功但交易所退)。"""
         if not rpt.get("error_message"):
             return
+        self._mark_order(rpt.get("order_no", ""), "rejected")
         with self._lock:
             st = self.trades.get(rpt.get("symbol", ""))
             if st is not None and st.order_no == rpt.get("order_no"):
                 st.order_status = "rejected"
                 st.order_no = ""
                 logger.error(f"[session] {st.symbol} 交易所拒單: {rpt['error_message']}")
+
+    # ─── 委託總表 (前端顯示 + 右鍵刪單) ────────────────────
+
+    def get_orders(self) -> list:
+        """全部委託 (新的在前) — 前端委託狀態表用。"""
+        with self._lock:
+            return [dict(r) for r in reversed(list(self.order_log.values()))]
+
+    def cancel_order_by_no(self, order_no: str):
+        """手動刪單 (前端右鍵)。刪的是進場買單時 → 該檔停止進場 (manual_cancel)。"""
+        if not self._broker_ready():
+            raise RuntimeError("券商未連線")
+        with self._lock:
+            row = self.order_log.get(order_no)
+            if row is None:
+                raise ValueError(f"查無委託 {order_no}")
+            if row["status"] != "pending":
+                raise ValueError(f"委託 {order_no} 狀態 {row['status']},不可刪")
+            symbol = row["symbol"]
+            is_buy = row["action"] == "buy"
+        self._gate()
+        self.broker.cancel(order_no, symbol, reason="manual_cancel")
+        self._mark_order(order_no, "cancelled")
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is not None and st.order_no == order_no:
+                unfilled = max(0, st.target_lots - st.filled_lots)
+                st.order_status = "cancelled"
+                st.order_no = ""
+                if is_buy:
+                    st.stopped_reason = st.stopped_reason or "manual_cancel"
+                    self.budget_used -= unfilled * st.limit_up * 1000
+        logger.warning(f"[session] 手動刪單 {order_no} ({symbol})")
 
     # ─── 查詢 ──────────────────────────────────────────────
 
