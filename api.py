@@ -212,12 +212,15 @@ def trading_mode(req: TradingModeReq):
 class TradingParamsReq(BaseModel):
     total_budget: Optional[float] = None
     per_symbol_budget: Optional[float] = None
+    sizing_mode: Optional[str] = None       # "budget" / "fixed_lots"
+    fixed_lots: Optional[int] = None
 
 
 @router.post("/trading/params")
 def trading_params(req: TradingParamsReq):
     try:
-        Runner.get().session.set_params(req.total_budget, req.per_symbol_budget)
+        Runner.get().session.set_params(req.total_budget, req.per_symbol_budget,
+                                        req.sizing_mode, req.fixed_lots)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}

@@ -258,7 +258,8 @@ class RealOrderClient:
             return
         result = self.sdk.stock.cancel_order(self.account, obj)
         ts_accepted = time.time()
-        ok = bool(result) and getattr(result, "is_success", None) is not False
+        # 與下單一致用 is True 判斷 (原 is not False 會把 None/缺失誤判為成功)
+        ok = bool(result) and getattr(result, "is_success", None) is True
         self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-",
                         reason if ok else f"FAIL:{getattr(result, 'message', '?')}")
         if not ok:
@@ -307,10 +308,13 @@ class RealOrderClient:
             logger.error(f"[broker] filled 回報 err: {err}")
             return
         try:
-            # 帳號過濾 (共用 login 時別人的單不處理)
+            # 帳號不符只 warning、不 drop — 帳號格式若有差 (前導零/分行前綴/int-vs-str)
+            # silent drop 成交回報是致命的。真正的安全網在下游 session._on_fill 的
+            # 「order_no ∈ order_log」過濾 (order_no 天然唯一,非策略單自然被擋)。
             acct = str(_attr(content, "account", default=""))
             if acct and self.account_no and acct != self.account_no:
-                return
+                logger.warning(f"[broker] 成交回報帳號 {acct} != 登入 {self.account_no} "
+                               f"— 仍轉發 (下游 order_no 過濾把關)")
             qty = int(_attr(content, "filled_qty", "filledQty", default=0) or 0)
             fill = {
                 "symbol": str(_attr(content, "stock_no", "symbol", default="")),

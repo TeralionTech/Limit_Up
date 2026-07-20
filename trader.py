@@ -242,27 +242,39 @@ class Trader:
                         f"(成交 {h.first_trade.get('price')} × {h.first_trade.get('lots')} 張) → 追蹤")
 
     def _fail_first(self, h: Holding, reason: str):
-        """第一盤檢查淘汰 — 同 filter unmark: 永久丟棄 + 退訂 + [real] 撤委託。"""
+        """第一盤檢查淘汰 — 永久丟棄。[real] 有部位→市價出場;沒部位→撤 pending。
+
+        ⚠️ 關鍵: 開盤預掛單可能已成交 (持倉)。若無腦退訂 → 抱著部位停收行情,
+        之後委賣出現偵測不到 → 出不了場。所以:有已成交部位時**市價賣出 + 不退訂**
+        (留著收行情直到賣掉);只有無部位才退訂。
+        """
         h.status = Holding.DISCARDED_FIRST
         h.first_fail_reason = reason
-        # [real] 已掛委託 → 撤;還沒掛 → session 標 stopped 不再下 (no-op when sim)
+        has_position = False
         if self.session is not None:
             try:
-                self.session.cancel_symbol_orders(h.symbol, f"first_check: {reason}")
+                has_position = self.session.get_filled_lots(h.symbol) > 0
+                if has_position:
+                    # 撤 pending + 市價賣出全部已成交 (同「出現賣單→出場」路徑)
+                    self.session.exit_position(h.symbol, f"first_check: {reason}")
+                else:
+                    self.session.cancel_symbol_orders(h.symbol, f"first_check: {reason}")
             except Exception as e:
-                logger.error(f"[trader] {h.symbol} 撤委託失敗: {e}")
-        # 同步 filter state (FilterPage 丟棄清單看得到) + 退訂
+                logger.error(f"[trader] {h.symbol} 淘汰處理委託/部位失敗: {e}")
+        # 同步 filter state (FilterPage 丟棄清單看得到)
         if self.state:
             try:
                 self.state.unmark_first_check(h.symbol, reason)
             except Exception:
                 pass
-        if self.unsub_fn:
+        # 退訂只在「無已成交部位」時做 — 有部位要留著收行情直到市價賣掉確認
+        if self.unsub_fn and not has_position:
             try:
                 self.unsub_fn(h.symbol)
             except Exception as e:
                 logger.warning(f"[trader] 退訂 {h.symbol} 失敗: {e}")
-        logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}")
+        logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}"
+                       f"{' (持倉→市價出場,不退訂)' if has_position else ''}")
 
     def _pull(self, h: Holding, reason: str):
         """盤中撤單 — 標狀態 + [real] 撤該檔 pending 委託。持續收資料 (不退訂)。"""

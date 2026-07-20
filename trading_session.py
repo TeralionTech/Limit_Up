@@ -60,7 +60,11 @@ class TradingSession:
         self.broker = None                # broker.RealOrderClient
         self.connecting = False
         self.connect_error = ""
-        # 預算 (雙層): 進場前 used + cost <= total 才下
+        # 下單量配置:
+        #   sizing_mode="budget"    → 每檔 min(每檔上限, 總預算餘額)/成本 (雙層金額)
+        #   sizing_mode="fixed_lots"→ 每檔固定 fixed_lots 張 (仍受總預算餘額 cap)
+        self.sizing_mode: str = "budget"
+        self.fixed_lots: int = 0
         self.total_budget: float = 0.0
         self.per_symbol_budget: float = 0.0
         self.budget_used: float = 0.0     # 下單時保留,撤單釋放未成交部分
@@ -216,8 +220,18 @@ class TradingSession:
         logger.info(f"[session] mode = {mode}")
 
     def set_params(self, total_budget: Optional[float] = None,
-                   per_symbol_budget: Optional[float] = None):
+                   per_symbol_budget: Optional[float] = None,
+                   sizing_mode: Optional[str] = None,
+                   fixed_lots: Optional[int] = None):
         with self._lock:
+            if sizing_mode is not None:
+                if sizing_mode not in ("budget", "fixed_lots"):
+                    raise ValueError("sizing_mode 必須是 budget 或 fixed_lots")
+                self.sizing_mode = sizing_mode
+            if fixed_lots is not None:
+                if fixed_lots < 0:
+                    raise ValueError("fixed_lots >= 0")
+                self.fixed_lots = int(fixed_lots)
             if total_budget is not None:
                 if total_budget < 0:
                     raise ValueError("total_budget >= 0")
@@ -226,7 +240,8 @@ class TradingSession:
                 if per_symbol_budget < 0:
                     raise ValueError("per_symbol_budget >= 0")
                 self.per_symbol_budget = float(per_symbol_budget)
-        logger.info(f"[session] 預算: 總 {self.total_budget:,.0f} / 每檔 {self.per_symbol_budget:,.0f}")
+        logger.info(f"[session] 配置: mode={self.sizing_mode} 固定 {self.fixed_lots} 張 / "
+                    f"總預算 {self.total_budget:,.0f} / 每檔 {self.per_symbol_budget:,.0f}")
 
     def set_armed(self, armed: bool):
         """kill switch。開啟前 pre-flight (day-trade 模式): 連線健康 + 預算已設。"""
@@ -235,8 +250,13 @@ class TradingSession:
                 raise RuntimeError("模擬模式不能開始交易 (先切真實模式)")
             if not self._broker_ready():
                 raise RuntimeError("券商未連線或連線不健康")
-            if self.total_budget <= 0 or self.per_symbol_budget <= 0:
-                raise RuntimeError("先設定總預算與每檔上限 (皆需 > 0)")
+            if self.total_budget <= 0:
+                raise RuntimeError("先設定總預算 (> 0)")
+            if self.sizing_mode == "fixed_lots":
+                if self.fixed_lots <= 0:
+                    raise RuntimeError("固定張數模式: 先設定每檔張數 (> 0)")
+            elif self.per_symbol_budget <= 0:
+                raise RuntimeError("依金額模式: 先設定每檔上限 (> 0)")
         with self._lock:
             self.armed = armed
         logger.warning(f"[session] ⚡ armed = {armed}")
@@ -252,11 +272,17 @@ class TradingSession:
     # ─── 預算/張數 ─────────────────────────────────────────
 
     def _calc_lots(self, limit_up: float) -> int:
-        """雙層預算: floor(min(每檔上限, 總預算餘額) / (漲停價×1000))。caller 持鎖。"""
+        """算該檔下單張數。caller 持鎖。總預算餘額永遠是硬上限。
+        - budget 模式: floor(min(每檔上限, 總預算餘額) / (漲停價×1000))
+        - fixed_lots 模式: min(fixed_lots, 總預算餘額能買的張數)"""
         cost_per_lot = limit_up * 1000
         if cost_per_lot <= 0:
             return 0
         remaining = self.total_budget - self.budget_used
+        budget_cap = int(remaining // cost_per_lot)     # 總預算餘額能買幾張 (硬上限)
+        if self.sizing_mode == "fixed_lots":
+            return max(0, min(self.fixed_lots, budget_cap))
+        # budget 模式 (預設): 再受每檔上限約束
         alloc = min(self.per_symbol_budget, remaining)
         return max(0, int(alloc // cost_per_lot))
 
@@ -600,6 +626,12 @@ class TradingSession:
             st = self.trades.get(symbol)
             return st is not None and st.order_status == "pending"
 
+    def get_filled_lots(self, symbol: str) -> int:
+        """該檔已成交張數 (trader 淘汰時判斷要不要先市價賣掉部位)。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            return st.filled_lots if st else 0
+
     def get_symbol_state(self, symbol: str) -> Optional[dict]:
         with self._lock:
             st = self.trades.get(symbol)
@@ -617,6 +649,8 @@ class TradingSession:
                 "connect_error": self.connect_error,
                 **b,
                 "params": {
+                    "sizing_mode": self.sizing_mode,
+                    "fixed_lots": self.fixed_lots,
                     "total_budget": self.total_budget,
                     "per_symbol_budget": self.per_symbol_budget,
                 },

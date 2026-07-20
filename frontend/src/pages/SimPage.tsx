@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useState } from 'react'
+import { ReactNode, useEffect, useRef, useState } from 'react'
 import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade, OrderRow } from '../api'
 
 export default function SimPage() {
@@ -292,9 +292,11 @@ function TradingPanel() {
   const [pfxPwd, setPfxPwd] = useState('')
   const [pfxFile, setPfxFile] = useState<File | null>(null)
   const [isTest, setIsTest] = useState(false)
-  // 預算
+  // 下單量配置
+  const [sizingMode, setSizingMode] = useState<'budget' | 'fixed_lots'>('budget')
   const [totalBudget, setTotalBudget] = useState('')
   const [perBudget, setPerBudget] = useState('')
+  const [fixedLots, setFixedLots] = useState('')
   // 委託總表 + 右鍵選單
   const [orders, setOrders] = useState<OrderRow[]>([])
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; order: OrderRow } | null>(null)
@@ -328,15 +330,16 @@ function TradingPanel() {
     }
   }, [ctxMenu])
 
-  // 帶入後端已設的預算 (只在欄位還空時)
+  // 帶入後端已設的參數 — 一次性 (之後由使用者輸入主導,不被 2s 輪詢覆蓋)
+  const seeded = useRef(false)
   useEffect(() => {
-    if (ts && totalBudget === '' && ts.params.total_budget > 0) {
-      setTotalBudget(String(ts.params.total_budget))
-    }
-    if (ts && perBudget === '' && ts.params.per_symbol_budget > 0) {
-      setPerBudget(String(ts.params.per_symbol_budget))
-    }
-  }, [ts])  // eslint-disable-line react-hooks/exhaustive-deps
+    if (!ts || seeded.current) return
+    seeded.current = true
+    if (ts.params.total_budget > 0) setTotalBudget(String(ts.params.total_budget))
+    if (ts.params.per_symbol_budget > 0) setPerBudget(String(ts.params.per_symbol_budget))
+    if ((ts.params.fixed_lots ?? 0) > 0) setFixedLots(String(ts.params.fixed_lots))
+    if (ts.params.sizing_mode) setSizingMode(ts.params.sizing_mode)
+  }, [ts])
 
   const flash = (m: string) => { setMsg(m); window.setTimeout(() => setMsg(''), 5000) }
 
@@ -363,10 +366,23 @@ function TradingPanel() {
   }
 
   async function saveBudget() {
-    const t = parseFloat(totalBudget); const p = parseFloat(perBudget)
-    if (!(t > 0) || !(p > 0)) { flash('✗ 總預算與每檔上限都要 > 0'); return }
-    try { await api.tradingParams({ total_budget: t, per_symbol_budget: p }); flash('✓ 預算已套用') }
-    catch (e: any) { flash(`✗ ${e.message}`) }
+    const t = parseFloat(totalBudget)
+    if (!(t > 0)) { flash('✗ 總預算要 > 0'); return }
+    if (sizingMode === 'fixed_lots') {
+      const n = parseInt(fixedLots, 10)
+      if (!(n > 0)) { flash('✗ 固定張數模式: 每檔張數要 > 0'); return }
+      try {
+        await api.tradingParams({ sizing_mode: 'fixed_lots', total_budget: t, fixed_lots: n })
+        flash(`✓ 已套用: 每檔固定 ${n} 張 (總預算上限 ${t.toLocaleString()})`)
+      } catch (e: any) { flash(`✗ ${e.message}`) }
+    } else {
+      const p = parseFloat(perBudget)
+      if (!(p > 0)) { flash('✗ 依金額模式: 每檔上限要 > 0'); return }
+      try {
+        await api.tradingParams({ sizing_mode: 'budget', total_budget: t, per_symbol_budget: p })
+        flash('✓ 已套用: 依金額')
+      } catch (e: any) { flash(`✗ ${e.message}`) }
+    }
   }
 
   async function toggleArm() {
@@ -462,22 +478,38 @@ function TradingPanel() {
             </div>
           )}
 
-          {/* 已連線: 預算 + 開始交易 + 緊急全平 */}
+          {/* 已連線: 配置方式 + 開始交易 + 緊急全平 */}
           {ts?.connected && (
             <div className="flex items-end gap-2 flex-wrap text-sm">
+              <Field label="配置方式">
+                <select value={sizingMode}
+                        onChange={e => setSizingMode(e.target.value as 'budget' | 'fixed_lots')}
+                        className="border rounded px-2 py-1.5 w-28">
+                  <option value="budget">依金額</option>
+                  <option value="fixed_lots">固定張數</option>
+                </select>
+              </Field>
               <Field label="總預算 (元)">
                 <input type="number" min={0} value={totalBudget}
                        onChange={e => setTotalBudget(e.target.value)}
                        className="border rounded px-2 py-1.5 w-36 font-mono" placeholder="例 1000000" />
               </Field>
-              <Field label="每檔上限 (元)">
-                <input type="number" min={0} value={perBudget}
-                       onChange={e => setPerBudget(e.target.value)}
-                       className="border rounded px-2 py-1.5 w-36 font-mono" placeholder="例 200000" />
-              </Field>
+              {sizingMode === 'budget' ? (
+                <Field label="每檔上限 (元)">
+                  <input type="number" min={0} value={perBudget}
+                         onChange={e => setPerBudget(e.target.value)}
+                         className="border rounded px-2 py-1.5 w-36 font-mono" placeholder="例 200000" />
+                </Field>
+              ) : (
+                <Field label="每檔張數">
+                  <input type="number" min={1} value={fixedLots}
+                         onChange={e => setFixedLots(e.target.value)}
+                         className="border rounded px-2 py-1.5 w-28 font-mono" placeholder="例 5" />
+                </Field>
+              )}
               <button onClick={saveBudget}
                       className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded font-medium">
-                套用預算
+                套用
               </button>
               <button onClick={toggleArm}
                       className={`px-5 py-2 rounded font-bold text-white ${

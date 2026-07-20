@@ -30,7 +30,8 @@ export const api = {
     req<{ ok: boolean }>('/api/trading/disconnect', { method: 'POST' }),
   tradingMode: (mode: 'sim' | 'real') =>
     req<{ ok: boolean }>('/api/trading/mode', { method: 'POST', body: JSON.stringify({ mode }) }),
-  tradingParams: (p: { total_budget?: number; per_symbol_budget?: number }) =>
+  tradingParams: (p: { total_budget?: number; per_symbol_budget?: number;
+                        sizing_mode?: 'budget' | 'fixed_lots'; fixed_lots?: number }) =>
     req<{ ok: boolean }>('/api/trading/params', { method: 'POST', body: JSON.stringify(p) }),
   tradingArm: (armed: boolean) =>
     req<{ ok: boolean }>('/api/trading/arm', { method: 'POST', body: JSON.stringify({ armed }) }),
@@ -168,7 +169,10 @@ export interface TradingStatus {
   account_masked: string
   is_test: boolean
   error: string
-  params: { total_budget: number; per_symbol_budget: number }
+  params: {
+    total_budget: number; per_symbol_budget: number
+    sizing_mode?: 'budget' | 'fixed_lots'; fixed_lots?: number
+  }
   budget_used: number
   n_symbols: number
   n_positions: number
