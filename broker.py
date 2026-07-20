@@ -197,12 +197,53 @@ class RealOrderClient:
                             "MARKET" if market else price, str(msg)[:80])
             raise RuntimeError(f"下單被拒 {symbol}: {msg}")
 
-        order_no = str(_attr(getattr(result, "data", None), "order_no", default="?"))
+        order_no = str(_attr(getattr(result, "data", None), "order_no", default="") or "")
+        if not order_no or order_no in ("?", "None"):
+            # 委託已被接受但回傳缺書號 (防禦路徑) — 反查認領,消除追蹤破口。
+            # 不 raise: raise 會觸發上層重試 → 重複下單,比丟追蹤更糟。
+            order_no = self._recover_order_no(symbol, buy, lots)
+            if not order_no:
+                logger.critical(f"[broker] ⚠⚠ {symbol} 委託已送出但無法取得書號!"
+                                f"未追蹤曝險 — 請立即人工至券商查驗 (user_def=hitlimit)")
+                order_no = f"UNKNOWN-{int(ts_sent)}"
         self._write_row(order_no, ts_sent, ts_accepted, action, symbol, lots,
                         "MARKET" if market else price, extra)
         logger.info(f"[broker] {action} {symbol} × {lots} 張 @ "
                     f"{'MKT' if market else price} → order_no={order_no}")
         return order_no
+
+    def _recover_order_no(self, symbol: str, buy: bool, lots: int) -> str:
+        """place 回傳缺書號時,用 get_order_results 反查認領。
+
+        候選 = user_def=="hitlimit" (策略單權威識別) + 標的 + 買賣別 + 股數 全相符
+        且書號有值。**恰好 1 筆才認領** — 0 或多筆一律回 "" (寧可不認不亂認;
+        狀態機每檔同時僅一張活躍委託,此路徑只在剛下單瞬間觸發,正常必唯一)。
+        """
+        try:
+            result = self.sdk.stock.get_order_results(self.account)
+            if not result or not getattr(result, "is_success", False):
+                return ""
+            candidates = []
+            for o in (result.data or []):
+                if str(_attr(o, "user_def", "userDef", default="") or "") != "hitlimit":
+                    continue
+                if str(_attr(o, "stock_no", "symbol", default="")) != symbol:
+                    continue
+                if _norm_enum(getattr(o, "buy_sell", "")) != ("Buy" if buy else "Sell"):
+                    continue
+                if int(_attr(o, "quantity", default=0) or 0) != lots * 1000:
+                    continue
+                no = str(getattr(o, "order_no", "") or "")
+                if no:
+                    candidates.append(no)
+            if len(candidates) == 1:
+                logger.warning(f"[broker] {symbol} 書號反查認領成功: {candidates[0]}")
+                return candidates[0]
+            logger.error(f"[broker] {symbol} 書號反查候選 {len(candidates)} 筆 — 不認領")
+            return ""
+        except Exception as e:
+            logger.error(f"[broker] {symbol} 書號反查失敗: {e}")
+            return ""
 
     # ─── 撤單 ──────────────────────────────────────────────
 
