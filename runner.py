@@ -161,6 +161,10 @@ class Runner:
         for k, v in self._param_overrides.items():
             setattr(self.cfg, k, v)
 
+        # 每日重置交易 state (新交易日 → 清前日 trades/委託表/預算 + armed=False;
+        # 同日手動重啟 → 保留當日 state。連線不動。)
+        self.session.roll_day(datetime.now().strftime("%Y-%m-%d"))
+
         # 交易會話策略參數 (500 上限 / 送單間隔 / 13:23 撤單時點)
         self.session.configure(
             max_stock_price=self.cfg.max_stock_price,
@@ -285,6 +289,17 @@ class Runner:
         self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
         self.trader.start()
 
+        # 種子化首筆成交 — 開盤撮合 trade 可能在 handler 掛上前就到了
+        # (08:59:58 已先訂 trades,subscriber buffer 有存);on_trade 冪等 (first_trade_seen)
+        for _sym in watchlist:
+            try:
+                _snap = self.subscriber.get_latest_snapshot(_sym)
+                _lt = (_snap or {}).get("last_trade")
+                if _lt and _lt.get("price"):
+                    self.trader.on_trade(_sym, _lt)
+            except Exception:
+                pass
+
         from filter import _wait_until
         _wait_until(self.cfg.trading_end_time, self.trader, self.cfg)
 
@@ -329,6 +344,12 @@ class Runner:
             if not marked:
                 logger.info("[runner] PRE_ORDER_TIME 到但 marked 清單空 — 不預掛")
                 return
+            # 先訂 trades — 9:00 才訂會漏掉開盤撮合那筆成交 (訂閱來回要百毫秒級,
+            # 不重播)。此刻訂好,開盤 trade 會進 subscriber buffer,9:00 轉場後種子化。
+            try:
+                self.subscriber.subscribe_trades_for(marked)
+            except Exception as e:
+                logger.warning(f"[runner] 預掛時訂 trades 失敗: {e}")
             try:
                 self.session.place_pre_orders(marked, self.limit_ups, self._stop_event)
             except Exception as e:

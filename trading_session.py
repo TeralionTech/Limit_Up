@@ -76,6 +76,30 @@ class TradingSession:
         # 全域送單閘門 (所有 place/cancel 過這裡,硬底線 50/s)
         self._send_lock = threading.Lock()
         self._last_send = 0.0
+        # 交易日 (roll_day 每日重置用)
+        self._trade_date: str = ""
+
+    def roll_day(self, date_str: str):
+        """每日重置 (runner 每天 8:00 開跑時呼叫)。
+
+        日期變了 → 清掉前一日的 per-day state (trades/order_log/fill去重/預算),
+        並強制 **armed=False** — 每天都必須手動重新按「開始交易」(安全預設)。
+        同日重複呼叫 (盤中手動重啟 runner) → 不清,保留當日委託/持倉 state
+        (券商端委託仍有效,清了會失去追蹤)。連線 (broker) 不動。
+        """
+        with self._lock:
+            if self._trade_date == date_str:
+                logger.info(f"[session] roll_day({date_str}) — 同日重啟,state 保留")
+                return
+            had = len(self.trades)
+            self._trade_date = date_str
+            self.trades.clear()
+            self.order_log.clear()
+            self._processed_fills.clear()
+            self.budget_used = 0.0
+            self.armed = False
+        logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
+                       f"armed=False (要交易請重新 arm)")
 
     def configure(self, max_stock_price: float = None,
                   order_min_interval_sec: float = None,
@@ -320,6 +344,24 @@ class TradingSession:
             except Exception as e:
                 logger.error(f"[session] {symbol} 撤預掛單失敗: {e}")
                 return
+            # 1b) 向券商查該單「權威成交量」— 防競態: 開盤已(部分)成交但 fill 回報
+            #     比首筆成交 tick 慢 → 記憶體 filled_lots 偏低 → 差額算太大 → 雙倍買。
+            self._gate(0.2)      # 委託/帳務查詢 5/s
+            try:
+                auth = self.broker.get_order_filled_lots(order_no)
+            except Exception as e:
+                logger.error(f"[session] {symbol} 查權威成交量失敗 ({e}) — 保守不追")
+                return
+            if auth < 0:
+                logger.error(f"[session] {symbol} 查無委託 {order_no} — 保守不追")
+                return
+            with self._lock:
+                if auth > st.filled_lots:
+                    delta = auth - st.filled_lots
+                    st.filled_lots = auth
+                    self.budget_used += delta * limit_up * 1000   # 補回這部分保留
+                    logger.warning(f"[session] {symbol} 權威成交量 {auth} 張 "
+                                   f"(記憶體 {auth - delta}) — 已校正,防雙倍買")
 
         # 2) 沒通過第一盤檢查 → 停止 (淘汰路徑 trader 會另呼叫 on_discard)
         if not passed:
@@ -470,6 +512,12 @@ class TradingSession:
             if key in self._processed_fills:
                 return
             self._processed_fills.add(key)
+            # 只認「策略下過的單」(order_no ∈ order_log) — 同帳號手動單的成交
+            # 不能混進策略部位 (否則差額算錯 + 出場連手動部位一起賣)
+            if fill["order_no"] not in self.order_log:
+                logger.info(f"[session] 非策略單成交,忽略: {fill['symbol']} "
+                            f"order={fill['order_no']} {fill['lots']} 張")
+                return
             # 委託總表同步 (前端顯示)
             row = self.order_log.get(fill["order_no"])
             if row is not None:
@@ -545,6 +593,12 @@ class TradingSession:
             if st is None or st.exited:
                 return False
             return st.filled_lots > 0 or st.order_status == "pending"
+
+    def has_pending(self, symbol: str) -> bool:
+        """該檔有排隊中委託 — trader「排隊中量減半→撤單」判斷用。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            return st is not None and st.order_status == "pending"
 
     def get_symbol_state(self, symbol: str) -> Optional[dict]:
         with self._lock:

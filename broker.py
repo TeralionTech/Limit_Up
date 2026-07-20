@@ -232,6 +232,16 @@ class RealOrderClient:
                     return o
         return None
 
+    def get_order_filled_lots(self, order_no: str) -> int:
+        """向券商查該委託的權威已成交張數。查無此單回 -1 (caller 保守處理)。
+        用途: 撤預掛後、市價追差額前,防「fill 回報晚到 → 差額算全額 → 雙倍買」競態。"""
+        self._require_ready()
+        obj = self._find_order_obj(order_no)
+        if obj is None:
+            return -1
+        filled_qty = int(_attr(obj, "filled_qty", "filledQty", default=0) or 0)
+        return filled_qty // 1000
+
     def get_pending_orders(self) -> list:
         """回當前委託清單 (重連/重啟重建 pending 用)。每項 dict。"""
         self._require_ready()

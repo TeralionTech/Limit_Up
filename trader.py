@@ -53,6 +53,7 @@ class Holding:
         # 盤中追蹤
         self.pulled_reason = ""
         self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
+        self.book_tick_count = 0         # 累計 books tick 數 (排隊中量減半檢查的暖機: >=3)
         self.prev_bid1_size: Optional[int] = None   # 上一個 tick 的委買一量 (tick 間比較)
         # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
         self.warning = ""
@@ -148,15 +149,29 @@ class Trader:
             h.prev_bid1_size = bid1_size
             return
 
+        h.book_tick_count += 1
+
         # === 盤中追蹤: 撤單條件 (只剩量減半) ===
         # 註: 原「委買一跌下漲停」條件已移除 — 盤中市價單會佔五檔第一列且 price=0
         # (例 0.00 × 1561, 漲停價買單在第二列), 拿 bids[0] 價格比會誤判跌下漲停。
+        qty_halved = bool(h.prev_bid1_size) and bid1_size < h.prev_bid1_size * 0.5
         if h.status == Holding.TRACKING:
             # 委買一量在兩 tick 之間減少 1/2 以上
             #   暖機: 第 3 筆成交後才判 — 避免開盤瞬間拿「盤前累積量」當基準造成誤撤。
             #   (prev_bid1_size 每 tick 都更新，到第 3 筆成交時基準已是盤後即時量)
-            if h.trade_count >= 3 and h.prev_bid1_size and bid1_size < h.prev_bid1_size * 0.5:
+            if h.trade_count >= 3 and qty_halved:
                 self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid1_size})")
+        elif (h.status == Holding.WAITING and qty_halved and h.book_tick_count >= 3
+              and self.session is not None and self.session.has_pending(symbol)):
+            # [real] 全鎖死無成交股 (WAITING, 沒有首筆成交) 排隊中的預掛單也要受
+            # 「量減半→撤單」保護 (規格 #3 主場景)。暖機改用 book tick 數 (≥3)。
+            # 只撤委託、Holding 狀態不動 (監控續跑)。
+            logger.warning(f"[trader] {symbol} 排隊中量減半 "
+                           f"({h.prev_bid1_size} → {bid1_size}) → 撤預掛單")
+            try:
+                self.session.cancel_symbol_orders(symbol, "qty_drop_half_queued")
+            except Exception as e:
+                logger.error(f"[trader] {symbol} 撤排隊委託失敗: {e}")
 
         h.prev_bid1_size = bid1_size
 
