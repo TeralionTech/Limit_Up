@@ -164,12 +164,12 @@ class RealOrderClient:
                            price=_fmt_price(price), market=False)
 
     def place_market_buy(self, symbol: str, lots: int) -> str:
-        return self._place(symbol, lots, buy=True, price="0", market=True)
+        return self._place(symbol, lots, buy=True, price=None, market=True)
 
     def place_market_sell(self, symbol: str, lots: int, reason: str = "") -> str:
-        return self._place(symbol, lots, buy=False, price="0", market=True, extra=reason)
+        return self._place(symbol, lots, buy=False, price=None, market=True, extra=reason)
 
-    def _place(self, symbol: str, lots: int, buy: bool, price: str,
+    def _place(self, symbol: str, lots: int, buy: bool, price,
                market: bool, extra: str = "") -> str:
         self._require_ready()
         from fubon_neo.sdk import Order
@@ -178,7 +178,9 @@ class RealOrderClient:
         order = Order(
             buy_sell=BSAction.Buy if buy else BSAction.Sell,
             symbol=symbol,
-            price=price,                       # 字串;市價 "0" (踩雷點 #1)
+            # 限價=字串;市價=**None** — 2026-07-22 實測: 帶 "0" 會被 SDK 本地驗證拒
+            # "Price should be empty" (委託沒送出)。day_trade worker.py 三處市價單全用 None。
+            price=None if market else price,
             quantity=lots * 1000,              # 股數 (踩雷點 #2)
             market_type=MarketType.Common,
             price_type=PriceType.Market if market else PriceType.Limit,

@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 _HARD_MIN_INTERVAL = 0.02
 # 撤預掛後、市價追之前的緩衝: 查無權威成交量時,等在途 fill 回報入帳再算差額
 _CHASE_GRACE_SEC = 1.0
+# 市價追連續失敗上限 — 永久性拒單 (SDK 驗證/處置股/資金不足) 重試不會過,
+# 無限空轉只會狂送拒單 (2026-07-22 實測教訓)。到上限 → 放棄該檔並標停止原因。
+_CHASE_MAX_CONSEC_FAIL = 10
 
 
 class SymbolTrade:
@@ -420,6 +423,8 @@ class TradingSession:
                 return
             self.budget_used += shortfall * limit_up * 1000
         attempt = 0
+        consec_fail = 0
+        last_err = ""
         abort_reason = ""
         while True:
             if not self.is_live():
@@ -432,6 +437,14 @@ class TradingSession:
             if (self.cancel_pending_time is not None
                     and datetime.now().time() >= self.cancel_pending_time):
                 abort_reason = "cancel_pending_time"
+                break
+            if consec_fail >= _CHASE_MAX_CONSEC_FAIL:
+                # 連續同類拒單到上限 → 放棄該檔,標停止原因 (前端「停止進場」hover 可見)
+                abort_reason = f"rejected×{consec_fail}: {last_err[:60]}"
+                with self._lock:
+                    st.stopped_reason = st.stopped_reason or abort_reason
+                logger.critical(f"[session] ⚠ {symbol} 市價追連續失敗 {consec_fail} 次 → "
+                                f"放棄進場。最後錯誤: {last_err}")
                 break
             self._gate(self.order_min_interval)
             attempt += 1
@@ -446,6 +459,8 @@ class TradingSession:
                                f"(第 {attempt} 次)")
                 return
             except Exception as e:
+                consec_fail += 1
+                last_err = str(e)
                 logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,續試): {e}")
         # 中止 → 釋放保留的預算
         with self._lock:
