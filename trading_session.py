@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 # 富邦 API 明定速率上限: 下單 50/s、批次下單 10/s、帳務查詢 5/s、連線數 10。
 # 所有 broker 呼叫 (place/cancel) 過全域送單閘門,硬底線 0.02s (= 50/s)。
 _HARD_MIN_INTERVAL = 0.02
+# 撤預掛後、市價追之前的緩衝: 查無權威成交量時,等在途 fill 回報入帳再算差額
+_CHASE_GRACE_SEC = 1.0
 
 
 class SymbolTrade:
@@ -367,27 +369,40 @@ class TradingSession:
                     st.order_no = ""
                     # 釋放未成交部分預算 (市價追會重新保留)
                     self.budget_used -= (target - filled) * limit_up * 1000
+                # 同步委託總表 (漏這行前端會永遠顯示排隊中 — 2026-07-22 實測 bug)
+                self._mark_order(order_no, "cancelled")
             except Exception as e:
                 logger.error(f"[session] {symbol} 撤預掛單失敗: {e}")
                 return
             # 1b) 向券商查該單「權威成交量」— 防競態: 開盤已(部分)成交但 fill 回報
             #     比首筆成交 tick 慢 → 記憶體 filled_lots 偏低 → 差額算太大 → 雙倍買。
-            self._gate(0.2)      # 委託/帳務查詢 5/s
-            try:
-                auth = self.broker.get_order_filled_lots(order_no)
-            except Exception as e:
-                logger.error(f"[session] {symbol} 查權威成交量失敗 ({e}) — 保守不追")
-                return
-            if auth < 0:
-                logger.error(f"[session] {symbol} 查無委託 {order_no} — 保守不追")
-                return
-            with self._lock:
-                if auth > st.filled_lots:
-                    delta = auth - st.filled_lots
-                    st.filled_lots = auth
-                    self.budget_used += delta * limit_up * 1000   # 補回這部分保留
-                    logger.warning(f"[session] {symbol} 權威成交量 {auth} 張 "
-                                   f"(記憶體 {auth - delta}) — 已校正,防雙倍買")
+            #     ⚠️「查無」是**正常情況** (剛被我們撤掉的單可能已不在委託查詢裡),
+            #     不能放棄追單 (2026-07-22 實測: 舊版在此保守 return → 5227 沒進場)。
+            auth = -1
+            for _q in range(3):
+                self._gate(0.2)      # 委託/帳務查詢 5/s
+                try:
+                    auth = self.broker.get_order_filled_lots(order_no)
+                    break
+                except Exception as e:
+                    logger.warning(f"[session] {symbol} 查權威成交量失敗 (第 {_q+1}/3 次): {e}")
+            if auth >= 0:
+                with self._lock:
+                    if auth > st.filled_lots:
+                        delta = auth - st.filled_lots
+                        st.filled_lots = auth
+                        self.budget_used += delta * limit_up * 1000   # 補回這部分保留
+                        logger.warning(f"[session] {symbol} 權威成交量 {auth} 張 "
+                                       f"(記憶體 {auth - delta}) — 已校正,防雙倍買")
+            else:
+                # 查無/查詢失敗 → 等在途 fill 回報入帳 (grace),用記憶體值續追。
+                # 雙倍買防護: grace 期間 on_filled (F6 過濾後) 照樣累進 filled_lots,
+                # 差額在 grace 之後才計算。
+                time.sleep(_CHASE_GRACE_SEC)
+                with self._lock:
+                    mem = st.filled_lots
+                logger.warning(f"[session] {symbol} 查無權威成交量 — grace {_CHASE_GRACE_SEC}s 後"
+                               f"以記憶體 {mem} 張計,續追差額")
 
         # 2) 沒通過第一盤檢查 → 停止 (淘汰路徑 trader 會另呼叫 on_discard)
         if not passed:
