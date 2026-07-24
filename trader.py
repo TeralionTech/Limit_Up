@@ -125,7 +125,11 @@ class Trader:
         h.last_ask1_size = ask1_size
         h.last_book_ts = datetime.now().isoformat(timespec="seconds")
 
-        # === [real] 委賣出現 → 立刻出場 (撤委託 + 市價賣出全部已成交) ===
+        # [real] 更新委買一價給 session (處置股出場要用委買一價限價賣)
+        if self.session is not None:
+            self.session.update_bid1(symbol, bid1_price)
+
+        # === [real] 委賣出現 → 立刻出場 (撤委託 + 賣出全部已成交;處置股用委買一價限價) ===
         # exited flag 在 session 內防重複;has_exposure 先擋掉無單無倉的檔避免每 tick 開 thread
         if asks_any and self.session is not None and self.session.has_exposure(symbol):
             self.session.exit_position(symbol, "ask_appeared")

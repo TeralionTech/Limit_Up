@@ -39,6 +39,8 @@ class SymbolTrade:
         self.avg_price = 0.0
         self.stopped_reason: str = ""  # 非空 = 此檔不再進場
         self.exited = False            # 已出場 (委賣出現)
+        self.is_disposition = False    # 處置股: 不撤預掛/不下市價買、出場改委買一價限價賣
+        self.last_bid1_price = 0.0     # 最近委買一價 (處置股出場限價賣用)
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +52,7 @@ class SymbolTrade:
             "avg_price": round(self.avg_price, 2),
             "stopped_reason": self.stopped_reason,
             "exited": self.exited,
+            "is_disposition": self.is_disposition,
         }
 
 
@@ -76,6 +79,8 @@ class TradingSession:
         self._processed_fills: set = set()   # 去重 key
         # 委託總表 (前端委託狀態顯示 + 右鍵刪單) — key=order_no, 插入序
         self.order_log: Dict[str, dict] = {}
+        # 處置股名單 (runner 從 ticker.isDisposition 填) — 影響下單機制
+        self.dispositions: Dict[str, bool] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
@@ -105,8 +110,25 @@ class TradingSession:
             self._processed_fills.clear()
             self.budget_used = 0.0
             self.armed = False
+            self.dispositions = {}
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
                        f"armed=False (要交易請重新 arm)")
+
+    def set_dispositions(self, dispositions: Dict[str, bool]):
+        """runner 抓完 ticker 後把處置股名單交進來。"""
+        with self._lock:
+            self.dispositions = dict(dispositions or {})
+        n = sum(1 for v in self.dispositions.values() if v)
+        logger.info(f"[session] 處置股名單: {n} 檔")
+
+    def update_bid1(self, symbol: str, bid1_price: float):
+        """trader 每 tick 更新委買一價 (處置股出場限價賣用)。只對有下單的檔記錄。"""
+        if bid1_price <= 0:
+            return
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is not None:
+                st.last_bid1_price = bid1_price
 
     def configure(self, max_stock_price: float = None,
                   order_min_interval_sec: float = None,
@@ -311,6 +333,7 @@ class TradingSession:
                     continue
                 st = self.trades.get(sym) or SymbolTrade(sym, limit_up)
                 self.trades[sym] = st
+                st.is_disposition = self.dispositions.get(sym, False)
                 if st.stopped_reason or st.order_no:
                     continue
                 # 只做漲停價 <= MAX_STOCK_PRICE 的股票 (0 = 不限)
@@ -354,6 +377,11 @@ class TradingSession:
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or st.exited:
+                return
+            # 處置股: 保留 08:59:58 的漲停價預掛限價單 — 不撤、不下市價追
+            # (處置股不能下市價單)。留著等分盤集合競價成交。
+            if st.is_disposition:
+                logger.warning(f"[session] {symbol} 處置股 — 保留預掛限價單,不撤不追市價")
                 return
             order_no = st.order_no if st.order_status == "pending" else ""
             filled = st.filled_lots
@@ -489,6 +517,32 @@ class TradingSession:
         threading.Thread(target=self._exit_worker, args=(symbol, reason),
                          name=f"exit-{symbol}", daemon=True).start()
 
+    def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str) -> bool:
+        """賣出 lots 張。處置股 → 委買一價**限價**賣 (不能下市價);其餘 → 市價賣。
+        試 3 次 (過閘門+等回報)。成功回 True。"""
+        disp = st.is_disposition
+        bid1 = st.last_bid1_price
+        if disp and bid1 <= 0:
+            logger.critical(f"[session] ⚠ {symbol} 處置股出場但無委買一價 → 無法限價賣,"
+                            f"部位 {lots} 張需人工處理")
+            return False
+        for attempt in range(1, 4):
+            self._gate(self.order_min_interval)
+            try:
+                if disp:
+                    sell_no = self.broker.place_limit_sell(symbol, bid1, lots, reason)
+                    self._log_order(sell_no, symbol, "sell", "limit_sell", lots, bid1)
+                    logger.warning(f"[session] ⚠ {symbol} 處置股出場 — 委買一價 {bid1} "
+                                   f"限價賣 {lots} 張 ({reason})")
+                else:
+                    sell_no = self.broker.place_market_sell(symbol, lots, reason)
+                    self._log_order(sell_no, symbol, "sell", "market_sell", lots, 0)
+                    logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
+                return True
+            except Exception as e:
+                logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt}/3 次): {e}")
+        return False
+
     def _exit_worker(self, symbol: str, reason: str):
         with self._lock:
             st = self.trades.get(symbol)
@@ -499,20 +553,10 @@ class TradingSession:
         with self._lock:
             lots = st.filled_lots
         if lots > 0:
-            # 出場賣單: 試 3 次 (每次過閘門+等回報);全失敗 → exited 還原,
-            # 下一個委賣 tick 會再觸發 (等效持續重試,但不在這裡空轉)
-            for attempt in range(1, 4):
-                self._gate(self.order_min_interval)
-                try:
-                    sell_no = self.broker.place_market_sell(symbol, lots, reason)
-                    self._log_order(sell_no, symbol, "sell", "market_sell", lots, 0)
-                    logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
-                    return
-                except Exception as e:
-                    logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt}/3 次): {e}")
-            with self._lock:
-                st.exited = False   # 賣失敗,允許下一次觸發重試
-            logger.error(f"[session] {symbol} 出場賣單 3 次全失敗!部位 {lots} 張仍在")
+            if not self._sell_position(symbol, st, lots, reason):
+                with self._lock:
+                    st.exited = False   # 賣失敗,允許下一個委賣 tick 再觸發
+                logger.error(f"[session] {symbol} 出場賣單 3 次全失敗!部位 {lots} 張仍在")
 
     def cancel_all_pending(self, reason: str):
         """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。"""
@@ -536,16 +580,12 @@ class TradingSession:
         sold = 0
         for sym, lots in snapshot:
             if lots > 0:
-                self._gate()
-                try:
-                    sell_no = self.broker.place_market_sell(sym, lots, "close_all")
-                    self._log_order(sell_no, sym, "sell", "market_sell", lots, 0)
+                st = self.trades[sym]
+                if self._sell_position(sym, st, lots, "close_all"):
                     with self._lock:
-                        self.trades[sym].exited = True
+                        st.exited = True
                     sold += 1
-                except Exception as e:
-                    logger.error(f"[session] close_all 賣 {sym} 失敗: {e}")
-        logger.warning(f"[session] 🚨 緊急全平: 賣出 {sold} 檔")
+        logger.warning(f"[session] 🚨 緊急全平: 賣出 {sold} 檔 (處置股用委買一價限價)")
         return sold
 
     # ─── broker 回報 ───────────────────────────────────────

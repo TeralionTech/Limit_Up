@@ -169,6 +169,11 @@ class RealOrderClient:
     def place_market_sell(self, symbol: str, lots: int, reason: str = "") -> str:
         return self._place(symbol, lots, buy=False, price=None, market=True, extra=reason)
 
+    def place_limit_sell(self, symbol: str, price: float, lots: int, reason: str = "") -> str:
+        """限價賣 (處置股出場用 — 委買一價,積極限價立即成交;處置股不能下市價)。回 order_no。"""
+        return self._place(symbol, lots, buy=False,
+                           price=_fmt_price(price), market=False, extra=reason)
+
     def _place(self, symbol: str, lots: int, buy: bool, price,
                market: bool, extra: str = "") -> str:
         self._require_ready()

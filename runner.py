@@ -55,6 +55,7 @@ class Runner:
         self.sdk = None
         self.universe: list = []
         self.limit_ups: Dict[str, float] = {}
+        self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
         self.state = None                # state.State
         self.subscriber = None
         self.trader = None
@@ -190,6 +191,8 @@ class Runner:
         self.limit_ups = self._load_or_fetch_limit_ups()
         if not self.limit_ups:
             raise RuntimeError("limit_ups 全 fail")
+        # 把處置股名單交給交易會話 (下單機制: 處置股不撤預掛/不下市價買、出場改委買一價賣)
+        self.session.set_dispositions(self.dispositions)
 
         # Phase 4: Subscribe
         self.phase = Phase.SUBSCRIBE
@@ -415,6 +418,7 @@ class Runner:
         output_dir.mkdir(exist_ok=True)
         today = datetime.now().strftime("%Y-%m-%d")
         cache_file = output_dir / f"{today}_limit_ups.json"
+        disp_file = output_dir / f"{today}_dispositions.json"
 
         # 讀 cache
         if cache_file.exists():
@@ -428,11 +432,18 @@ class Runner:
                         "done": len(cached), "total": len(cached),
                         "ok": len(cached), "fail": 0,
                     }
+                    # 處置股 cache (best-effort;缺 → 全視為非處置股,安全預設)
+                    if disp_file.exists():
+                        try:
+                            with disp_file.open(encoding="utf-8") as f:
+                                self.dispositions = {k: bool(v) for k, v in _json.load(f).items()}
+                        except Exception:
+                            pass
                     return {k: float(v) for k, v in cached.items()}
             except Exception as e:
                 logger.warning(f"[runner] cache 讀失敗 ({e})，改走 REST 重抓")
 
-        # cache miss → 抓 (含重試補齊) + 存
+        # cache miss → 抓 (含重試補齊) + 存 (self.dispositions 在 _query_limit_up 內填)
         logger.info(f"[runner] 無當日 cache，開始抓 {len(self.universe)} 檔漲停價 "
                     f"(盤前分批上架，會重試補齊到 {self.cfg.limit_up_fetch_deadline})...")
         result = self._fetch_limit_ups_with_progress()
@@ -441,7 +452,11 @@ class Runner:
             try:
                 with cache_file.open("w", encoding="utf-8") as f:
                     _json.dump(result, f, ensure_ascii=False, indent=2)
-                logger.info(f"[runner] cache 已寫 {cache_file.name} ({len(result)} 檔)")
+                n_disp = sum(1 for v in self.dispositions.values() if v)
+                with disp_file.open("w", encoding="utf-8") as f:
+                    _json.dump(self.dispositions, f, ensure_ascii=False, indent=2)
+                logger.info(f"[runner] cache 已寫 {cache_file.name} ({len(result)} 檔,"
+                            f"其中處置股 {n_disp} 檔)")
             except Exception as e:
                 logger.warning(f"[runner] cache 寫失敗: {e}")
         return result
@@ -506,10 +521,13 @@ class Runner:
         return result
 
     def _query_limit_up(self, stock, sym: str):
-        """查單檔漲停價 — 回 float 或 None (空值/例外都回 None，交給重試補)。"""
+        """查單檔漲停價 — 回 float 或 None (空值/例外都回 None，交給重試補)。
+        順便把 isDisposition (處置股) 記進 self.dispositions (下單機制要用)。"""
         try:
             resp = stock.intraday.ticker(symbol=sym)
             up = resp.get("limitUpPrice") or resp.get("limit_up")
+            if up:
+                self.dispositions[sym] = bool(resp.get("isDisposition"))
             return float(up) if up else None
         except Exception:
             return None
