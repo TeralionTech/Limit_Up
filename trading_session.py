@@ -20,9 +20,6 @@ logger = logging.getLogger(__name__)
 # 富邦 API 明定速率上限: 下單 50/s、批次下單 10/s、帳務查詢 5/s、連線數 10。
 # 所有 broker 呼叫 (place/cancel) 過全域送單閘門,硬底線 0.02s (= 50/s)。
 _HARD_MIN_INTERVAL = 0.02
-# 市價追連續失敗上限 — 永久性拒單 (SDK 驗證/處置股/資金不足) 重試不會過,
-# 無限空轉只會狂送拒單 (2026-07-22 實測教訓)。到上限 → 放棄該檔並標停止原因。
-_CHASE_MAX_CONSEC_FAIL = 10
 
 
 class SymbolTrade:
@@ -439,9 +436,11 @@ class TradingSession:
             if shortfall <= 0 or st.stopped_reason:
                 return
             self.budget_used += shortfall * limit_up * 1000
+        # 市價追: **重試到成功為止** (使用者定案 2026-07-27,移除連續失敗上限)。
+        # 送單全程過全域閘門 (硬底線 0.02s = 50/s;富邦下單上限),多標的同時追時
+        # 全域不會超速;失敗後單檔退避 order_min_interval,避免單一失敗標的獨佔額度。
+        # 中止只在: kill switch 關 / 該檔淘汰或出場 / 13:23 (CANCEL_PENDING_TIME) 到。
         attempt = 0
-        consec_fail = 0
-        last_err = ""
         abort_reason = ""
         while True:
             if not self.is_live():
@@ -455,15 +454,7 @@ class TradingSession:
                     and datetime.now().time() >= self.cancel_pending_time):
                 abort_reason = "cancel_pending_time"
                 break
-            if consec_fail >= _CHASE_MAX_CONSEC_FAIL:
-                # 連續同類拒單到上限 → 放棄該檔,標停止原因 (前端「停止進場」hover 可見)
-                abort_reason = f"rejected×{consec_fail}: {last_err[:60]}"
-                with self._lock:
-                    st.stopped_reason = st.stopped_reason or abort_reason
-                logger.critical(f"[session] ⚠ {symbol} 市價追連續失敗 {consec_fail} 次 → "
-                                f"放棄進場。最後錯誤: {last_err}")
-                break
-            self._gate(self.order_min_interval)
+            self._gate()      # 全域 50/s 硬上限 (多標的共用同一送單閘門)
             attempt += 1
             try:
                 new_no = self.broker.place_market_buy(symbol, shortfall)
@@ -476,9 +467,8 @@ class TradingSession:
                                f"(第 {attempt} 次)")
                 return
             except Exception as e:
-                consec_fail += 1
-                last_err = str(e)
-                logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,續試): {e}")
+                logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,續試至成功): {e}")
+                time.sleep(self.order_min_interval)   # 單檔退避 (不佔全域額度)
         # 中止 → 釋放保留的預算
         with self._lock:
             self.budget_used -= shortfall * limit_up * 1000
@@ -517,17 +507,26 @@ class TradingSession:
         threading.Thread(target=self._exit_worker, args=(symbol, reason),
                          name=f"exit-{symbol}", daemon=True).start()
 
-    def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str) -> bool:
+    def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str,
+                       max_tries: Optional[int] = None) -> bool:
         """賣出 lots 張。處置股 → 委買一價**限價**賣 (不能下市價);其餘 → 市價賣。
-        試 3 次 (過閘門+等回報)。成功回 True。"""
+        max_tries=None → **重試到成功為止** (自動出場用;中止只在 kill switch 關);
+        給整數 → 最多試幾次 (緊急全平用,避免 API thread 卡死)。成功回 True。
+        送單全程過全域閘門 (50/s);失敗後單檔退避。"""
         disp = st.is_disposition
-        bid1 = st.last_bid1_price
-        if disp and bid1 <= 0:
-            logger.critical(f"[session] ⚠ {symbol} 處置股出場但無委買一價 → 無法限價賣,"
-                            f"部位 {lots} 張需人工處理")
-            return False
-        for attempt in range(1, 4):
-            self._gate(self.order_min_interval)
+        attempt = 0
+        while True:
+            if not self.is_live():
+                return False
+            if max_tries is not None and attempt >= max_tries:
+                return False
+            bid1 = st.last_bid1_price     # 每次重讀 (限價賣價隨市場更新)
+            if disp and bid1 <= 0:
+                logger.critical(f"[session] ⚠ {symbol} 處置股出場但無委買一價 → 無法限價賣,"
+                                f"部位 {lots} 張需人工處理")
+                return False
+            self._gate()      # 全域 50/s 硬上限
+            attempt += 1
             try:
                 if disp:
                     sell_no = self.broker.place_limit_sell(symbol, bid1, lots, reason)
@@ -540,8 +539,8 @@ class TradingSession:
                     logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
                 return True
             except Exception as e:
-                logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt}/3 次): {e}")
-        return False
+                logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt} 次): {e}")
+                time.sleep(self.order_min_interval)   # 單檔退避
 
     def _exit_worker(self, symbol: str, reason: str):
         with self._lock:
@@ -553,10 +552,11 @@ class TradingSession:
         with self._lock:
             lots = st.filled_lots
         if lots > 0:
+            # 自動出場: 重試到成功為止 (kill switch 關才會回 False)
             if not self._sell_position(symbol, st, lots, reason):
                 with self._lock:
-                    st.exited = False   # 賣失敗,允許下一個委賣 tick 再觸發
-                logger.error(f"[session] {symbol} 出場賣單 3 次全失敗!部位 {lots} 張仍在")
+                    st.exited = False   # 未賣成 (kill switch) → 允許再觸發
+                logger.error(f"[session] {symbol} 出場賣單中止 (未成功),部位 {lots} 張仍在")
 
     def cancel_all_pending(self, reason: str):
         """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。"""
@@ -581,7 +581,8 @@ class TradingSession:
         for sym, lots in snapshot:
             if lots > 0:
                 st = self.trades[sym]
-                if self._sell_position(sym, st, lots, "close_all"):
+                # 緊急全平從 API thread 呼叫 → 限 3 次,避免卡死請求
+                if self._sell_position(sym, st, lots, "close_all", max_tries=3):
                     with self._lock:
                         st.exited = True
                     sold += 1
