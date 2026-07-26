@@ -209,9 +209,18 @@ class Runner:
         unsub_ref = {"fn": None}
         on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
 
+        # 載入隔日賣清單 (昨天買到未出場的持倉);把它們也放進訂閱母體,
+        # 8:30 起就收得到五檔+成交 (隔日賣標的可能不在漲停母體裡)
+        self._load_overnight_file(output_dir)
+        overnight_syms = self.session.overnight_symbols()
+        sub_universe = [s for s in self.universe if s in self.limit_ups]
+        for s in overnight_syms:
+            if s not in sub_universe:
+                sub_universe.append(s)
+
         self.subscriber = Subscriber(
             sdk=self.sdk,
-            universe=[s for s in self.universe if s in self.limit_ups],
+            universe=sub_universe,
             on_book=on_book,
             login_cfg=self.cfg,
             recorder=self.recorder,
@@ -248,12 +257,13 @@ class Runner:
         watchlist = [row["symbol"] for row in self.state.snapshot()]
         logger.info(f"[runner] 篩選階段結束，watchlist {len(watchlist)} 檔")
 
-        # 9:00 轉場: 只留 marked 股票 — 其餘全退訂，watchlist 加訂 trades
-        if watchlist:
-            self.subscriber.keep_only(watchlist)
-            self.subscriber.subscribe_trades_for(watchlist)
+        # 9:00 轉場: 只留 marked + 隔日賣標的 — 其餘全退訂,並加訂 trades
+        keep = watchlist + [s for s in overnight_syms if s not in watchlist]
+        if keep:
+            self.subscriber.keep_only(keep)
+            self.subscriber.subscribe_trades_for(keep)
         else:
-            logger.warning("[runner] watchlist 空 — 不退訂 (留全母體訂閱供查詢)")
+            logger.warning("[runner] watchlist + 隔日賣皆空 — 不退訂 (留全母體訂閱供查詢)")
 
         # ── 分岔: SKIP_TRADER 決定進 LIVE_SUBSCRIBE 或 TRADING ──
 
@@ -269,14 +279,15 @@ class Runner:
             logger.info("[runner] LIVE_SUBSCRIBE 結束")
             return
 
-        if not watchlist:
-            logger.info("[runner] 篩選結果空 + SKIP_TRADER=false → 直接 finished")
+        if not watchlist and not overnight_syms:
+            logger.info("[runner] 篩選結果空 + 無隔日賣 + SKIP_TRADER=false → 直接 finished")
             self.subscriber.stop()
             self.recorder.close()
             self.phase = Phase.FINISHED
             return
 
-        # Phase 6: Trading (9:00-13:24) — 監控;session 為 real+armed 時掛真單
+        # Phase 6: Trading (9:00-13:24) — 監控;session 為 real+armed 時掛真單。
+        # watchlist 空但有隔日賣標的時,trader 仍要建 (才能分派隔日賣標的的 tick)。
         self.phase = Phase.TRADING
         from trader import Trader
         self.trader = Trader(
@@ -311,11 +322,49 @@ class Runner:
             self.session.cancel_all_pending("trading_end")
         except Exception as e:
             logger.warning(f"[runner] 收盤撤單例外: {e}")
+        # 存「今日買到、未出場」的持倉 → 隔日賣清單 (13:24 當下持倉算隔夜)
+        self._write_overnight_file()
         self.trader.stop()
         self.subscriber.stop()
         self.recorder.close()
         self.phase = Phase.FINISHED
         logger.info("[runner] 收盤結束")
+
+    # ─── 隔日賣標的檔案 (跨日持久化;固定檔名,非日期戳) ───────
+
+    def _overnight_file(self) -> Path:
+        return Path(__file__).parent / "output" / "overnight_holdings.json"
+
+    def _load_overnight_file(self, output_dir: Path):
+        """讀昨日存的持倉 → session.load_overnight;連線中則順便對帳庫存。"""
+        import json as _json
+        f = self._overnight_file()
+        if not f.exists():
+            return
+        try:
+            with f.open(encoding="utf-8") as fh:
+                data = _json.load(fh)
+            items = data.get("holdings", []) if isinstance(data, dict) else data
+            self.session.load_overnight(items)
+            self.session.refresh_overnight_inventory()   # broker 連線中才有效
+        except Exception as e:
+            logger.warning(f"[runner] 讀隔日賣清單失敗: {e}")
+
+    def _write_overnight_file(self):
+        """收盤把今日持倉 (filled>0 未出場) 存成隔日賣清單。空則清空檔案。"""
+        import json as _json
+        try:
+            holdings = self.session.get_overnight_candidates()
+            payload = {
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "holdings": holdings,
+            }
+            with self._overnight_file().open("w", encoding="utf-8") as fh:
+                _json.dump(payload, fh, ensure_ascii=False, indent=2)
+            logger.warning(f"[runner] 隔日賣清單已存: {len(holdings)} 檔 "
+                           f"{[h['symbol'] for h in holdings]}")
+        except Exception as e:
+            logger.warning(f"[runner] 存隔日賣清單失敗: {e}")
 
     def _start_pre_order_timer(self):
         """背景 thread: 等到 PRE_ORDER_TIME (08:59:58) → 對當下 marked 清單預掛限價單。

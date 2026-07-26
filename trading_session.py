@@ -78,6 +78,8 @@ class TradingSession:
         self.order_log: Dict[str, dict] = {}
         # 處置股名單 (runner 從 ticker.isDisposition 填) — 影響下單機制
         self.dispositions: Dict[str, bool] = {}
+        # 隔日賣標的 (昨天買到、收盤未出場的持倉) — 隔天開盤第一筆成交後委買一價賣出
+        self.overnight: Dict[str, dict] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
@@ -108,6 +110,7 @@ class TradingSession:
             self.budget_used = 0.0
             self.armed = False
             self.dispositions = {}
+            self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
                        f"armed=False (要交易請重新 arm)")
 
@@ -209,6 +212,11 @@ class TradingSession:
                             pass
                     self.broker = client
                 logger.info("[session] broker 連線完成")
+                # 連線後對帳庫存 → 隔日賣清單以券商實際庫存為準
+                try:
+                    self.refresh_overnight_inventory()
+                except Exception as e:
+                    logger.error(f"[session] 連線後對帳庫存例外: {e}")
             except Exception as e:
                 logger.exception(f"[session] 連線失敗: {e}")
                 with self._lock:
@@ -588,6 +596,153 @@ class TradingSession:
                     sold += 1
         logger.warning(f"[session] 🚨 緊急全平: 賣出 {sold} 檔 (處置股用委買一價限價)")
         return sold
+
+    # ─── 隔日賣標的 (昨天買到、未出場的持倉,隔天賣掉) ──────────
+
+    def get_overnight_candidates(self) -> list:
+        """今日收盤 (13:24) 的持倉快照 — filled>0 且未出場。runner 存檔供隔日賣。"""
+        with self._lock:
+            return [
+                {"symbol": s, "lots": st.filled_lots, "avg_cost": round(st.avg_price, 2)}
+                for s, st in self.trades.items()
+                if st.filled_lots > 0 and not st.exited
+            ]
+
+    def load_overnight(self, items: list):
+        """隔天開盤前 runner 從檔案載入昨日持倉 (張數待 reconcile 庫存後才確定)。"""
+        with self._lock:
+            self.overnight = {}
+            for it in (items or []):
+                sym = str(it.get("symbol") or "")
+                if not sym:
+                    continue
+                self.overnight[sym] = {
+                    "symbol": sym,
+                    "lots": int(it.get("lots") or 0),      # 暫用檔案值,reconcile 後覆寫
+                    "avg_cost": float(it.get("avg_cost") or 0),
+                    "reconciled": False,
+                    "bid1": 0.0, "ask1": 0.0,
+                    "sell_placed": False,
+                    "sell_order_no": "",
+                    "sell_price": 0.0,
+                    "sold_lots": 0,
+                    "note": "待確認 (未對帳庫存)",
+                }
+        logger.warning(f"[session] 載入隔日賣清單: {len(self.overnight)} 檔 {list(self.overnight)}")
+
+    def refresh_overnight_inventory(self):
+        """券商連線後以庫存為準對帳: 有庫存→用庫存張數;無庫存 (已賣/沒了)→移除。"""
+        if not self.overnight or not self._broker_ready():
+            return
+        try:
+            inv = {r["symbol"]: r for r in self.broker.get_inventories()}
+        except Exception as e:
+            logger.error(f"[session] 對帳庫存失敗: {e}")
+            return
+        with self._lock:
+            for sym in list(self.overnight):
+                o = self.overnight[sym]
+                if sym in inv:
+                    o["lots"] = inv[sym]["lots"]
+                    o["reconciled"] = True
+                    o["note"] = ""
+                else:
+                    # 庫存沒這檔 → 已無部位,移除 (但若已下賣單則保留顯示)
+                    if not o["sell_placed"]:
+                        logger.info(f"[session] 隔日賣 {sym} 庫存為 0 → 移除")
+                        del self.overnight[sym]
+        logger.warning(f"[session] 隔日賣對帳完成: {len(self.overnight)} 檔實有庫存")
+
+    def overnight_symbols(self) -> list:
+        """要保留訂閱 (收五檔+成交) 的隔日賣標的。"""
+        with self._lock:
+            return list(self.overnight)
+
+    def is_overnight(self, symbol: str) -> bool:
+        with self._lock:
+            o = self.overnight.get(symbol)
+            return o is not None and not o["sell_placed"]
+
+    def update_overnight_book(self, symbol: str, bid1: float, ask1: float):
+        """trader 每 tick 更新隔日賣標的的委買一/委賣一價 (第一筆成交後算賣價用)。"""
+        with self._lock:
+            o = self.overnight.get(symbol)
+            if o is not None:
+                if bid1 > 0:
+                    o["bid1"] = bid1
+                if ask1 > 0:
+                    o["ask1"] = ask1
+
+    def on_overnight_first_trade(self, symbol: str):
+        """隔日賣標的收到成交 → (armed+連線時) 算賣價下限價賣。一次性 (背景 thread)。"""
+        if not self.is_live():
+            return
+        with self._lock:
+            o = self.overnight.get(symbol)
+            if o is None or o["sell_placed"] or o["lots"] <= 0 or not o["reconciled"]:
+                return
+            o["sell_placed"] = True      # 先佔位防重複觸發
+        threading.Thread(target=self._overnight_sell_worker, args=(symbol,),
+                         name=f"overnight-{symbol}", daemon=True).start()
+
+    def _overnight_sell_worker(self, symbol: str):
+        import ticks
+        with self._lock:
+            o = self.overnight.get(symbol)
+            if o is None:
+                return
+            bid1, ask1, lots = o["bid1"], o["ask1"], o["lots"]
+        price = ticks.overnight_sell_price(bid1, ask1)
+        if price <= 0:
+            logger.critical(f"[session] ⚠ 隔日賣 {symbol} 無有效委買一價 → 無法賣,{lots} 張需人工")
+            with self._lock:
+                if symbol in self.overnight:
+                    self.overnight[symbol]["sell_placed"] = False   # 允許下一筆成交再試
+            return
+        # 賣單: 重試到委託成功為止 (全域 50/s 閘門;kill switch 關才中止)
+        attempt = 0
+        while True:
+            if not self.is_live():
+                with self._lock:
+                    if symbol in self.overnight:
+                        self.overnight[symbol]["sell_placed"] = False
+                logger.error(f"[session] 隔日賣 {symbol} 中止 (kill switch)")
+                return
+            self._gate()
+            attempt += 1
+            try:
+                no = self.broker.place_limit_sell(symbol, price, lots, "overnight_sell")
+                self._log_order(no, symbol, "sell", "overnight_sell", lots, price)
+                with self._lock:
+                    o = self.overnight.get(symbol)
+                    if o is not None:
+                        o["sell_order_no"] = no
+                        o["sell_price"] = price
+                logger.warning(f"[session] 🌙 隔日賣 {symbol} — {price} 限價賣 {lots} 張 "
+                               f"(委買一 {bid1} 委賣一 {ask1})")
+                return
+            except Exception as e:
+                logger.error(f"[session] 隔日賣 {symbol} 委託失敗 (第 {attempt} 次): {e}")
+                time.sleep(self.order_min_interval)
+
+    def overnight_status(self) -> list:
+        """給前端「隔日賣標的」分頁 — 每檔含賣出狀態 (五檔由 API 端補)。"""
+        with self._lock:
+            out = []
+            for sym, o in self.overnight.items():
+                row = self.order_log.get(o["sell_order_no"]) if o["sell_order_no"] else None
+                out.append({
+                    "symbol": sym,
+                    "lots": o["lots"],
+                    "avg_cost": o["avg_cost"],
+                    "reconciled": o["reconciled"],
+                    "note": o["note"],
+                    "sell_placed": o["sell_placed"],
+                    "sell_price": o["sell_price"],
+                    "sold_lots": row["filled_lots"] if row else 0,
+                    "sell_status": row["status"] if row else "",
+                })
+            return sorted(out, key=lambda x: x["symbol"])
 
     # ─── broker 回報 ───────────────────────────────────────
 

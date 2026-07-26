@@ -109,6 +109,10 @@ class Trader:
     def on_book(self, symbol: str, bids: list, asks: list):
         h = self.holdings.get(symbol)
         if h is None:
+            # 非今日搶單標的 — 若是隔日賣標的,更新委買一/委賣一價 (第一筆成交後算賣價用)
+            if self.session is not None and self.session.is_overnight(symbol):
+                self.session.update_overnight_book(
+                    symbol, _first_priced(bids), _first_priced(asks))
             return
 
         bid1_price = float(_pick(bids[0], "price") or 0) if bids else 0.0
@@ -203,6 +207,11 @@ class Trader:
     def on_trade(self, symbol: str, trade_data: dict):
         h = self.holdings.get(symbol)
         if h is None:
+            # 非今日搶單標的 — 若是隔日賣標的,收到成交 → 觸發委買一價賣出 (session 內判 armed)
+            if self.session is not None and self.session.is_overnight(symbol):
+                price = float(_pick(trade_data, "price") or 0)
+                if price > 0:
+                    self.session.on_overnight_first_trade(symbol)
             return
 
         price = float(_pick(trade_data, "price") or 0)
@@ -346,3 +355,12 @@ def _pick(o, k):
     if isinstance(o, dict):
         return o.get(k)
     return getattr(o, k, None)
+
+
+def _first_priced(levels: list) -> float:
+    """回第一個 price>0 的檔位價格 (跳過盤中市價單的 price=0 彙總列)。無則回 0。"""
+    for lv in (levels or []):
+        p = float(_pick(lv, "price") or 0)
+        if p > 0:
+            return p
+    return 0.0

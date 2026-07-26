@@ -37,6 +37,7 @@ export const api = {
     req<{ ok: boolean }>('/api/trading/arm', { method: 'POST', body: JSON.stringify({ armed }) }),
   tradingCloseAll: () =>
     req<{ ok: boolean; sold_symbols: number }>('/api/trading/close_all', { method: 'POST' }),
+  tradingOvernight: () => req<{ overnight: OvernightRow[] }>('/api/trading/overnight'),
   tradingOrders: () => req<{ orders: OrderRow[] }>('/api/trading/orders'),
   tradingCancelOrder: (order_no: string) =>
     req<{ ok: boolean }>('/api/trading/cancel_order', {
@@ -198,4 +199,23 @@ export interface OrderRow {
   status: 'pending' | 'filled' | 'cancelled' | 'rejected'
   filled_lots: number
   ts: string
+}
+
+// 隔日賣標的 row (昨天買到未出場的持倉,今天要賣)
+export interface OvernightRow {
+  symbol: string
+  lots: number
+  avg_cost: number
+  reconciled: boolean       // 是否已對帳券商庫存
+  note: string
+  sell_placed: boolean
+  sell_price: number
+  sold_lots: number
+  sell_status: string       // '' / pending / filled / cancelled / rejected
+  books?: {
+    bids: Array<{ price: number; size: number }>
+    asks: Array<{ price: number; size: number }>
+    ts: string
+  } | null
+  last_trade?: { price: number; size: number; ts: string } | null
 }

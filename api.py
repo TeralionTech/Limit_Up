@@ -268,3 +268,15 @@ def trading_cancel_order(req: CancelOrderReq):
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+@router.get("/trading/overnight")
+def trading_overnight():
+    """隔日賣標的 (昨天買到未出場的持倉) — 含賣出狀態 + 最新五檔。"""
+    r = Runner.get()
+    rows = r.session.overnight_status()
+    for row in rows:
+        snap = r.subscriber.get_latest_snapshot(row["symbol"]) if r.subscriber else None
+        row["books"] = (snap or {}).get("books")
+        row["last_trade"] = (snap or {}).get("last_trade")
+    return {"overnight": rows}

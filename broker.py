@@ -281,6 +281,33 @@ class RealOrderClient:
                     return o
         return None
 
+    def get_inventories(self) -> list:
+        """查庫存 (隔日賣標的用 — 隔天以券商庫存為準對帳)。
+        回 [{symbol, lots, order_type}];只回**現股多單** (Stock/DayTrade,net>0),
+        跳過融資融券借券 (Short/Margin/SBL 私人部位)。"""
+        self._require_ready()
+        try:
+            result = self.sdk.accounting.inventories(self.account)
+        except Exception as e:
+            logger.error(f"[broker] 查庫存例外: {e}")
+            return []
+        if not result or not getattr(result, "is_success", False) or not result.data:
+            return []
+        out = []
+        for inv in result.data:
+            sym = str(_attr(inv, "stock_no", "symbol", default="") or "")
+            if not sym:
+                continue
+            otype = _norm_enum(getattr(inv, "order_type", ""))
+            if otype in ("Short", "Margin", "SBL"):
+                continue                          # 私人部位不碰
+            net = int(_attr(inv, "lastday_qty", default=0) or 0) + \
+                  int(_attr(inv, "today_qty", default=0) or 0)
+            if net <= 0:
+                continue                          # 只處理多單 (可賣)
+            out.append({"symbol": sym, "lots": net // 1000, "order_type": otype})
+        return out
+
     def get_order_filled_lots(self, order_no: str) -> int:
         """向券商查該委託的權威已成交張數。查無此單回 -1 (caller 保守處理)。
         用途: 撤預掛後、市價追差額前,防「fill 回報晚到 → 差額算全額 → 雙倍買」競態。"""
