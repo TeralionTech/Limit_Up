@@ -38,6 +38,10 @@ export const api = {
   tradingCloseAll: () =>
     req<{ ok: boolean; sold_symbols: number }>('/api/trading/close_all', { method: 'POST' }),
   tradingOvernight: () => req<{ overnight: OvernightRow[] }>('/api/trading/overnight'),
+  tradingOvernightSkip: (symbol: string, skip: boolean) =>
+    req<{ ok: boolean }>('/api/trading/overnight/skip', {
+      method: 'POST', body: JSON.stringify({ symbol, skip }),
+    }),
   tradingOrders: () => req<{ orders: OrderRow[] }>('/api/trading/orders'),
   tradingCancelOrder: (order_no: string) =>
     req<{ ok: boolean }>('/api/trading/cancel_order', {
@@ -212,6 +216,7 @@ export interface OvernightRow {
   sell_price: number
   sold_lots: number
   sell_status: string       // '' / pending / filled / cancelled / rejected
+  skip: boolean             // 使用者按「不要賣」暫停
   books?: {
     bids: Array<{ price: number; size: number }>
     asks: Array<{ price: number; size: number }>

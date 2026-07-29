@@ -393,6 +393,7 @@ class TradingSession:
             target = st.target_lots
             limit_up = st.limit_up
 
+        auth = -1     # 券商權威成交量 (只算差額用,不寫回 filled_lots)
         # 1) 撤掉未成交的預掛單 (部分成交 → 撤剩餘、留已成交)
         if order_no and filled < target:
             self._gate()
@@ -410,8 +411,10 @@ class TradingSession:
                 return
             # 1b) 向券商查該單「權威成交量」— 防競態: 開盤已(部分)成交但 fill 回報
             #     比首筆成交 tick 慢 → 記憶體 filled_lots 偏低 → 差額算太大 → 雙倍買。
-            #     查無/查詢失敗 → 保守不追 (使用者定案 2026-07-22 revert 回此行為;
-            #     Jul22 log 證實剛撤的單查得到 auth>=0,此路徑實際罕見)。
+            #     查無/查詢失敗 → 保守不追 (使用者定案 2026-07-22)。
+            #     ⚠️ auth 只用來算 shortfall (防超買),**絕不寫回 filled_lots** — 那筆成交的
+            #        fill 回報稍後會進 on_fill (filled += ...),這裡也加就重複計算持倉
+            #        (2026-07-29 實測 bug: 成交 1 張顯示 2 張)。
             self._gate(0.2)      # 委託/帳務查詢 5/s
             try:
                 auth = self.broker.get_order_filled_lots(order_no)
@@ -421,13 +424,6 @@ class TradingSession:
             if auth < 0:
                 logger.error(f"[session] {symbol} 查無委託 {order_no} — 保守不追")
                 return
-            with self._lock:
-                if auth > st.filled_lots:
-                    delta = auth - st.filled_lots
-                    st.filled_lots = auth
-                    self.budget_used += delta * limit_up * 1000   # 補回這部分保留
-                    logger.warning(f"[session] {symbol} 權威成交量 {auth} 張 "
-                                   f"(記憶體 {auth - delta}) — 已校正,防雙倍買")
 
         # 2) 沒通過第一盤檢查 → 停止 (淘汰路徑 trader 會另呼叫 on_discard)
         if not passed:
@@ -440,7 +436,10 @@ class TradingSession:
         #    - 距上次送單 >= order_min_interval (0.2s;富邦下單上限 50/s,不搞退避)
         #    - 停止條件: kill switch 關 / 該檔淘汰或出場 / CANCEL_PENDING_TIME 已到
         with self._lock:
-            shortfall = st.target_lots - st.filled_lots
+            # 差額用 max(記憶體成交, 券商權威成交) 算 — auth 領先 (回報慢) 時防超買,
+            # 但不寫回 filled_lots (由 on_fill 累加,避免重複計算持倉)
+            effective_filled = max(st.filled_lots, auth)
+            shortfall = st.target_lots - effective_filled
             if shortfall <= 0 or st.stopped_reason:
                 return
             self.budget_used += shortfall * limit_up * 1000
@@ -626,6 +625,7 @@ class TradingSession:
                     "sell_order_no": "",
                     "sell_price": 0.0,
                     "sold_lots": 0,
+                    "skip": False,                    # 使用者按「不要賣」→ 暫停自動賣
                     "note": "待確認 (未對帳庫存)",
                 }
         logger.warning(f"[session] 載入隔日賣清單: {len(self.overnight)} 檔 {list(self.overnight)}")
@@ -673,13 +673,36 @@ class TradingSession:
                 if ask1 > 0:
                     o["ask1"] = ask1
 
+    def set_overnight_skip(self, symbol: str, skip: bool):
+        """前端「不要賣 / 恢復賣出」— skip=True 暫停自動賣;若已下賣單則一併撤掉。"""
+        with self._lock:
+            o = self.overnight.get(symbol)
+            if o is None:
+                raise ValueError(f"隔日賣清單無 {symbol}")
+            o["skip"] = bool(skip)
+            pending_no = o["sell_order_no"] if (skip and o["sell_placed"]) else ""
+        if pending_no:
+            try:
+                self.broker.cancel(pending_no, symbol, reason="overnight_skip")
+                self._mark_order(pending_no, "cancelled")
+            except Exception as e:
+                logger.error(f"[session] 隔日賣 {symbol} 撤賣單失敗: {e}")
+            with self._lock:
+                o = self.overnight.get(symbol)
+                if o is not None:
+                    o["sell_placed"] = False    # 撤掉後可恢復 (取消 skip 時再賣)
+                    o["sell_order_no"] = ""
+        logger.warning(f"[session] 隔日賣 {symbol} skip={skip}"
+                       f"{' (已撤賣單)' if pending_no else ''}")
+
     def on_overnight_first_trade(self, symbol: str):
         """隔日賣標的收到成交 → (armed+連線時) 算賣價下限價賣。一次性 (背景 thread)。"""
         if not self.is_live():
             return
         with self._lock:
             o = self.overnight.get(symbol)
-            if o is None or o["sell_placed"] or o["lots"] <= 0 or not o["reconciled"]:
+            if (o is None or o["sell_placed"] or o["lots"] <= 0
+                    or not o["reconciled"] or o["skip"]):
                 return
             o["sell_placed"] = True      # 先佔位防重複觸發
         threading.Thread(target=self._overnight_sell_worker, args=(symbol,),
@@ -741,6 +764,7 @@ class TradingSession:
                     "sell_price": o["sell_price"],
                     "sold_lots": row["filled_lots"] if row else 0,
                     "sell_status": row["status"] if row else "",
+                    "skip": o["skip"],
                 })
             return sorted(out, key=lambda x: x["symbol"])
 

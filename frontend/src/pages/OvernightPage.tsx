@@ -5,6 +5,7 @@ import { api, OvernightRow } from '../api'
 export default function OvernightPage() {
   const [rows, setRows] = useState<OvernightRow[]>([])
   const [err, setErr] = useState('')
+  const [msg, setMsg] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -21,6 +22,17 @@ export default function OvernightPage() {
     return () => { cancelled = true; window.clearInterval(id) }
   }, [])
 
+  async function toggleSkip(r: OvernightRow) {
+    const next = !r.skip
+    if (next && r.sell_placed && !window.confirm(
+      `${r.symbol} 已下賣單,「不要賣」會撤掉賣單。確定?`)) return
+    try {
+      await api.tradingOvernightSkip(r.symbol, next)
+      setMsg(`✓ ${r.symbol} ${next ? '已暫停賣出' : '恢復賣出'}`)
+      window.setTimeout(() => setMsg(''), 4000)
+    } catch (e: any) { setMsg(`✗ ${e.message}`) }
+  }
+
   return (
     <div className="space-y-4">
       <section className="bg-white rounded-lg shadow p-4">
@@ -28,8 +40,10 @@ export default function OvernightPage() {
         <p className="text-xs text-gray-500 mb-3">
           昨天買到、收盤未出場的持倉。今天開盤收到第一筆成交後,以委買一價限價賣出
           (委買一委賣一價差 ≥ 5 tick 時改掛「賣一往下一檔」)。需真實模式已連線+開始交易才會實際賣。
+          按「不要賣」可暫停該檔 (已下賣單會一併撤掉)。
         </p>
         {err && <div className="text-red-600 text-sm mb-2">API 錯: {err}</div>}
+        {msg && <div className="text-sm mb-2">{msg}</div>}
         {rows.length === 0 ? (
           <div className="text-gray-400 text-sm py-6 text-center">
             無隔日賣標的 (昨天沒有留倉,或已全部賣出)
@@ -44,12 +58,13 @@ export default function OvernightPage() {
                   <th className="text-right py-2 px-2">成本</th>
                   <th className="text-right py-2 px-2">最新成交</th>
                   <th className="text-left py-2 px-2">賣出狀態</th>
+                  <th className="text-center py-2 px-2">操作</th>
                   <th className="text-left py-2 px-2">委買五檔</th>
                   <th className="text-left py-2 px-2">委賣五檔</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map(r => <OvernightTr key={r.symbol} row={r} />)}
+                {rows.map(r => <OvernightTr key={r.symbol} row={r} onToggleSkip={() => toggleSkip(r)} />)}
               </tbody>
             </table>
           </div>
@@ -59,11 +74,11 @@ export default function OvernightPage() {
   )
 }
 
-function OvernightTr({ row }: { row: OvernightRow }) {
+function OvernightTr({ row, onToggleSkip }: { row: OvernightRow; onToggleSkip: () => void }) {
   const bids = row.books?.bids ?? []
   const asks = row.books?.asks ?? []
   return (
-    <tr className="border-b align-top">
+    <tr className={`border-b align-top ${row.skip ? 'bg-gray-50' : ''}`}>
       <td className="py-2 px-2 font-mono font-semibold">
         {row.symbol}
         {!row.reconciled && (
@@ -77,7 +92,18 @@ function OvernightTr({ row }: { row: OvernightRow }) {
       <td className="py-2 px-2 text-right font-mono">
         {row.last_trade?.price ? row.last_trade.price.toFixed(2) : <span className="text-gray-300">—</span>}
       </td>
-      <td className="py-2 px-2 text-xs"><SellStatus row={row} /></td>
+      <td className="py-2 px-2 text-xs">
+        {row.skip ? <span className="bg-gray-200 text-gray-600 px-2 py-0.5 rounded">已暫停</span>
+                  : <SellStatus row={row} />}
+      </td>
+      <td className="py-2 px-2 text-center">
+        <button onClick={onToggleSkip}
+                className={`px-2 py-1 rounded text-xs font-medium border ${
+                  row.skip ? 'border-green-400 text-green-700 hover:bg-green-50'
+                           : 'border-orange-400 text-orange-700 hover:bg-orange-50'}`}>
+          {row.skip ? '恢復賣出' : '不要賣'}
+        </button>
+      </td>
       <td className="py-2 px-2"><BookSide levels={bids} color="text-red-600" /></td>
       <td className="py-2 px-2"><BookSide levels={asks} color="text-green-700" /></td>
     </tr>

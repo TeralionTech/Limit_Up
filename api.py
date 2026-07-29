@@ -280,3 +280,18 @@ def trading_overnight():
         row["books"] = (snap or {}).get("books")
         row["last_trade"] = (snap or {}).get("last_trade")
     return {"overnight": rows}
+
+
+class OvernightSkipReq(BaseModel):
+    symbol: str
+    skip: bool = True
+
+
+@router.post("/trading/overnight/skip")
+def trading_overnight_skip(req: OvernightSkipReq):
+    """隔日賣標的「不要賣 / 恢復賣出」。skip=True 暫停 (已下賣單則撤掉)。"""
+    try:
+        Runner.get().session.set_overnight_skip(req.symbol, req.skip)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
