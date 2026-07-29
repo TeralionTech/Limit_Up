@@ -233,7 +233,7 @@ class Runner:
 
         # unmark 淘汰 → 立即退訂 + 撤該檔預掛/pending 委託 (session 未 armed 時為 no-op)
         def _unsub_and_cancel(symbol: str):
-            self.subscriber.request_unsubscribe(symbol)
+            self._unsub_symbol(symbol)
             try:
                 self.session.cancel_symbol_orders(symbol, "unmarked")
             except Exception as e:
@@ -296,7 +296,7 @@ class Runner:
             cfg=self.cfg,
             recorder=self.recorder,
             state=self.state,                                   # 第一盤淘汰同步 unmark
-            unsub_fn=self.subscriber.request_unsubscribe,       # + 退訂
+            unsub_fn=self._unsub_symbol,                        # + 退訂 (隔日賣標的不退)
             session=self.session,                               # 交易會話 (sim = 純監控)
         )
         # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
@@ -329,6 +329,13 @@ class Runner:
         self.recorder.close()
         self.phase = Phase.FINISHED
         logger.info("[runner] 收盤結束")
+
+    def _unsub_symbol(self, symbol: str):
+        """退訂單檔 — 但隔日賣清單的標的**不退訂** (要持續收五檔+成交才能賣掉)。"""
+        if self.session.has_overnight(symbol):
+            logger.info(f"[runner] {symbol} 在隔日賣清單 → 不退訂 (保留收資料)")
+            return
+        self.subscriber.request_unsubscribe(symbol)
 
     # ─── 隔日賣標的檔案 (跨日持久化;固定檔名,非日期戳) ───────
 

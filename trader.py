@@ -108,11 +108,12 @@ class Trader:
 
     def on_book(self, symbol: str, bids: list, asks: list):
         h = self.holdings.get(symbol)
+        # 隔日賣標的: 只要在清單裡就更新委買一/委賣一價 (供 tab 顯示 + 算賣價);
+        # 即使它同時是今日標的 (被今日淘汰後仍要能賣昨天的量)。
+        if self.session is not None and self.session.has_overnight(symbol):
+            self.session.update_overnight_book(
+                symbol, _first_priced(bids), _first_priced(asks))
         if h is None:
-            # 非今日搶單標的 — 若是隔日賣標的,更新委買一/委賣一價 (第一筆成交後算賣價用)
-            if self.session is not None and self.session.is_overnight(symbol):
-                self.session.update_overnight_book(
-                    symbol, _first_priced(bids), _first_priced(asks))
             return
 
         bid1_price = float(_pick(bids[0], "price") or 0) if bids else 0.0
@@ -206,12 +207,14 @@ class Trader:
 
     def on_trade(self, symbol: str, trade_data: dict):
         h = self.holdings.get(symbol)
-        if h is None:
-            # 非今日搶單標的 — 若是隔日賣標的,收到成交 → 觸發委買一價賣出 (session 內判 armed)
-            if self.session is not None and self.session.is_overnight(symbol):
+        # 隔日賣觸發: 收到成交 → 委買一價賣出。今日標的**活躍中** (WAITING/TRACKING) 時不觸發
+        # (尊重「只賣非今日搶單」原則);h 為 None 或今日已淘汰/撤單 → 由隔日賣接手賣昨天的量。
+        if self.session is not None and self.session.has_overnight(symbol):
+            if h is None or h.status in (Holding.DISCARDED_FIRST, Holding.PULLED):
                 price = float(_pick(trade_data, "price") or 0)
                 if price > 0:
                     self.session.on_overnight_first_trade(symbol)
+        if h is None:
             return
 
         price = float(_pick(trade_data, "price") or 0)

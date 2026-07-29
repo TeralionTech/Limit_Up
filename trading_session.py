@@ -663,6 +663,11 @@ class TradingSession:
             o = self.overnight.get(symbol)
             return o is not None and not o["sell_placed"]
 
+    def has_overnight(self, symbol: str) -> bool:
+        """在隔日賣清單裡 (不看 skip/sell_placed) — 退訂保護 + 收資料判斷用。"""
+        with self._lock:
+            return symbol in self.overnight
+
     def update_overnight_book(self, symbol: str, bid1: float, ask1: float):
         """trader 每 tick 更新隔日賣標的的委買一/委賣一價 (第一筆成交後算賣價用)。"""
         with self._lock:

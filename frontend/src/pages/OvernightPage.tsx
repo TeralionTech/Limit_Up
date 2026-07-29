@@ -139,13 +139,16 @@ function SellStatus({ row }: { row: OvernightRow }) {
 function BookSide({ levels, color }: {
   levels: Array<{ price: number; size: number }>; color: string
 }) {
-  const priced = levels.filter(l => l.price > 0).slice(0, 5)
-  if (priced.length === 0) return <span className="text-gray-300 text-xs">—</span>
+  // 顯示前 5 檔;price=0 是市價委託列 → 顯示「市價」(不要濾掉)
+  const shown = (levels || []).filter(l => l.size > 0).slice(0, 5)
+  if (shown.length === 0) return <span className="text-gray-300 text-xs">—</span>
   return (
     <div className="font-mono text-xs leading-tight">
-      {priced.map((l, i) => (
+      {shown.map((l, i) => (
         <div key={i} className="flex gap-2 justify-between">
-          <span className={color}>{l.price.toFixed(2)}</span>
+          <span className={l.price > 0 ? color : 'text-purple-600 font-semibold'}>
+            {l.price > 0 ? l.price.toFixed(2) : '市價'}
+          </span>
           <span className="text-gray-400">{l.size.toLocaleString()}</span>
         </div>
       ))}
