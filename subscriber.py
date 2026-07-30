@@ -181,6 +181,36 @@ class Subscriber:
         logger.info(f"[subscriber] subscribe_trades_for: {ok} ok / {fail} fail "
                     f"(watchlist {len(symbols)} 檔) first_err={first_err}")
 
+    def add_symbol(self, symbol: str) -> bool:
+        """盤中手動加訂一檔 (隔日賣手動輸入用) — 立即訂 books+trades。
+
+        socket loop 只 re-subscribe 開機算好的 batches,盤中 append 的不會被 loop 帶到,
+        所以這裡一次性直接訂 (券商端會保留訂閱)。回 True=有送出訂閱。
+        """
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            return False
+        if not self._sockets:
+            logger.error("[subscriber] add_symbol: 尚無 sockets")
+            return False
+        # 從 removed 移除 (若曾被淘汰),並確保 universe 有它 (_socket_for/index 需要)
+        with self._removed_lock:
+            self._removed.discard(symbol)
+        if symbol not in self.universe:
+            self.universe.append(symbol)
+        ws = self._socket_for(symbol)
+        if ws is None:
+            return False
+        ok = True
+        for ch in ("books", "trades"):
+            try:
+                ws.subscribe({"channel": ch, "symbol": symbol})
+            except Exception as e:
+                ok = False
+                logger.warning(f"[subscriber] add_symbol {symbol} {ch} 失敗: {str(e)[:150]}")
+        logger.warning(f"[subscriber] 手動加訂 {symbol} (books+trades) ok={ok}")
+        return ok
+
     def request_unsubscribe(self, symbol: str):
         """單檔退訂 (unmark 淘汰時呼叫) — thread-safe，可在 message handler 內呼叫。
 

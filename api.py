@@ -295,3 +295,27 @@ def trading_overnight_skip(req: OvernightSkipReq):
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
+
+
+class OvernightSymbolReq(BaseModel):
+    symbol: str
+
+
+@router.post("/trading/overnight/add")
+def trading_overnight_add(req: OvernightSymbolReq):
+    """手動加入一檔隔日賣標的追蹤 (張數以券商庫存為準,盤中即時收五檔)。"""
+    try:
+        added = Runner.get().track_overnight(req.symbol)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "added": added}
+
+
+@router.post("/trading/overnight/remove")
+def trading_overnight_remove(req: OvernightSymbolReq):
+    """從隔日賣清單移除一檔 (誤加可刪)。"""
+    try:
+        removed = Runner.get().untrack_overnight(req.symbol)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "removed": removed}

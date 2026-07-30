@@ -42,6 +42,14 @@ export const api = {
     req<{ ok: boolean }>('/api/trading/overnight/skip', {
       method: 'POST', body: JSON.stringify({ symbol, skip }),
     }),
+  tradingOvernightAdd: (symbol: string) =>
+    req<{ ok: boolean; added: boolean }>('/api/trading/overnight/add', {
+      method: 'POST', body: JSON.stringify({ symbol }),
+    }),
+  tradingOvernightRemove: (symbol: string) =>
+    req<{ ok: boolean; removed: boolean }>('/api/trading/overnight/remove', {
+      method: 'POST', body: JSON.stringify({ symbol }),
+    }),
   tradingOrders: () => req<{ orders: OrderRow[] }>('/api/trading/orders'),
   tradingCancelOrder: (order_no: string) =>
     req<{ ok: boolean }>('/api/trading/cancel_order', {

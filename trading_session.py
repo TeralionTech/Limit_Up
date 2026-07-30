@@ -599,13 +599,29 @@ class TradingSession:
     # ─── 隔日賣標的 (昨天買到、未出場的持倉,隔天賣掉) ──────────
 
     def get_overnight_candidates(self) -> list:
-        """今日收盤 (13:24) 的持倉快照 — filled>0 且未出場。runner 存檔供隔日賣。"""
+        """收盤 (13:24) 寫檔用的隔日賣清單 — 聯集,逐日往前帶到真的賣掉為止:
+
+        1) 今日新成交 (session.trades filled>0 且未出場)
+        2) 昨天帶過來、今天還沒賣完的 (session.overnight remaining = lots-sold_lots > 0)
+           + 手動加入還沒對到庫存的 (lots=0 但 reconciled=False,待隔天對帳)
+
+        張數僅供隔天連線前顯示;refresh_overnight_inventory 會以券商庫存校正。
+        """
         with self._lock:
-            return [
-                {"symbol": s, "lots": st.filled_lots, "avg_cost": round(st.avg_price, 2)}
-                for s, st in self.trades.items()
-                if st.filled_lots > 0 and not st.exited
-            ]
+            out = {}
+            for s, st in self.trades.items():
+                if st.filled_lots > 0 and not st.exited:
+                    out[s] = {"symbol": s, "lots": st.filled_lots,
+                              "avg_cost": round(st.avg_price, 2)}
+            for s, o in self.overnight.items():
+                if s in out:
+                    continue  # 今日成交已涵蓋,不重複
+                remaining = int(o.get("lots") or 0) - int(o.get("sold_lots") or 0)
+                # 還握著的 (remaining>0) 或 手動加入待對帳的 (未 reconciled) 都保留帶下去
+                if remaining > 0 or not o.get("reconciled"):
+                    out[s] = {"symbol": s, "lots": max(remaining, 0),
+                              "avg_cost": round(float(o.get("avg_cost") or 0), 2)}
+            return list(out.values())
 
     def load_overnight(self, items: list):
         """隔天開盤前 runner 從檔案載入昨日持倉 (張數待 reconcile 庫存後才確定)。"""
@@ -626,6 +642,7 @@ class TradingSession:
                     "sell_price": 0.0,
                     "sold_lots": 0,
                     "skip": False,                    # 使用者按「不要賣」→ 暫停自動賣
+                    "manual": False,                  # 昨日檔案帶入 → 非手動
                     "note": "待確認 (未對帳庫存)",
                 }
         logger.warning(f"[session] 載入隔日賣清單: {len(self.overnight)} 檔 {list(self.overnight)}")
@@ -647,11 +664,55 @@ class TradingSession:
                     o["reconciled"] = True
                     o["note"] = ""
                 else:
-                    # 庫存沒這檔 → 已無部位,移除 (但若已下賣單則保留顯示)
-                    if not o["sell_placed"]:
+                    # 庫存沒這檔 → 已無部位,移除
+                    # (但已下賣單 or 手動加入的保留顯示: 手動加的沒庫存也不刪,由使用者自行移除)
+                    if not o["sell_placed"] and not o.get("manual"):
                         logger.info(f"[session] 隔日賣 {sym} 庫存為 0 → 移除")
                         del self.overnight[sym]
+                    elif o.get("manual"):
+                        o["note"] = "手動加入,庫存查無 (不會下賣單)"
         logger.warning(f"[session] 隔日賣對帳完成: {len(self.overnight)} 檔實有庫存")
+
+    def add_overnight(self, symbol: str) -> bool:
+        """手動加入一檔隔日賣標的 (前端輸入)。張數以券商庫存為準。
+
+        回 True=新加入、False=已在清單。連線中會立即對帳庫存拿實際張數;
+        沒庫存 (沒真的持有) → lots=0 → 顯示但不會下賣單。
+        """
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            raise ValueError("代號不可空白")
+        with self._lock:
+            if symbol in self.overnight:
+                return False
+            self.overnight[symbol] = {
+                "symbol": symbol,
+                "lots": 0,                     # 待對帳庫存
+                "avg_cost": 0.0,
+                "reconciled": False,
+                "bid1": 0.0, "ask1": 0.0,
+                "sell_placed": False,
+                "sell_order_no": "",
+                "sell_price": 0.0,
+                "sold_lots": 0,
+                "skip": False,
+                "manual": True,                # 手動加入 → 對帳庫存 0 也不自動移除
+                "note": "手動加入,待對帳庫存",
+            }
+        logger.warning(f"[session] 手動加入隔日賣: {symbol}")
+        # 連線中 → 立即對帳庫存 (拿實際張數;沒庫存會被移除)
+        self.refresh_overnight_inventory()
+        return True
+
+    def remove_overnight(self, symbol: str) -> bool:
+        """從隔日賣清單移除一檔 (誤加可刪)。回 True=有移除。"""
+        symbol = str(symbol or "").strip()
+        with self._lock:
+            if symbol not in self.overnight:
+                return False
+            del self.overnight[symbol]
+        logger.warning(f"[session] 移除隔日賣: {symbol}")
+        return True
 
     def overnight_symbols(self) -> list:
         """要保留訂閱 (收五檔+成交) 的隔日賣標的。"""

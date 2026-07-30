@@ -373,6 +373,26 @@ class Runner:
         except Exception as e:
             logger.warning(f"[runner] 存隔日賣清單失敗: {e}")
 
+    def track_overnight(self, symbol: str) -> bool:
+        """前端手動加入一檔隔日賣標的: 加清單 + 盤中即時訂閱 + 立即寫回檔案 (持久化)。
+
+        回 True=新加入、False=已在清單。
+        """
+        added = self.session.add_overnight(symbol)
+        if self.subscriber:
+            try:
+                self.subscriber.add_symbol(symbol)
+            except Exception as e:
+                logger.warning(f"[runner] 手動加訂 {symbol} 失敗: {e}")
+        self._write_overnight_file()   # 立即持久化,重啟仍在
+        return added
+
+    def untrack_overnight(self, symbol: str) -> bool:
+        """前端移除一檔隔日賣標的 + 立即寫回檔案。回 True=有移除。"""
+        removed = self.session.remove_overnight(symbol)
+        self._write_overnight_file()
+        return removed
+
     def _start_pre_order_timer(self):
         """背景 thread: 等到 PRE_ORDER_TIME (08:59:58) → 對當下 marked 清單預掛限價單。
         現在時間已過 PRE_ORDER_TIME → 不掛 (只在正常 8:00 流程有效)。"""
