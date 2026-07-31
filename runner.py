@@ -419,7 +419,8 @@ class Runner:
                 self._stop_event.wait(0.01 if remaining < 1 else remaining - 0.5)
             if self._stop_event.is_set():
                 return
-            marked = self.state.get_marked_list() if self.state else []
+            # 開盤即鎖 (first_tick) 優先下單+吃預算,再盤中鎖;各組內照代號
+            marked = self.state.get_marked_prioritized() if self.state else []
             if not marked:
                 logger.info("[runner] PRE_ORDER_TIME 到但 marked 清單空 — 不預掛")
                 return

@@ -182,6 +182,17 @@ class State:
         with self._lock:
             return sorted(self.marked & self.first_tick_limit_up)
 
+    def get_marked_prioritized(self) -> List[str]:
+        """預掛下單順序用 — 開盤即鎖 (first_tick) 優先,再盤中鎖;各組內照代號。
+
+        place_pre_orders 照清單順序下單+扣預算,故重排即給開盤即鎖送單時間優先
+        (試撮排隊) + 預算優先。
+        """
+        with self._lock:
+            first = sorted(self.marked & self.first_tick_limit_up)
+            rest = sorted(self.marked - self.first_tick_limit_up)
+            return first + rest
+
     def is_first_tick(self, symbol: str) -> bool:
         """該股是否「開盤即鎖」(第一筆真實報價就漲停) — trader/SimPage 徽章用."""
         with self._lock:
