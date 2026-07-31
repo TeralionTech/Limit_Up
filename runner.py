@@ -326,6 +326,12 @@ class Runner:
         self._write_overnight_file()
         self.trader.stop()
         self.subscriber.stop()
+        # 收盤即把今日成交載回 session.overnight → 隔日賣頁立刻顯示 (庫存對帳為準)。
+        # 放在 trader/subscriber stop 之後 → 已無 tick,不會誤觸發今日賣單。
+        try:
+            self._load_overnight_file()
+        except Exception as e:
+            logger.warning(f"[runner] 收盤載入隔日賣顯示失敗: {e}")
         self.recorder.close()
         self.phase = Phase.FINISHED
         logger.info("[runner] 收盤結束")
@@ -342,8 +348,12 @@ class Runner:
     def _overnight_file(self) -> Path:
         return Path(__file__).parent / "output" / "overnight_holdings.json"
 
-    def _load_overnight_file(self, output_dir: Path):
-        """讀昨日存的持倉 → session.load_overnight;連線中則順便對帳庫存。"""
+    def _load_overnight_file(self, output_dir: Path = None):
+        """讀存的持倉 → session.load_overnight;連線中則順便對帳庫存。
+
+        兩處呼叫: (1) 早上啟動載入昨日清單 (2) 收盤即把今日成交載回顯示。
+        output_dir 未用到 (實際讀 self._overnight_file());保留參數相容既有呼叫。
+        """
         import json as _json
         f = self._overnight_file()
         if not f.exists():
