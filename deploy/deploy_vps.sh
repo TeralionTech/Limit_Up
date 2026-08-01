@@ -14,10 +14,10 @@ set -euo pipefail
 
 BASE=/opt/hit_limit_up
 REPO_DIR=$BASE/repo
-APP_DIR=$REPO_DIR/hit_limit_up
+APP_DIR=$REPO_DIR              # 獨立 repo 後 hit_limit_up 即 repo 根 (原為 $REPO_DIR/hit_limit_up)
 VENV=$BASE/venv
-REPO_URL=https://github.com/TeralionTech/twse_day_trade.git
-BRANCH=limit_up
+REPO_URL=https://github.com/TeralionTech/Limit_Up.git
+BRANCH=main
 
 info()  { echo -e "\033[1;34m[deploy]\033[0m $*"; }
 warn()  { echo -e "\033[1;33m[warn]\033[0m $*"; }

@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/hit_limit_up/repo/hit_limit_up
+WorkingDirectory=/opt/hit_limit_up/repo
 ExecStart=/opt/hit_limit_up/venv/bin/python server.py
 Restart=always
 RestartSec=10

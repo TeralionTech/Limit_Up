@@ -8,7 +8,7 @@
 
 ## Step 1 — Windows 端: 上傳檔案
 
-在**本機 PowerShell** (`experiment/hit_limit_up` 目錄) 執行:
+在**本機 PowerShell** (`experiment/Limit_Up` 目錄) 執行:
 
 ```powershell
 # 建目錄
@@ -45,16 +45,16 @@ SKIP_TRADER=false        # trader 已是純監控 (不下單)，開了才有模�
 ```bash
 ssh root@45.76.222.150
 # 第一次: 先拿 script (repo 還沒 clone)
-curl -fsSL https://raw.githubusercontent.com/TeralionTech/twse_day_trade/limit_up/hit_limit_up/deploy/deploy_vps.sh -o /tmp/deploy_vps.sh
+curl -fsSL https://raw.githubusercontent.com/TeralionTech/Limit_Up/main/deploy/deploy_vps.sh -o /tmp/deploy_vps.sh
 # (private repo curl 拿不到的話: 本機 scp deploy/deploy_vps.sh root@45.76.222.150:/tmp/)
 chmod +x /tmp/deploy_vps.sh
 /tmp/deploy_vps.sh
 ```
 
-Script 會做: 環境檢查 (timezone/port) → clone `limit_up` branch → venv + whl + deps →
-前端 → secrets 檢查 → systemd unit 安裝啟動 → API 驗證 → 印 cloudflared 指引。
+Script 會做: 環境檢查 (timezone/port) → clone `main` branch (repo=`TeralionTech/Limit_Up`) →
+venv + whl + deps → 前端 → secrets 檢查 → systemd unit 安裝啟動 → API 驗證 → 印 cloudflared 指引。
 
-之後更新版本只要重跑同一支 script (會 git pull + restart)。
+之後更新版本只要重跑同一支 script (會 git pull + restart)。`output/` 為 gitignore,更新不會動到。
 
 ---
 
@@ -98,8 +98,49 @@ Zero Trust → Networks → Tunnels → 現有 tunnel → Public Hostname → Ad
 journalctl -u hit-limit-up -f            # 看即時 log
 sudo systemctl restart hit-limit-up      # 重啟
 /tmp/deploy_vps.sh                       # 更新到 limit_up branch 最新 + 重啟
-ls /opt/hit_limit_up/repo/hit_limit_up/output/   # 每日 JSON/JSONL 輸出
+ls /opt/hit_limit_up/repo/output/        # 每日 JSON/JSONL 輸出 (repo 根,獨立 repo 後不再有 /hit_limit_up 子層)
 ```
+
+## 一次性遷移: 從 twse_day_trade monorepo 切到 Limit_Up 獨立 repo
+
+VPS 上舊的 `/opt/hit_limit_up/repo` 是 clone 自 `twse_day_trade` (monorepo,app 在
+`repo/hit_limit_up/` 子層)。獨立 repo 後 app 變 repo 根。**必須保留 `output/`**
+(內含 `overnight_holdings.json` 隔日賣清單 + 下單 CSV,刪了會失去留倉追蹤)。
+
+**收盤/週末做** (會重啟服務)。在 VPS:
+
+```bash
+# 0) 停服務
+systemctl stop hit-limit-up
+
+# 1) 備份舊 output (在舊的子層路徑)
+cp -a /opt/hit_limit_up/repo/hit_limit_up/output /opt/hit_limit_up/output_backup
+
+# 2) 移除舊 repo,clone 新的獨立 repo
+rm -rf /opt/hit_limit_up/repo
+git clone https://github.com/TeralionTech/Limit_Up.git /opt/hit_limit_up/repo
+
+# 3) 還原 output 到新的 repo 根
+mv /opt/hit_limit_up/output_backup /opt/hit_limit_up/repo/output
+
+# 4) 還原 .env symlink (config.py 讀 server.py 同層 .env)
+ln -sf /opt/hit_limit_up/secrets/.env /opt/hit_limit_up/repo/.env
+
+# 5) 前端 dist: 新 clone 無 dist (gitignore) → 本機 build 後 scp 到 dist_upload,
+#    再由 deploy script 佈署;或直接:
+#    (本機) scp -r frontend/dist/* root@45.76.222.150:/opt/hit_limit_up/dist_upload/
+
+# 6) 跑更新後的 deploy script (會裝新 systemd unit: WorkingDirectory=/opt/hit_limit_up/repo)
+curl -fsSL https://raw.githubusercontent.com/TeralionTech/Limit_Up/main/deploy/deploy_vps.sh -o /tmp/deploy_vps.sh
+chmod +x /tmp/deploy_vps.sh
+/tmp/deploy_vps.sh
+
+# 7) 驗證留倉清單還在
+cat /opt/hit_limit_up/repo/output/overnight_holdings.json
+systemctl status hit-limit-up --no-pager | head
+```
+
+之後日常更新就回到 Step 2 的重跑 script 即可 (git pull + restart,不動 output)。
 
 ## 注意
 
