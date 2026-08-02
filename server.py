@@ -59,6 +59,12 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
     logger.info("[server] APScheduler started — 每個交易日 8:00 自動觸發 runner")
+    # 服務一啟動就載入隔日賣清單 → 任何時間 (含週末) 打開頁面都看得到待賣標的,
+    # 不用等交易日 8:00 主流程。連線富邦後 connect_async 會再對帳庫存校正張數。
+    try:
+        Runner.get()._load_overnight_file()
+    except Exception as e:
+        logger.warning(f"[server] 啟動載入隔日賣清單失敗: {e}")
     yield
     logger.info("[server] shutdown — stop scheduler + runner")
     if scheduler:
