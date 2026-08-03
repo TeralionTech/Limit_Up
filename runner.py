@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import datetime
 from enum import Enum
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from config import Config, load_config
+from trader import _first_priced, _pick   # 輕量純函式 (monitor handler 每 tick 用,不 lazy import)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,10 @@ class Runner:
         # 執行 thread
         self._main_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # timer threads (預掛/13:23 撤單) — 每輪 start() 前先終結上一輪殘留
+        self._timer_threads: list = []
+        # overnight_holdings.json 檔案鎖 — 13:24 主流程與前端 add/remove API 都會寫
+        self._overnight_file_lock = threading.Lock()
 
     # ─── 對外 API ────────────────────────────────────────────
 
@@ -84,7 +90,16 @@ class Runner:
         if self._main_thread and self._main_thread.is_alive():
             logger.warning("[runner] 已在跑，忽略 start()")
             return False
-        self._stop_event.clear()
+        # 終結上一輪殘留 timer threads,再換**全新** event。
+        # 不能 clear() 重用: 舊 pre-order-timer 還在等同一個 event,clear 會把它復活
+        # → 兩個 timer 都到 08:59:58 → 預掛單重複下 (雙倍買+雙倍預算)。
+        self._stop_event.set()
+        for t in self._timer_threads:
+            t.join(timeout=2)
+            if t.is_alive():
+                logger.warning(f"[runner] 舊 timer {t.name} 2 秒內沒結束 (它抓的是舊 event,不會復活)")
+        self._timer_threads = []
+        self._stop_event = threading.Event()
         self.phase = Phase.IDLE
         self.error_msg = ""
         self._started_at = datetime.now()
@@ -94,13 +109,17 @@ class Runner:
         return True
 
     def stop(self):
-        """通知主流程停止 + 平倉 (若已進 trading 階段)."""
+        """通知主流程停止 (不平倉 — 持倉/委託不動,平倉走 /api/trading/close_all)."""
         logger.info("[runner] stop() 被呼叫")
         self._stop_event.set()
+        for t in self._timer_threads:
+            t.join(timeout=2)
+            if t.is_alive():
+                logger.warning(f"[runner] timer {t.name} 2 秒內沒 join 完 (skip)")
         # 各元件單獨 stop (順序: trader → subscriber → recorder → order_client)
         if self.trader:
             try:
-                self.trader.stop(do_final_close=True)
+                self.trader.stop()
             except Exception as e:
                 logger.warning(f"[runner] trader.stop 例外: {e}")
         if self.subscriber:
@@ -141,7 +160,7 @@ class Runner:
             "limit_up_progress": dict(self._limit_up_progress),
             "universe_size": len(self.universe),
             "filter_stats": stats,
-            "watchlist_size": len([1 for s in (self.state.marked if self.state else set())]),
+            "watchlist_size": stats.get("currently_marked", 0),
             "recorder_tick_count": self.recorder.count() if self.recorder else 0,
         }
 
@@ -151,10 +170,12 @@ class Runner:
         """runner main — 從 login 到 trading 收盤."""
         try:
             self._run_all_phases()
-        except Exception as e:
+        except BaseException as e:
+            # BaseException: SystemExit 在非主 thread 會被 threading 靜默丟棄
+            # (phase 凍結、error_msg 空 → 早上壞掉沒人知道),一併攔下標 ERROR。
             logger.exception(f"[runner] 主流程例外: {e}")
             self.phase = Phase.ERROR
-            self.error_msg = str(e)
+            self.error_msg = str(e) or type(e).__name__
 
     def _run_all_phases(self):
         # 讀 config + 套 API runtime overrides
@@ -171,6 +192,7 @@ class Runner:
             max_stock_price=self.cfg.max_stock_price,
             order_min_interval_sec=self.cfg.order_min_interval_sec,
             cancel_pending_time=self.cfg.cancel_pending_time,
+            order_max_per_sec=self.cfg.order_max_per_sec,
         )
 
         # Phase 1: Login
@@ -235,7 +257,9 @@ class Runner:
         def _unsub_and_cancel(symbol: str):
             self._unsub_symbol(symbol)
             try:
-                self.session.cancel_symbol_orders(symbol, "unmarked")
+                # async — unmark 在行情 thread 上觸發,08:59:58 後有預掛單時
+                # 同步 REST 會卡住同 socket 其他股票的 tick
+                self.session.cancel_symbol_orders_async(symbol, "unmarked")
             except Exception as e:
                 logger.warning(f"[runner] 撤 {symbol} 委託失敗: {e}")
         unsub_ref["fn"] = _unsub_and_cancel
@@ -253,6 +277,14 @@ class Runner:
         from filter import wait_until_end_time, write_output
         wait_until_end_time(self.state, self.cfg)
         write_output(self.state, self.cfg)
+
+        # 9:00 起 filter handler 必須**立刻**卸下 — 盤中市價買單佔五檔第一列且 price=0,
+        # filter 的「跌下漲停」規則會 mass-unmark → 連鎖撤預掛單 (6243 事件同型)。
+        # 換 monitor handler: 不做 mark/unmark,只服務隔日賣標的的報價/成交觸發
+        # (snapshot/recorder 在 subscriber 內部,不受 handler 更換影響)。
+        # SKIP_TRADER=false 時稍後會再被 trader handlers 蓋掉。
+        self.subscriber.set_handlers(on_book=self._monitor_on_book,
+                                     on_trade=self._monitor_on_trade)
 
         watchlist = [row["symbol"] for row in self.state.snapshot()]
         logger.info(f"[runner] 篩選階段結束，watchlist {len(watchlist)} 檔")
@@ -273,6 +305,10 @@ class Runner:
             self.phase = Phase.LIVE_SUBSCRIBE
             self._live_subscribe_loop()
             # 收盤 / user 手動 stop 都會跳出
+            # armed 下 SKIP_TRADER 也可能有成交 (預掛/隔日賣) — 一樣要持久化,
+            # 原本只有 TRADING 分支寫,SKIP_TRADER 的持倉會直接消失 (2026-08 修)
+            self._write_overnight_file()
+            self._append_positions_history()
             self.subscriber.stop()
             self.recorder.close()
             self.phase = Phase.FINISHED
@@ -344,6 +380,37 @@ class Runner:
             return
         self.subscriber.request_unsubscribe(symbol)
 
+    # ─── 9:00 後 monitor handlers (LIVE_SUBSCRIBE 全程 / trader 建立前的空窗) ───
+
+    def _monitor_on_book(self, symbol: str, bids: list, asks: list):
+        """9:00 後的看盤 handler — **不做 mark/unmark** (filter 規則對盤中 price=0
+        市價列會誤判)。只更新隔日賣標的的委買/委賣一價 (算賣價用)。"""
+        if self.session.has_overnight(symbol):
+            self.session.update_overnight_book(
+                symbol, _first_priced(bids), _first_priced(asks))
+
+    def _monitor_on_trade(self, symbol: str, trade_data):
+        """monitor 期間的 trades handler — **08:59:58 就掛上** (見 _start_pre_order_timer),
+        9:00:00 開盤撮合 tick 一到就觸發,不等 9:00 轉場建 Trader (轉場要 1~3 秒)。
+
+        1. 今日標的首筆成交 → 瞬間觸發市價追 (session.on_first_trade;
+           冪等旗標在 session 內 — 重複 tick / trader 接手後都不會重複下單)
+        2. 隔日賣標的收到成交 → 觸發隔日賣 (今日活躍標的不觸發,尊重「只賣非今日搶單」)
+        armed/is_live 閘門都在 session 內,sim/未 armed 完全不動作。"""
+        price = float(_pick(trade_data, "price") or 0)
+        if price <= 0:
+            return
+        # 搶市價單優先 (速度至上): 有些 API 給股數、有的給張數 — >=1000 視為股數換算
+        qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
+        lots = qty // 1000 if qty >= 1000 else qty
+        self.session.on_first_trade(symbol, lots >= self.cfg.first_trade_min_lots)
+        # 隔日賣觸發 — 該檔今日仍活躍 (有下單且未淘汰未出場) 時不觸發
+        if self.session.has_overnight(symbol):
+            stt = self.session.get_symbol_state(symbol)
+            active_today = bool(stt) and not stt["stopped_reason"] and not stt["exited"]
+            if not active_today:
+                self.session.on_overnight_first_trade(symbol)
+
     # ─── 隔日賣標的檔案 (跨日持久化;固定檔名,非日期戳) ───────
 
     def _overnight_file(self) -> Path:
@@ -360,29 +427,50 @@ class Runner:
         if not f.exists():
             return
         try:
-            with f.open(encoding="utf-8") as fh:
-                data = _json.load(fh)
-            items = data.get("holdings", []) if isinstance(data, dict) else data
-            self.session.load_overnight(items)
-            self.session.refresh_overnight_inventory()   # broker 連線中才有效
+            with self._overnight_file_lock:
+                with f.open(encoding="utf-8") as fh:
+                    data = _json.load(fh)
+                items = data.get("holdings", []) if isinstance(data, dict) else data
+                self.session.load_overnight(items)
+            # REST 對帳放鎖外 — 不讓 broker 查詢佔住檔案鎖 (broker 連線中才有效)
+            self.session.refresh_overnight_inventory()
         except Exception as e:
             logger.warning(f"[runner] 讀隔日賣清單失敗: {e}")
 
     def _write_overnight_file(self):
-        """收盤把今日持倉 (filled>0 未出場) 存成隔日賣清單。空則清空檔案。"""
+        """收盤把今日持倉 (filled>0 未出場) 存成隔日賣清單。空則清空檔案。
+
+        temp + os.replace **原子寫** — 這檔是隔天早上唯一的賣單依據,"w" 直接截斷
+        寫到一半掛掉 = 清單毀掉;多寫入端 (13:24 主流程 + 前端 add/remove) 共用檔案鎖。"""
         import json as _json
-        try:
-            holdings = self.session.get_overnight_candidates()
-            payload = {
-                "saved_at": datetime.now().isoformat(timespec="seconds"),
-                "holdings": holdings,
-            }
-            with self._overnight_file().open("w", encoding="utf-8") as fh:
-                _json.dump(payload, fh, ensure_ascii=False, indent=2)
-            logger.warning(f"[runner] 隔日賣清單已存: {len(holdings)} 檔 "
-                           f"{[h['symbol'] for h in holdings]}")
-        except Exception as e:
-            logger.warning(f"[runner] 存隔日賣清單失敗: {e}")
+        with self._overnight_file_lock:
+            try:
+                holdings = self.session.get_overnight_candidates()
+                payload = {
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    "holdings": holdings,
+                }
+                f = self._overnight_file()
+                f.parent.mkdir(exist_ok=True)   # 全新環境經 API add/remove 寫入時 output/ 可能還沒建
+                tmp = f.parent / (f.name + ".tmp")
+                with tmp.open("w", encoding="utf-8") as fh:
+                    _json.dump(payload, fh, ensure_ascii=False, indent=2)
+                # Windows: 目標被外部讀取端短暫佔用時 os.replace 會 PermissionError
+                # (Linux rename 無此問題) — 短重試;最後一次失敗交外層 except 記 warning,
+                # 殘留的 tmp 下次寫入會直接覆寫,無害。
+                import time as _t
+                for _retry in range(4):
+                    try:
+                        os.replace(tmp, f)
+                        break
+                    except PermissionError:
+                        _t.sleep(0.05)
+                else:
+                    os.replace(tmp, f)
+                logger.warning(f"[runner] 隔日賣清單已存: {len(holdings)} 檔 "
+                               f"{[h['symbol'] for h in holdings]}")
+            except Exception as e:
+                logger.warning(f"[runner] 存隔日賣清單失敗: {e}")
 
     def _append_positions_history(self):
         """每日收盤 append 一行當日持倉快照到 positions_history.jsonl (不覆蓋,累積歷史台帳)。
@@ -430,6 +518,9 @@ class Runner:
         """背景 thread: 等到 PRE_ORDER_TIME (08:59:58) → 對當下 marked 清單預掛限價單。
         現在時間已過 PRE_ORDER_TIME → 不掛 (只在正常 8:00 流程有效)。"""
         from datetime import time as _time_cls
+        # 抓「本輪專屬」的 event 進 closure — timer 內只用這個 local,
+        # 之後 start() 換新 event 也不會把舊 timer 復活 (防預掛重複下單)。
+        stop_event = self._stop_event
 
         def _timer():
             try:
@@ -442,15 +533,15 @@ class Runner:
                 logger.info("[runner] 已過 PRE_ORDER_TIME — 跳過預掛")
                 return
             # 精準等到時點 (最後 1 秒改 10ms 細顆粒,誤差 ~10ms)
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 now = datetime.now()
                 remaining = (now.replace(hour=target.hour, minute=target.minute,
                                          second=target.second, microsecond=0) - now
                              ).total_seconds()
                 if remaining <= 0:
                     break
-                self._stop_event.wait(0.01 if remaining < 1 else remaining - 0.5)
-            if self._stop_event.is_set():
+                stop_event.wait(0.01 if remaining < 1 else remaining - 0.5)
+            if stop_event.is_set():
                 return
             # 開盤即鎖 (first_tick) 優先下單+吃預算,再盤中鎖;各組內照代號
             marked = self.state.get_marked_prioritized() if self.state else []
@@ -463,16 +554,26 @@ class Runner:
                 self.subscriber.subscribe_trades_for(marked)
             except Exception as e:
                 logger.warning(f"[runner] 預掛時訂 trades 失敗: {e}")
+            # 搶市價單: **現在**就掛上 on_trade — 9:00:00 開盤撮合 tick 一到就能
+            # 瞬間觸發市價追,不等 9:00 轉場建 Trader (轉場要 1~3 秒,錯過最快進場時機)。
+            # on_book 不動 (filter 的 unmark 規則到 9:00 前照跑)。
             try:
-                self.session.place_pre_orders(marked, self.limit_ups, self._stop_event)
+                self.subscriber.set_handlers(on_trade=self._monitor_on_trade)
+            except Exception as e:
+                logger.warning(f"[runner] 預掛時掛 on_trade 失敗: {e}")
+            try:
+                self.session.place_pre_orders(marked, self.limit_ups, stop_event)
             except Exception as e:
                 logger.exception(f"[runner] 預掛例外: {e}")
 
-        threading.Thread(target=_timer, name="pre-order-timer", daemon=True).start()
+        t = threading.Thread(target=_timer, name="pre-order-timer", daemon=True)
+        t.start()
+        self._timer_threads.append(t)
 
     def _start_cancel_pending_timer(self):
         """背景 thread: CANCEL_PENDING_TIME (13:23) 到 → 撤所有未成交委託 (持倉不動)。"""
         from datetime import time as _time_cls
+        stop_event = self._stop_event    # 本輪專屬 (同 pre-order timer,防舊 thread 復活)
 
         def _timer():
             try:
@@ -484,18 +585,20 @@ class Runner:
                 return
             if datetime.now().time() >= target:
                 return
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 if datetime.now().time() >= target:
                     break
-                self._stop_event.wait(1)
-            if self._stop_event.is_set():
+                stop_event.wait(1)
+            if stop_event.is_set():
                 return
             try:
                 self.session.cancel_all_pending("cancel_pending_time")
             except Exception as e:
                 logger.exception(f"[runner] 13:23 撤單例外: {e}")
 
-        threading.Thread(target=_timer, name="cancel-pending-timer", daemon=True).start()
+        t = threading.Thread(target=_timer, name="cancel-pending-timer", daemon=True)
+        t.start()
+        self._timer_threads.append(t)
 
     def _live_subscribe_loop(self):
         """LIVE_SUBSCRIBE — 保持 subscriber 常駐，直到 stop event 或 TRADING_END_TIME.

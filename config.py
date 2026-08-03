@@ -12,6 +12,11 @@ except ImportError:
     pass
 
 
+class ConfigError(RuntimeError):
+    """設定錯誤 — 用可捕捉例外 (SystemExit 在 background thread 會靜默死亡,
+    runner 的 phase/error_msg 都不會更新 → 早上壞掉沒人知道)。"""
+
+
 @dataclass
 class Config:
     # 富邦主帳號憑證
@@ -30,7 +35,8 @@ class Config:
     final_check_start: str  # "08:59:00" — 此時起 bid 減半 final check (之前只記錄 max)
     pre_order_time: str    # "08:59:58" — 真實模式預掛漲停價限價單時點 (final check 窗口也到此為止)
     max_stock_price: float  # 500 — 只做漲停價 ≤ 此價的股票 (0 = 不限制)
-    order_min_interval_sec: float  # 0.2 — 市價追單最小送單間隔 (富邦下單上限 50/s;必等回報+此間隔)
+    order_min_interval_sec: float  # 0.2 — 市價追單「失敗後」單檔退避 (送單速率由 ORDER_MAX_PER_SEC 管)
+    order_max_per_sec: int  # 45 — 送單速率上限 (爆發式滑動窗口;富邦 50/s,留 margin)
     cancel_pending_time: str  # "13:23:00" — 撤掉所有未成交委託的時點 (與 13:24 程式結束脫鉤)
     bid_drop_ratio: float   # final check 減半閾值 (預設 0.5)
     debug: bool
@@ -61,10 +67,10 @@ def load_config() -> Config:
     if not password: missing.append("FUBON_PASSWORD")
     if not pfx_path: missing.append("FUBON_PFX_PATH")
     if missing:
-        raise SystemExit(f"[config] .env 缺少必填欄位: {', '.join(missing)}")
+        raise ConfigError(f"[config] .env 缺少必填欄位: {', '.join(missing)}")
 
     if not Path(pfx_path).exists():
-        raise SystemExit(f"[config] PFX 憑證檔案不存在: {pfx_path}")
+        raise ConfigError(f"[config] PFX 憑證檔案不存在: {pfx_path}")
 
     # 副帳號 (選填)
     account_id_2 = os.environ.get("FUBON_ACCOUNT_ID_2", "").strip()
@@ -72,7 +78,7 @@ def load_config() -> Config:
     pfx_path_2 = os.environ.get("FUBON_PFX_PATH_2", "").strip()
     pfx_password_2 = os.environ.get("FUBON_PFX_PASSWORD_2", "").strip()
     if account_id_2 and pfx_path_2 and not Path(pfx_path_2).exists():
-        raise SystemExit(f"[config] 副帳號 PFX 不存在: {pfx_path_2}")
+        raise ConfigError(f"[config] 副帳號 PFX 不存在: {pfx_path_2}")
 
     return Config(
         account_id=account_id,
@@ -94,6 +100,7 @@ def load_config() -> Config:
         pre_order_time=os.environ.get("PRE_ORDER_TIME", "08:59:58").strip(),
         max_stock_price=float(os.environ.get("MAX_STOCK_PRICE", "500")),
         order_min_interval_sec=float(os.environ.get("ORDER_MIN_INTERVAL_SEC", "0.2")),
+        order_max_per_sec=int(os.environ.get("ORDER_MAX_PER_SEC", "45")),
         cancel_pending_time=os.environ.get("CANCEL_PENDING_TIME", "13:23:00").strip(),
         bid_drop_ratio=float(os.environ.get("BID_DROP_RATIO", "0.5")),
         debug=os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes"),

@@ -64,6 +64,10 @@ logger = logging.getLogger("filter")
 
 # ─── 富邦 login ──────────────────────────────────────────────
 
+class LoginError(RuntimeError):
+    """登入失敗 — 用可捕捉例外 (SystemExit 在 runner background thread 會靜默死亡)。"""
+
+
 def login_fubon(cfg: Config):
     """Login + init_realtime。回 (sdk, accounts).
 
@@ -83,10 +87,10 @@ def login_fubon(cfg: Config):
                              cfg.pfx_path, cfg.pfx_password)
 
     if not accounts:
-        raise SystemExit("[login] 富邦 login 失敗 (無 accounts 回傳)")
+        raise LoginError("[login] 富邦 login 失敗 (無 accounts 回傳)")
     is_success = getattr(accounts, "is_success", None)
     if is_success is False:
-        raise SystemExit(f"[login] 富邦 login is_success=False: "
+        raise LoginError(f"[login] 富邦 login is_success=False: "
                          f"{getattr(accounts, 'message', '?')}")
 
     sdk.init_realtime()
@@ -268,7 +272,7 @@ def write_output(state: State, cfg: Config) -> Path:
 def main():
     try:
         cfg = load_config()
-    except SystemExit as e:
+    except Exception as e:      # ConfigError 等 (原 SystemExit 已改為可捕捉例外)
         print(e, file=sys.stderr)
         return 1
 

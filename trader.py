@@ -101,7 +101,7 @@ class Trader:
         """無獨立 thread — 邏輯全在 on_book/on_trade handlers (下單動作交給 session)。"""
         logger.info("[trader] 啟動 (下單與否由 session mode/armed 決定)")
 
-    def stop(self, do_final_close: bool = True):
+    def stop(self):
         self._stop.set()
 
     # ─── 掛 subscriber 的 handlers ─────────────────────────
@@ -116,10 +116,11 @@ class Trader:
         if h is None:
             return
 
-        bid1_price = float(_pick(bids[0], "price") or 0) if bids else 0.0
-        bid1_size = int(_pick(bids[0], "size") or 0) if bids else 0
-        ask1_price = float(_pick(asks[0], "price") or 0) if asks else 0.0
-        ask1_size = int(_pick(asks[0], "size") or 0) if asks else 0
+        # 取第一個 price>0 的檔位 — 盤中市價單佔第一列且 price=0 (6243 教訓),
+        # 拿 bids[0] 原始值會讓「量減半」比較拿市價彙總列 vs 限價列互比而誤撤,
+        # 也會把 price=0 餵給 session.update_bid1 (處置股出場限價賣價會壞)
+        bid1_price, bid1_size = _first_priced_level(bids)
+        ask1_price, ask1_size = _first_priced_level(asks)
         # 委賣「任一檔」有量 (市價賣單 price=0 也算真賣單)
         asks_any = any(int(_pick(a, "size") or 0) > 0 for a in asks) if asks else False
 
@@ -150,8 +151,8 @@ class Trader:
                 "ask1_price": ask1_price, "ask1_size": ask1_size,
                 "ts": h.last_book_ts,
             }
-            # 檢查: 委賣一出現 → 淘汰
-            if ask1_size > 0:
+            # 檢查: 委賣出現 (任一檔有量;市價賣單 price=0 列也算真賣單) → 淘汰
+            if asks_any:
                 self._fail_first(h, f"first_books_ask_appeared ({ask1_price} × {ask1_size})")
                 return
             self._maybe_enter_tracking(h)
@@ -178,7 +179,8 @@ class Trader:
             logger.warning(f"[trader] {symbol} 排隊中量減半 "
                            f"({h.prev_bid1_size} → {bid1_size}) → 撤預掛單")
             try:
-                self.session.cancel_symbol_orders(symbol, "qty_drop_half_queued")
+                # async — 這裡在行情 thread 上,同步撤單會卡同 socket 其他股票的 tick
+                self.session.cancel_symbol_orders_async(symbol, "qty_drop_half_queued")
             except Exception as e:
                 logger.error(f"[trader] {symbol} 撤排隊委託失敗: {e}")
 
@@ -274,7 +276,8 @@ class Trader:
                     # 撤 pending + 市價賣出全部已成交 (同「出現賣單→出場」路徑)
                     self.session.exit_position(h.symbol, f"first_check: {reason}")
                 else:
-                    self.session.cancel_symbol_orders(h.symbol, f"first_check: {reason}")
+                    # async — 行情 thread 上不做同步 REST
+                    self.session.cancel_symbol_orders_async(h.symbol, f"first_check: {reason}")
             except Exception as e:
                 logger.error(f"[trader] {h.symbol} 淘汰處理委託/部位失敗: {e}")
         # 同步 filter state (FilterPage 丟棄清單看得到)
@@ -298,7 +301,8 @@ class Trader:
         h.pulled_reason = reason
         if self.session is not None:
             try:
-                self.session.cancel_symbol_orders(h.symbol, reason)
+                # async — _pull 由 on_book (行情 thread) 呼叫,同步 REST 會卡 tick
+                self.session.cancel_symbol_orders_async(h.symbol, reason)
             except Exception as e:
                 logger.error(f"[trader] {h.symbol} 撤委託失敗: {e}")
         logger.warning(f"[trader] {h.symbol} 撤單 — {reason}")
@@ -367,3 +371,12 @@ def _first_priced(levels: list) -> float:
         if p > 0:
             return p
     return 0.0
+
+
+def _first_priced_level(levels: list) -> tuple:
+    """回第一個 price>0 檔位的 (price, size) — 跳過盤中市價單 price=0 彙總列。無則 (0.0, 0)。"""
+    for lv in (levels or []):
+        p = float(_pick(lv, "price") or 0)
+        if p > 0:
+            return p, int(_pick(lv, "size") or 0)
+    return 0.0, 0

@@ -57,7 +57,7 @@ export default function App() {
             </button>
             <button
               onClick={async () => {
-                if (confirm('停止 runner (會平倉+關 WS)？')) {
+                if (confirm('停止 runner (停止監控+關 WS,不會平倉)？')) {
                   await api.stopNow()
                   reloadStatus()
                 }

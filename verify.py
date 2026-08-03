@@ -79,7 +79,7 @@ def main():
         _info(f"  account_id: {cfg.account_id[:3]}*** (前 3 字)")
         _info(f"  pfx_path:   {cfg.pfx_path}")
         _info(f"  universe:   {cfg.universe}")
-    except SystemExit as e:
+    except Exception as e:      # ConfigError 等 (原 SystemExit 已改為可捕捉例外)
         _fail(f"config 錯誤: {e}")
         return 1
 

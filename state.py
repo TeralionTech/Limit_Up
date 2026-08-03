@@ -30,6 +30,12 @@ class State:
         # mark 之後追蹤該 symbol 看過的 bid1 max size (只在 8:30–8:59 更新)
         self._max_bid_size: Dict[str, int] = {}
         self._bid_drop_ratio = bid_drop_ratio
+        # stats 增量計數器 — mark/_unmark 時維護,stats() 變 O(1)
+        # (原本每次五趟全掃 history、拿的又是跟 tick handler 同一把鎖,
+        #  前端每 2s 輪詢會在 8:30–9:00 高峰跟 mark/unmark 搶鎖)
+        self._mark_events = 0
+        self._unmark_events = 0
+        self._unmark_reasons: Dict[str, int] = {}
 
     # ─── Mark / Unmark ─────────────────────────────────────
 
@@ -46,6 +52,7 @@ class State:
             was_new = symbol not in self.marked
             self.marked.add(symbol)
             if was_new:
+                self._mark_events += 1
                 self._max_bid_size[symbol] = max(bid1_size, 0)
                 if first_tick:
                     self.first_tick_limit_up.add(symbol)
@@ -92,6 +99,8 @@ class State:
             self.marked.discard(symbol)
             self.discarded.add(symbol)          # 永久淘汰，不能 re-mark
             self._max_bid_size.pop(symbol, None)
+            self._unmark_events += 1
+            self._unmark_reasons[reason] = self._unmark_reasons.get(reason, 0) + 1
             event = {
                 "event": "unmark",
                 "reason": reason,
@@ -147,28 +156,15 @@ class State:
             ]
 
     def stats(self) -> dict:
+        """O(1) — 純計數器組裝 (增量維護於 mark/_unmark),不掃 history。"""
         with self._lock:
-            mark_ev = sum(1 for evs in self.history.values() for e in evs if e["event"] == "mark")
-            unmark_ev = sum(1 for evs in self.history.values() for e in evs if e["event"] == "unmark")
-            ask_unmarks = sum(
-                1 for evs in self.history.values() for e in evs
-                if e.get("event") == "unmark" and e.get("reason") == "ask_appeared"
-            )
-            bid_below_unmarks = sum(
-                1 for evs in self.history.values() for e in evs
-                if e.get("event") == "unmark" and e.get("reason") == "bid_below_limit"
-            )
-            bid_drop_unmarks = sum(
-                1 for evs in self.history.values() for e in evs
-                if e.get("event") == "unmark" and e.get("reason") == "bid_dropped_half"
-            )
             return {
                 "currently_marked": len(self.marked),
-                "total_mark_events": mark_ev,
-                "total_unmark_events": unmark_ev,
-                "unmark_by_ask_appeared": ask_unmarks,
-                "unmark_by_bid_below_limit": bid_below_unmarks,
-                "unmark_by_bid_dropped": bid_drop_unmarks,
+                "total_mark_events": self._mark_events,
+                "total_unmark_events": self._unmark_events,
+                "unmark_by_ask_appeared": self._unmark_reasons.get("ask_appeared", 0),
+                "unmark_by_bid_below_limit": self._unmark_reasons.get("bid_below_limit", 0),
+                "unmark_by_bid_dropped": self._unmark_reasons.get("bid_dropped_half", 0),
                 "unique_symbols_touched": len(self.history),
             }
 

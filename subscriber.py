@@ -74,6 +74,9 @@ class Subscriber:
         # 已淘汰股票 — socket loop 每輪 re-subscribe 時必須跳過，否則退訂又被訂回
         self._removed: set = set()
         self._removed_lock = threading.Lock()
+        # symbol → universe 位置 (O(1) 路由;原本 list.index O(n),9:00 keep_only
+        # 退訂 ~1900 檔 × 線性掃描會在開盤那一秒燒 CPU)
+        self._symbol_idx: dict = {}
 
     # ─── 對外 API ────────────────────────────────────────────
 
@@ -167,10 +170,7 @@ class Subscriber:
         fail = 0
         first_err = None
         for sym in symbols:
-            try:
-                idx = self.universe.index(sym) % n
-            except ValueError:
-                idx = 0
+            idx = self._symbol_idx.get(sym, 0) % n
             try:
                 self._sockets[idx].subscribe({"channel": "trades", "symbol": sym})
                 ok += 1
@@ -196,8 +196,9 @@ class Subscriber:
         # 從 removed 移除 (若曾被淘汰),並確保 universe 有它 (_socket_for/index 需要)
         with self._removed_lock:
             self._removed.discard(symbol)
-        if symbol not in self.universe:
+        if symbol not in self._symbol_idx and symbol not in self.universe:
             self.universe.append(symbol)
+            self._symbol_idx[symbol] = len(self.universe) - 1
         ws = self._socket_for(symbol)
         if ws is None:
             return False
@@ -269,15 +270,17 @@ class Subscriber:
                 logger.info(f"[pruner] 已退訂 {done} 個 subscription "
                             f"(queue 剩 {self._unsub_queue.qsize()})")
 
+    def _rebuild_symbol_index(self):
+        """建 symbol → universe 位置 dict — universe 定案 (truncate) 後呼叫一次。"""
+        self._symbol_idx = {sym: i for i, sym in enumerate(self.universe)}
+
     def _socket_for(self, symbol: str):
-        """round-robin 定位 symbol 所屬 socket (跟 _split_universe_per_socket 同法)。"""
+        """round-robin 定位 symbol 所屬 socket (跟 _split_universe_per_socket 同法,
+        O(1) dict 查表;查無 → socket 0,同舊版 ValueError fallback)。"""
         n = len(self._sockets)
         if n == 0:
             return None
-        try:
-            idx = self.universe.index(symbol) % n
-        except ValueError:
-            idx = 0
+        idx = self._symbol_idx.get(symbol, 0) % n
         return self._sockets[idx]
 
     # ─── Multi-SDK: 開 N 個 login sessions ───────────────────
@@ -366,6 +369,7 @@ class Subscriber:
         else:
             logger.info(f"[subscriber] universe {len(self.universe)} 檔 <= 容量 {capacity} 檔，"
                         f"全部一次性 subscribe 常駐 (不 rotation)")
+        self._rebuild_symbol_index()      # universe 定案 (truncate 後) → 建 O(1) 路由表
         connected_events = []
         for i, ws in enumerate(self._sockets):
             ev = threading.Event()
@@ -501,6 +505,7 @@ class Subscriber:
             logger.error(f"[subscriber] 保底 socket connect 失敗: {e}")
             raise
 
+        self._rebuild_symbol_index()      # 保底路線也要建 O(1) 路由表
         batches = self._make_batches(self.universe, self.batch_size)
         t = threading.Thread(
             target=self._socket_loop_thread,
@@ -581,14 +586,16 @@ class Subscriber:
                 elif channel == "trades":
                     self._trades_count += 1
 
-                # 先 record raw tick (books + trades 都存)
-                if self.recorder and channel in ("books", "trades"):
-                    self.recorder.record(channel, data)
-
-                # books → 分派給 on_book 做 mark/unmark 判斷 + 存 snapshot
+                # ⚡ handler **最先跑** — 觸發市價追的那筆 tick 不等 snapshot 鎖/落檔
+                # (2026-08 修: 原順序 record→snapshot→handler,每 tick 先付一次磁碟+鎖)。
+                # handler 例外獨立捕捉 → 掛掉也不影響後面的 snapshot/落檔。
                 if channel == "books":
                     bids = data.get("bids") or []
                     asks = data.get("asks") or []
+                    try:
+                        self.on_book(symbol, bids, asks)
+                    except Exception as e:
+                        self._log_handler_exc(socket_idx, e)
                     # 存 snapshot 給 API /api/tick/{symbol} 用
                     with self._snap_lock:
                         self._latest_books[symbol] = {
@@ -596,8 +603,13 @@ class Subscriber:
                             "asks": self._serialize_book_side(asks),
                             "ts": datetime.now().isoformat(timespec="microseconds"),
                         }
-                    self.on_book(symbol, bids, asks)
                 elif channel == "trades":
+                    # trader on_trade dispatch (08:59:58 起就掛上)
+                    if self.on_trade:
+                        try:
+                            self.on_trade(symbol, data)
+                        except Exception as e:
+                            self._log_handler_exc(socket_idx, e)
                     # 存 snapshot
                     with self._snap_lock:
                         self._latest_trade[symbol] = {
@@ -605,13 +617,24 @@ class Subscriber:
                             "size": data.get("size") or data.get("qty"),
                             "ts": datetime.now().isoformat(timespec="microseconds"),
                         }
-                    # trader on_trade dispatch (9:00 後才有)
-                    if self.on_trade:
-                        self.on_trade(symbol, data)
+
+                # 落檔最後 (record 已是零 I/O 入佇列,順序仍讓 handler 絕對優先)
+                if self.recorder and channel in ("books", "trades"):
+                    self.recorder.record(channel, data)
             except Exception as e:
-                if self.debug:
-                    logger.exception(f"[subscriber] handle_msg 例外: {e}")
+                # parse/snapshot/record 層例外 (handler 例外已在內層各自捕捉)
+                self._log_handler_exc(socket_idx, e)
         return _handler
+
+    def _log_handler_exc(self, socket_idx: int, e: Exception):
+        """handler/分派例外絕不吞 — filter/trader 整套邏輯都跑在這裡,吞掉 = 盤中
+        邏輯掛了完全無感。永遠記 ERROR+traceback (dedup: 前 3 次全印,之後每 500 次一次)。
+        (需在 except 區塊內呼叫 — logger.exception 才抓得到 traceback。)"""
+        key = f"handler:{type(e).__name__}:{str(e)[:80]}"
+        cnt = self._error_count.get(key, 0) + 1
+        self._error_count[key] = cnt
+        if cnt <= 3 or cnt % 500 == 0:
+            logger.exception(f"[socket#{socket_idx}] handle_msg 例外 #{cnt}: {e}")
 
     @staticmethod
     def _get(obj, key):

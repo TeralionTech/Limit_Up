@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -18,8 +19,40 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 # 富邦 API 明定速率上限: 下單 50/s、批次下單 10/s、帳務查詢 5/s、連線數 10。
-# 所有 broker 呼叫 (place/cancel) 過全域送單閘門,硬底線 0.02s (= 50/s)。
-_HARD_MIN_INTERVAL = 0.02
+# 送單 (place/cancel) 走 SendRateLimiter 爆發式滑動窗口 (預設 45/s,留 margin);
+# 帳務/委託查詢另走 _query_gate 間隔閘門 (5/s)。
+_HARD_MIN_INTERVAL = 0.02      # order_min_interval (追單失敗退避) 的下限
+
+# 出場賣重試上限 (進場市價追**無上限** — 使用者定案 2026-07-27,試到成功為止;
+# 出場失敗後下一個委賣 tick 會再觸發,行情節奏自然重試,故有限次即可。
+# 隔日賣 5 次上限見 _overnight_sell_worker, fd451ce):
+DEFAULT_SELL_MAX_TRIES = 8     # 出場賣: 指數退避 0.2→…→5s;用盡記 CRITICAL + sell_failed 旗標
+
+
+class SendRateLimiter:
+    """爆發式送單風控 — 滑動窗口: 過去 1 秒內 < max_per_sec 筆就**立刻放行**,
+    滿了才等最舊的一筆滑出窗口。
+
+    與「每筆間隔 0.02s」均勻鋪開不同: 45 筆可以在一秒的最前面全部送出
+    (搶 08:59:58 預掛 2 秒窗口),仍保證任一 1 秒窗口內不超過 max_per_sec。
+    進場/出場/撤單全 thread 共用同一額度。"""
+
+    def __init__(self, max_per_sec: int = 45):
+        self._lock = threading.Lock()
+        self._stamps: deque = deque()       # monotonic 送出時間戳 (只留最近 1 秒)
+        self.max_per_sec = max_per_sec
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._stamps and now - self._stamps[0] >= 1.0:
+                    self._stamps.popleft()
+                if len(self._stamps) < self.max_per_sec:
+                    self._stamps.append(now)
+                    return
+                wait = self._stamps[0] + 1.0 - now
+            time.sleep(max(wait, 0.001))    # 鎖外睡 — 不擋其他 thread 檢查窗口
 
 
 class SymbolTrade:
@@ -36,6 +69,9 @@ class SymbolTrade:
         self.avg_price = 0.0
         self.stopped_reason: str = ""  # 非空 = 此檔不再進場
         self.exited = False            # 已出場 (委賣出現)
+        self.budget_reserved = 0.0     # 該檔目前保留中的預算 (下單保留,成交轉消耗,撤/拒釋放)
+        self.sell_failed = False       # 出場賣單重試用盡仍沒送出 → 需人工 (前端顯示)
+        self.first_trade_fired = False  # 首筆成交已處理 — 早期觸發/trader/重複 tick 冪等用
         self.is_disposition = False    # 處置股: 不撤預掛/不下市價買、出場改委買一價限價賣
         self.last_bid1_price = 0.0     # 最近委買一價 (處置股出場限價賣用)
 
@@ -50,6 +86,7 @@ class SymbolTrade:
             "stopped_reason": self.stopped_reason,
             "exited": self.exited,
             "is_disposition": self.is_disposition,
+            "sell_failed": self.sell_failed,
         }
 
 
@@ -85,11 +122,17 @@ class TradingSession:
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
         self.cancel_pending_time = None            # datetime.time;此時後不再追單
-        # 全域送單閘門 (所有 place/cancel 過這裡,硬底線 50/s)
+        # 爆發式送單風控 — 進場/出場/撤單共用 45/s 滑動窗口 (一秒最前面可全部送出)
+        self._rate = SendRateLimiter(45)
+        # 帳務/委託查詢閘門 (富邦 5/s) — 與送單額度分開計
         self._send_lock = threading.Lock()
         self._last_send = 0.0
+        # fills.csv 寫檔鎖 — SDK 回報可能多 thread 併發,防雙表頭/行交錯
+        self._fills_lock = threading.Lock()
         # 交易日 (roll_day 每日重置用)
         self._trade_date: str = ""
+        # 今日已預掛過的日期 — place_pre_orders 冪等保護 (防重複 timer 雙倍下單)
+        self._pre_orders_date: str = ""
 
     def roll_day(self, date_str: str):
         """每日重置 (runner 每天 8:00 開跑時呼叫)。
@@ -112,6 +155,7 @@ class TradingSession:
             self.armed = False
             self.dispositions = {}
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
+            self._pre_orders_date = ""   # 新交易日 → 允許今日預掛
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
                        f"armed=False (要交易請重新 arm)")
 
@@ -133,7 +177,8 @@ class TradingSession:
 
     def configure(self, max_stock_price: float = None,
                   order_min_interval_sec: float = None,
-                  cancel_pending_time: str = None):
+                  cancel_pending_time: str = None,
+                  order_max_per_sec: int = None):
         """runner 啟動時從 cfg 塞策略參數。"""
         from datetime import time as _time_cls
         with self._lock:
@@ -149,11 +194,19 @@ class TradingSession:
                     self.cancel_pending_time = _time_cls(*parts[:3])
                 except Exception:
                     logger.warning(f"[session] CANCEL_PENDING_TIME 格式錯: {cancel_pending_time!r}")
+            if order_max_per_sec is not None:
+                v = int(order_max_per_sec)
+                if v > 50:
+                    logger.warning(f"[session] ORDER_MAX_PER_SEC={v} 超過富邦下單上限 50 → 強制 50")
+                    v = 50
+                self._rate.max_per_sec = max(1, v)
         logger.info(f"[session] configure: max_price={self.max_stock_price} "
-                    f"interval={self.order_min_interval}s cancel_at={self.cancel_pending_time}")
+                    f"backoff={self.order_min_interval}s rate={self._rate.max_per_sec}/s "
+                    f"cancel_at={self.cancel_pending_time}")
 
-    def _gate(self, min_interval: float = _HARD_MIN_INTERVAL):
-        """全域送單閘門 — 距上次「送單」不足 min_interval 就等 (跨 thread 序列化)。"""
+    def _query_gate(self, min_interval: float = 0.2):
+        """帳務/委託查詢閘門 (富邦 5/s) — 距上次查詢不足 min_interval 就等。
+        送單**不走這裡** (送單走 self._rate 爆發式窗口)。"""
         with self._send_lock:
             wait = self._last_send + min_interval - time.monotonic()
             if wait > 0:
@@ -297,9 +350,18 @@ class TradingSession:
         return bool(self.broker and self.broker.connected and self.broker.healthy)
 
     def is_live(self) -> bool:
-        """True = 真實模式 + armed + 連線健康 → 才會真下單。"""
+        """True = 真實模式 + armed + 連線健康 → 才會真下單。**只給進場路徑用**。"""
         with self._lock:
             return self.mode == "real" and self.armed and self._broker_ready()
+
+    def _can_manage(self) -> bool:
+        """出場/撤單閘門 — 真實模式 + broker 物件在就嘗試 (不看 armed、不看連線健康)。
+
+        armed 只擋「新進場」;kill switch 關掉或交易 WS 斷線時,已有的持倉/委託
+        **仍必須可管理** — 否則關 kill switch = 13:23 撤單失效 + 部位賣不掉。
+        連線不健康時照樣嘗試送出,失敗記 CRITICAL (不預先擋掉)。"""
+        with self._lock:
+            return self.mode == "real" and self.broker is not None
 
     # ─── 預算/張數 ─────────────────────────────────────────
 
@@ -318,6 +380,23 @@ class TradingSession:
         alloc = min(self.per_symbol_budget, remaining)
         return max(0, int(alloc // cost_per_lot))
 
+    # 預算不變式: budget_used == Σ(買進已成交 × 漲停價 × 1000) + Σ(st.budget_reserved)。
+    # 下單前 _reserve_budget 保留;買成交在 _on_fill 把保留轉消耗;撤單/拒單/追單中止
+    # _release_budget 釋放剩餘保留。賣出成交**不退**預算 (保守日預算,使用者定案)。
+    # 所有 budget_used 增減只准走這兩支 — 別再散落手算。
+
+    def _reserve_budget(self, st: "SymbolTrade", lots: int):
+        """下單前保留預算 (caller 持鎖)。"""
+        amt = lots * st.limit_up * 1000
+        self.budget_used += amt
+        st.budget_reserved += amt
+
+    def _release_budget(self, st: "SymbolTrade"):
+        """釋放該檔剩餘保留 (撤單/拒單/追單中止;caller 持鎖)。冪等 — 重複呼叫無害。"""
+        amt = st.budget_reserved
+        st.budget_reserved = 0.0
+        self.budget_used = max(0.0, self.budget_used - amt)
+
     # ─── 08:59:58 預掛限價單 ───────────────────────────────
 
     def place_pre_orders(self, symbols: list, limit_ups: dict, stop_event=None):
@@ -325,11 +404,18 @@ class TradingSession:
 
         **不重試** — 精準時點一次丟出 (使用者定案 2026-07-16)。失敗只記 log +
         釋放預算、**不設 stopped_reason** — 9:00 首筆成交時市價追會救回這檔。
-        送單只過 50/s 硬底線閘門 (預掛窗口只有 2 秒,不能用 0.2s 慢節奏)。
+        送單過爆發式風控 (45/s 滑動窗口) — 一秒最前面可全部送出,搶預掛 2 秒窗口。
         """
         if not self.is_live():
             logger.info("[session] 未 armed/未連線 — 跳過預掛")
             return
+        # 冪等保護 (check-and-set 原子): 就算 timer 生命週期修壞了、兩個 timer 同時到,
+        # 也只有一個能預掛 (放在 is_live 之後 — 未 armed 的早退不燒掉今日額度)。
+        with self._lock:
+            if self._trade_date and self._pre_orders_date == self._trade_date:
+                logger.warning("[session] 今日已預掛過 — 跳過重複預掛 (冪等保護)")
+                return
+            self._pre_orders_date = self._trade_date
         logger.warning(f"[session] ⚡ 預掛限價單開始 — {len(symbols)} 檔候選")
         for sym in symbols:
             if stop_event is not None and stop_event.is_set():
@@ -354,8 +440,8 @@ class TradingSession:
                     logger.info(f"[session] {sym} 預算不足 → 跳過")
                     continue
                 st.target_lots = lots
-                self.budget_used += lots * limit_up * 1000   # 下單即保留
-            self._gate()                                     # 硬底線 50/s
+                self._reserve_budget(st, lots)               # 下單即保留
+            self._rate.acquire()                             # 爆發式 45/s 窗口
             try:
                 order_no = self.broker.place_limit_buy(sym, limit_up, lots)
                 with self._lock:
@@ -366,127 +452,146 @@ class TradingSession:
             except Exception as e:
                 logger.error(f"[session] {sym} 預掛失敗 (不重試,9:00 市價追會救): {e}")
                 with self._lock:
-                    self.budget_used -= lots * limit_up * 1000   # 釋放 (追單時重新保留)
+                    self._release_budget(st)                 # 釋放 (追單時重新保留)
         logger.warning("[session] 預掛限價單完成")
 
     # ─── 9:00 後事件 (trader 呼叫) ─────────────────────────
 
     def on_first_trade(self, symbol: str, passed_first_check: bool):
-        """首筆成交資訊到達: 預掛單未(全)成交 → 撤剩餘;通過檢查 → 市價追差額。
-        (在背景 thread 跑,不 block subscriber callback。)"""
+        """首筆成交資訊到達 → **市價單優先**搶進 (背景 thread,不 block subscriber callback)。
+
+        冪等: 08:59:58 起的早期 handler 每個 trade tick 都會呼叫,trader 接手後
+        也會再觸發 — 這裡便宜預過濾 (st 不在 / 已處理過 → 不開 thread),
+        權威去重旗標在 worker 內鎖內 check-and-set。"""
         if not self.is_live():
             return
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is None or st.first_trade_fired:
+                return
         threading.Thread(target=self._first_trade_worker,
                          args=(symbol, passed_first_check),
                          name=f"first-trade-{symbol}", daemon=True).start()
 
     def _first_trade_worker(self, symbol: str, passed: bool):
+        """**市價單優先** (使用者定案 2026-08-03,速度至上):
+
+        首筆成交 tick → **立刻**下市價單追差額 — 差額只看記憶體 filled_lots,
+        **不先撤預掛、不向券商查權威成交量** (舊 2026-07-22「查無→保守不追」定案廢除)。
+        市價單出手後才回頭撤預掛剩餘。單筆下單往返 ~60ms (orders CSV latency_ms),
+        故 tick → 市價單送出 ≈ 一次往返內。
+
+        超買風險 (使用者接受「多下到沒關係」): 預掛+市價都成交時最多持有 2×target;
+        出場賣 filled_lots 全量,兩單成交都會累進,超買部位一樣被完整賣掉。
+        預算為近似值: 差額轉移保留,兩單都成交時實際花費可超過保留額。"""
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or st.exited:
                 return
+            if st.first_trade_fired:
+                return              # 權威去重 (早期觸發/trader/重複 tick 只處理一次)
+            st.first_trade_fired = True
             # 處置股: 保留 08:59:58 的漲停價預掛限價單 — 不撤、不下市價追
             # (處置股不能下市價單)。留著等分盤集合競價成交。
             if st.is_disposition:
                 logger.warning(f"[session] {symbol} 處置股 — 保留預掛限價單,不撤不追市價")
                 return
-            order_no = st.order_no if st.order_status == "pending" else ""
-            filled = st.filled_lots
-            target = st.target_lots
-            limit_up = st.limit_up
+            pre_order_no = st.order_no if st.order_status == "pending" else ""
 
-        auth = -1     # 券商權威成交量 (只算差額用,不寫回 filled_lots)
-        # 1) 撤掉未成交的預掛單 (部分成交 → 撤剩餘、留已成交)
-        if order_no and filled < target:
-            self._gate()
-            try:
-                self.broker.cancel(order_no, symbol, reason="first_trade_unfilled")
-                with self._lock:
-                    st.order_status = "cancelled"
-                    st.order_no = ""
-                    # 釋放未成交部分預算 (市價追會重新保留)
-                    self.budget_used -= (target - filled) * limit_up * 1000
-                # 同步委託總表 (漏這行前端會永遠顯示排隊中 — 2026-07-22 實測 bug)
-                self._mark_order(order_no, "cancelled")
-            except Exception as e:
-                logger.error(f"[session] {symbol} 撤預掛單失敗: {e}")
-                return
-            # 1b) 向券商查該單「權威成交量」— 防競態: 開盤已(部分)成交但 fill 回報
-            #     比首筆成交 tick 慢 → 記憶體 filled_lots 偏低 → 差額算太大 → 雙倍買。
-            #     查無/查詢失敗 → 保守不追 (使用者定案 2026-07-22)。
-            #     ⚠️ auth 只用來算 shortfall (防超買),**絕不寫回 filled_lots** — 那筆成交的
-            #        fill 回報稍後會進 on_fill (filled += ...),這裡也加就重複計算持倉
-            #        (2026-07-29 實測 bug: 成交 1 張顯示 2 張)。
-            self._gate(0.2)      # 委託/帳務查詢 5/s
-            try:
-                auth = self.broker.get_order_filled_lots(order_no)
-            except Exception as e:
-                logger.error(f"[session] {symbol} 查權威成交量失敗 ({e}) — 保守不追")
-                return
-            if auth < 0:
-                logger.error(f"[session] {symbol} 查無委託 {order_no} — 保守不追")
-                return
-
-        # 2) 沒通過第一盤檢查 → 停止 (淘汰路徑 trader 會另呼叫 on_discard)
+        # 沒通過第一盤檢查 → 撤預掛 + 停止,不下市價單
         if not passed:
             with self._lock:
                 st.stopped_reason = st.stopped_reason or "first_check_failed"
+            if pre_order_no:
+                self._rate.acquire()
+                try:
+                    self.broker.cancel(pre_order_no, symbol, reason="first_check_failed")
+                    with self._lock:
+                        st.order_status = "cancelled"
+                        st.order_no = ""
+                        self._release_budget(st)
+                    # 同步委託總表 (漏這行前端會永遠顯示排隊中 — 2026-07-22 實測 bug)
+                    self._mark_order(pre_order_no, "cancelled")
+                except Exception as e:
+                    logger.error(f"[session] {symbol} 撤預掛單失敗: {e}")
             return
 
-        # 3) 通過 → 市價單追差額。**重試無上限直到成功** (使用者定案 2026-07-16):
-        #    - 必等上一筆「委託結果」回來 (place_order 是阻塞呼叫,return = 結果回來)
-        #    - 距上次送單 >= order_min_interval (0.2s;富邦下單上限 50/s,不搞退避)
-        #    - 停止條件: kill switch 關 / 該檔淘汰或出場 / CANCEL_PENDING_TIME 已到
+        # 通過 → 差額只看記憶體 (fill 回報通常還沒到 → shortfall ≈ target),先搶單
         with self._lock:
-            # 差額用 max(記憶體成交, 券商權威成交) 算 — auth 領先 (回報慢) 時防超買,
-            # 但不寫回 filled_lots (由 on_fill 累加,避免重複計算持倉)
-            effective_filled = max(st.filled_lots, auth)
-            shortfall = st.target_lots - effective_filled
-            if shortfall <= 0 or st.stopped_reason:
+            if st.stopped_reason:
                 return
-            self.budget_used += shortfall * limit_up * 1000
-        # 市價追: **重試到成功為止** (使用者定案 2026-07-27,移除連續失敗上限)。
-        # 送單全程過全域閘門 (硬底線 0.02s = 50/s;富邦下單上限),多標的同時追時
-        # 全域不會超速;失敗後單檔退避 order_min_interval,避免單一失敗標的獨佔額度。
+            shortfall = st.target_lots - st.filled_lots
+            if shortfall > 0:
+                # 預算轉移: 預掛剩餘保留 → 市價追保留 (不等撤單完成,速度優先)
+                self._release_budget(st)
+                self._reserve_budget(st, shortfall)
+
+        # 市價追: **重試到成功為止** (使用者定案 2026-07-27)。送單全程過爆發式風控
+        # (45/s 滑動窗口,多標的共用,不超富邦上限);失敗後單檔退避 order_min_interval
+        # (0.2s),避免單一失敗標的獨佔共用額度。
         # 中止只在: kill switch 關 / 該檔淘汰或出場 / 13:23 (CANCEL_PENDING_TIME) 到。
-        attempt = 0
-        abort_reason = ""
-        while True:
-            if not self.is_live():
-                abort_reason = "kill_switch_off"
-                break
-            with self._lock:
-                if st.stopped_reason or st.exited:
-                    abort_reason = st.stopped_reason or "exited"
+        if shortfall > 0:
+            attempt = 0
+            abort_reason = ""
+            chased_ok = False
+            while True:
+                if not self.is_live():
+                    abort_reason = "kill_switch_off"
                     break
-            if (self.cancel_pending_time is not None
-                    and datetime.now().time() >= self.cancel_pending_time):
-                abort_reason = "cancel_pending_time"
-                break
-            self._gate()      # 全域 50/s 硬上限 (多標的共用同一送單閘門)
-            attempt += 1
-            try:
-                new_no = self.broker.place_market_buy(symbol, shortfall)
                 with self._lock:
-                    st.order_no = new_no
-                    st.order_kind = "market_buy"
-                    st.order_status = "pending"
-                self._log_order(new_no, symbol, "buy", "market_buy", shortfall, 0)
-                logger.warning(f"[session] {symbol} 市價追 {shortfall} 張 → 委託成功 "
-                               f"(第 {attempt} 次)")
-                return
+                    if st.stopped_reason or st.exited:
+                        abort_reason = st.stopped_reason or "exited"
+                        break
+                if (self.cancel_pending_time is not None
+                        and datetime.now().time() >= self.cancel_pending_time):
+                    abort_reason = "cancel_pending_time"
+                    break
+                self._rate.acquire()      # 爆發式 45/s 窗口 (多標的共用)
+                attempt += 1
+                try:
+                    new_no = self.broker.place_market_buy(symbol, shortfall)
+                    with self._lock:
+                        st.order_no = new_no
+                        st.order_kind = "market_buy"
+                        st.order_status = "pending"
+                    self._log_order(new_no, symbol, "buy", "market_buy", shortfall, 0)
+                    logger.warning(f"[session] {symbol} 市價追 {shortfall} 張 → 委託成功 "
+                                   f"(第 {attempt} 次)")
+                    chased_ok = True
+                    break
+                except Exception as e:
+                    # log 防洪: 前 5 次全印,之後每 50 次一次 (無上限重試最壞 5 log/s/檔)
+                    if attempt <= 5 or attempt % 50 == 0:
+                        logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,"
+                                     f"續試至成功): {e}")
+                    time.sleep(self.order_min_interval)   # 單檔退避 (不佔共用額度)
+            if not chased_ok:
+                # 中止 → 釋放保留的預算
+                with self._lock:
+                    self._release_budget(st)
+                logger.warning(f"[session] {symbol} 市價追中止 ({abort_reason}, 共試 {attempt} 次)")
+
+        # 市價單已出手 (成功或中止) → 才回頭撤預掛剩餘。預算已轉移,這裡**不再動預算**、
+        # 不動 st.order_no/order_status (已屬市價單);撤失敗由 13:23 cancel_all 兜底。
+        if pre_order_no:
+            self._rate.acquire()
+            try:
+                self.broker.cancel(pre_order_no, symbol, reason="first_trade_unfilled")
+                self._mark_order(pre_order_no, "cancelled")
+                logger.info(f"[session] {symbol} 預掛剩餘已撤 (市價單已先出手)")
             except Exception as e:
-                logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,續試至成功): {e}")
-                time.sleep(self.order_min_interval)   # 單檔退避 (不佔全域額度)
-        # 中止 → 釋放保留的預算
-        with self._lock:
-            self.budget_used -= shortfall * limit_up * 1000
-        logger.warning(f"[session] {symbol} 市價追中止 ({abort_reason}, 共試 {attempt} 次)")
+                logger.error(f"[session] {symbol} 撤預掛剩餘失敗 (13:23 cancel_all 兜底): {e}")
+
+    def cancel_symbol_orders_async(self, symbol: str, reason: str):
+        """撤單非同步版 — **行情 callback thread 專用** (撤單 REST 往返 ~60ms,
+        同步呼叫會卡住同 socket 其他股票的 tick,包括正要觸發市價追的那筆)。"""
+        threading.Thread(target=self.cancel_symbol_orders, args=(symbol, reason),
+                         name=f"cancel-{symbol}", daemon=True).start()
 
     def cancel_symbol_orders(self, symbol: str, reason: str):
-        """撤該檔 pending 委託 (unmark/首盤淘汰/qty_drop_half 用)。不賣持倉。"""
-        if not self.is_live():
-            return
+        """撤該檔 pending 委託 (unmark/首盤淘汰/qty_drop_half 用)。不賣持倉。
+        閘門 = _can_manage (非 is_live) — 關 kill switch 後撤單仍要能動。
+        ⚠ 同步阻塞 (REST 往返) — 行情 thread 上請用 cancel_symbol_orders_async。"""
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or not st.order_no or st.order_status != "pending":
@@ -494,24 +599,32 @@ class TradingSession:
                     st.stopped_reason = st.stopped_reason or reason
                 return
             order_no = st.order_no
-            unfilled = max(0, st.target_lots - st.filled_lots)
-            limit_up = st.limit_up
-        self._gate()
+        # 真的有 pending 才檢查閘門 — 沒單就不必叫,也不會誤鳴 CRITICAL
+        if not self._can_manage():
+            if self.mode == "real":
+                logger.critical(f"[session] ⚠ {symbol} 撤單請求但 broker 未連線 — "
+                                f"委託可能仍掛在券商端,需人工處理 ({reason})")
+            return
+        self._rate.acquire()
         try:
             self.broker.cancel(order_no, symbol, reason=reason)
             with self._lock:
                 st.order_status = "cancelled"
                 st.order_no = ""
                 st.stopped_reason = st.stopped_reason or reason
-                self.budget_used -= unfilled * limit_up * 1000
+                self._release_budget(st)
             self._mark_order(order_no, "cancelled")
             logger.warning(f"[session] {symbol} 撤單 ({reason})")
         except Exception as e:
-            logger.error(f"[session] {symbol} 撤單失敗: {e}")
+            logger.critical(f"[session] ⚠ {symbol} 撤單失敗 — 委託可能仍掛在券商端: {e}")
 
     def exit_position(self, symbol: str, reason: str):
-        """委賣出現 → 立刻出場: 撤 pending + 市價賣出全部已成交。(背景 thread)"""
-        if not self.is_live():
+        """委賣出現 → 立刻出場: 撤 pending + 市價賣出全部已成交。(背景 thread)
+        閘門 = _can_manage (非 is_live) — 關 kill switch / WS 不健康時出場仍要能動。"""
+        if not self._can_manage():
+            if self.mode == "real":
+                logger.critical(f"[session] ⚠ {symbol} 出場請求但 broker 未連線 — "
+                                f"部位無法賣出,需人工處理 ({reason})")
             return
         threading.Thread(target=self._exit_worker, args=(symbol, reason),
                          name=f"exit-{symbol}", daemon=True).start()
@@ -519,22 +632,24 @@ class TradingSession:
     def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str,
                        max_tries: Optional[int] = None) -> bool:
         """賣出 lots 張。處置股 → 委買一價**限價**賣 (不能下市價);其餘 → 市價賣。
-        max_tries=None → **重試到成功為止** (自動出場用;中止只在 kill switch 關);
-        給整數 → 最多試幾次 (緊急全平用,避免 API thread 卡死)。成功回 True。
-        送單全程過全域閘門 (50/s);失敗後單檔退避。"""
+        max_tries=None → 預設 DEFAULT_SELL_MAX_TRIES 次 (原「重試到成功為止」2026-08 修 —
+        持續被拒會無限狂送;用盡由 caller 記 CRITICAL + sell_failed 旗標,下一個
+        委賣 tick 仍可再觸發出場,行情節奏非熱迴圈);給整數 → 最多試幾次
+        (緊急全平用,避免 API thread 卡死)。成功回 True。
+        送單全程過全域閘門 (50/s);失敗後單檔指數退避 (0.2→…→5s)。"""
         disp = st.is_disposition
+        tries = max_tries if max_tries is not None else DEFAULT_SELL_MAX_TRIES
         attempt = 0
-        while True:
-            if not self.is_live():
-                return False
-            if max_tries is not None and attempt >= max_tries:
+        while attempt < tries:
+            # _can_manage (非 is_live): 關 kill switch 不該讓賣單送不出去 (2026-08 修)
+            if not self._can_manage():
                 return False
             bid1 = st.last_bid1_price     # 每次重讀 (限價賣價隨市場更新)
             if disp and bid1 <= 0:
                 logger.critical(f"[session] ⚠ {symbol} 處置股出場但無委買一價 → 無法限價賣,"
                                 f"部位 {lots} 張需人工處理")
                 return False
-            self._gate()      # 全域 50/s 硬上限
+            self._rate.acquire()      # 爆發式 45/s 窗口
             attempt += 1
             try:
                 if disp:
@@ -546,10 +661,12 @@ class TradingSession:
                     sell_no = self.broker.place_market_sell(symbol, lots, reason)
                     self._log_order(sell_no, symbol, "sell", "market_sell", lots, 0)
                     logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
+                st.sell_failed = False    # 賣單送出成功 → 解除先前失敗旗標
                 return True
             except Exception as e:
-                logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt} 次): {e}")
-                time.sleep(self.order_min_interval)   # 單檔退避
+                logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt}/{tries} 次): {e}")
+                time.sleep(min(self.order_min_interval * (2 ** (attempt - 1)), 5.0))  # 指數退避
+        return False    # 重試用盡
 
     def _exit_worker(self, symbol: str, reason: str):
         with self._lock:
@@ -561,19 +678,26 @@ class TradingSession:
         with self._lock:
             lots = st.filled_lots
         if lots > 0:
-            # 自動出場: 重試到成功為止 (kill switch 關才會回 False)
             if not self._sell_position(symbol, st, lots, reason):
                 with self._lock:
-                    st.exited = False   # 未賣成 (kill switch) → 允許再觸發
-                logger.error(f"[session] {symbol} 出場賣單中止 (未成功),部位 {lots} 張仍在")
+                    st.exited = False       # 未賣成 → 下一個委賣 tick 可再觸發 (行情節奏,非熱迴圈)
+                    st.sell_failed = True   # 前端顯示「需人工」
+                logger.critical(f"[session] ⚠⚠ {symbol} 出場賣單連續失敗,部位 {lots} 張仍在 — "
+                                f"需人工處理 ({reason})")
 
     def cancel_all_pending(self, reason: str):
-        """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。"""
-        if not self.is_live():
-            return
+        """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。
+        閘門 = _can_manage (非 is_live) — 關 kill switch 也必須能撤 13:23 的單。"""
         with self._lock:
             syms = [s for s, st in self.trades.items()
                     if st.order_no and st.order_status == "pending"]
+        if not syms:
+            return
+        if not self._can_manage():
+            if self.mode == "real":
+                logger.critical(f"[session] ⚠ 13:23/收盤撤單但 broker 未連線 — "
+                                f"{len(syms)} 檔未成交委託可能仍掛在券商端,需人工處理")
+            return
         for sym in syms:
             self.cancel_symbol_orders(sym, reason)
         logger.warning(f"[session] 收盤撤單完成 ({len(syms)} 檔) — 持倉保留")
@@ -751,6 +875,7 @@ class TradingSession:
             pending_no = o["sell_order_no"] if (skip and o["sell_placed"]) else ""
         if pending_no:
             try:
+                self._rate.acquire()   # 補漏: 原本這條撤單完全沒過送單風控
                 self.broker.cancel(pending_no, symbol, reason="overnight_skip")
                 self._mark_order(pending_no, "cancelled")
             except Exception as e:
@@ -764,7 +889,10 @@ class TradingSession:
                        f"{' (已撤賣單)' if pending_no else ''}")
 
     def on_overnight_first_trade(self, symbol: str):
-        """隔日賣標的收到成交 → (armed+連線時) 算賣價下限價賣。一次性 (背景 thread)。"""
+        """隔日賣標的收到成交 → (armed+連線時) 算賣價下限價賣。一次性 (背景 thread)。
+
+        閘門**刻意用 is_live** (跟出場/撤單的 _can_manage 不同): 這是從行情「自動發起」
+        的新賣單,不是管理既有委託 — 未 armed 絕不自動下單的安全預設必須守住。"""
         if not self.is_live():
             return
         with self._lock:
@@ -827,7 +955,7 @@ class TradingSession:
                         self.overnight[symbol]["sell_placed"] = False
                 logger.warning(f"[session] 隔日賣 {symbol} 中止賣出 (kill switch / 暫停 / 已移除)")
                 return
-            self._gate()
+            self._rate.acquire()
             attempt += 1
             try:
                 no = self.broker.place_limit_sell(symbol, price, lots, "overnight_sell")
@@ -880,20 +1008,21 @@ class TradingSession:
             from datetime import datetime as _dt
             self._output_dir.mkdir(exist_ok=True)
             f = self._output_dir / f"{_dt.now().strftime('%Y-%m-%d')}_fills.csv"
-            new = not f.exists()
-            with f.open("a", newline="", encoding="utf-8") as fh:
-                w = _csv.writer(fh)
-                if new:
-                    w.writerow(["recv_time", "symbol", "action", "price", "lots",
-                                "quantity", "order_no", "filled_no",
-                                "broker_filled_time", "strategy"])
-                w.writerow([
-                    _dt.now().isoformat(timespec="seconds"),
-                    fill.get("symbol", ""), fill.get("action", ""),
-                    fill.get("price", 0), fill.get("lots", 0), fill.get("quantity", 0),
-                    fill.get("order_no", ""), fill.get("filled_no", ""),
-                    fill.get("filled_time", ""), 1 if is_strategy else 0,
-                ])
+            with self._fills_lock:
+                new = not f.exists()
+                with f.open("a", newline="", encoding="utf-8") as fh:
+                    w = _csv.writer(fh)
+                    if new:
+                        w.writerow(["recv_time", "symbol", "action", "price", "lots",
+                                    "quantity", "order_no", "filled_no",
+                                    "broker_filled_time", "strategy"])
+                    w.writerow([
+                        _dt.now().isoformat(timespec="seconds"),
+                        fill.get("symbol", ""), fill.get("action", ""),
+                        fill.get("price", 0), fill.get("lots", 0), fill.get("quantity", 0),
+                        fill.get("order_no", ""), fill.get("filled_no", ""),
+                        fill.get("filled_time", ""), 1 if is_strategy else 0,
+                    ])
         except Exception as e:
             logger.error(f"[session] 寫成交台帳失敗: {e}")
 
@@ -929,6 +1058,9 @@ class TradingSession:
                 st.filled_lots += fill["lots"]
                 if st.filled_lots > 0:
                     st.avg_price = (prev_cost + fill["price"] * fill["lots"]) / st.filled_lots
+                # 保留轉消耗 (預算不變式;晚到的 fill 若保留已被釋放,floor 0 保底)
+                st.budget_reserved = max(
+                    0.0, st.budget_reserved - fill["lots"] * st.limit_up * 1000)
                 if st.filled_lots >= st.target_lots:
                     st.order_status = "done"
                     st.order_no = ""
@@ -945,6 +1077,10 @@ class TradingSession:
             if st is not None and st.order_no == rpt.get("order_no"):
                 st.order_status = "rejected"
                 st.order_no = ""
+                # 拒單釋放保留預算 — 不釋放的話每次拒單都永久吃掉當日額度。
+                # st.order_no 只會是買單 (賣單不寫 order_no),order_kind 再保險一層。
+                if st.order_kind in ("pre_limit", "market_buy"):
+                    self._release_budget(st)
                 logger.error(f"[session] {st.symbol} 交易所拒單: {rpt['error_message']}")
 
     # ─── 委託總表 (前端顯示 + 右鍵刪單) ────────────────────
@@ -966,18 +1102,17 @@ class TradingSession:
                 raise ValueError(f"委託 {order_no} 狀態 {row['status']},不可刪")
             symbol = row["symbol"]
             is_buy = row["action"] == "buy"
-        self._gate()
+        self._rate.acquire()
         self.broker.cancel(order_no, symbol, reason="manual_cancel")
         self._mark_order(order_no, "cancelled")
         with self._lock:
             st = self.trades.get(symbol)
             if st is not None and st.order_no == order_no:
-                unfilled = max(0, st.target_lots - st.filled_lots)
                 st.order_status = "cancelled"
                 st.order_no = ""
                 if is_buy:
                     st.stopped_reason = st.stopped_reason or "manual_cancel"
-                    self.budget_used -= unfilled * st.limit_up * 1000
+                    self._release_budget(st)
         logger.warning(f"[session] 手動刪單 {order_no} ({symbol})")
 
     # ─── 查詢 ──────────────────────────────────────────────

@@ -34,7 +34,7 @@ def start_now():
 
 @router.post("/stop")
 def stop_now():
-    """手動 stop (會平倉 + 關 WS)."""
+    """手動 stop (停止監控 + 關 WS;**不平倉** — 持倉/委託不動,平倉用 /trading/close_all)."""
     r = Runner.get()
     r.stop()
     return {"ok": True}
