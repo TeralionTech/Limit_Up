@@ -74,6 +74,7 @@ class TradingSession:
         # per-symbol state
         self.trades: Dict[str, SymbolTrade] = {}
         self._processed_fills: set = set()   # 去重 key
+        self._output_dir: Optional[Path] = None   # 連線後設 — 成交台帳 fills.csv 落檔用
         # 委託總表 (前端委託狀態顯示 + 右鍵刪單) — key=order_no, 插入序
         self.order_log: Dict[str, dict] = {}
         # 處置股名單 (runner 從 ticker.isDisposition 填) — 影響下單機制
@@ -186,6 +187,7 @@ class TradingSession:
     def connect_async(self, account_id: str, password: str, pfx_path: str,
                       pfx_password: str, is_test: bool, output_dir: Path):
         """背景 thread 連線 (照 day-trade /api/auth/connect 模式,前端輪詢 status)。"""
+        self._output_dir = output_dir            # 成交台帳 fills.csv 落檔用
         with self._lock:
             if self.connecting:
                 raise RuntimeError("連線進行中")
@@ -866,8 +868,37 @@ class TradingSession:
 
     # ─── broker 回報 ───────────────────────────────────────
 
+    def _append_fill_csv(self, fill: dict, is_strategy: bool):
+        """每筆成交回報落檔 output/YYYY-MM-DD_fills.csv (重啟不丟;每日戰績台帳)。
+
+        含非策略單 (strategy=0) → 完整成交紀錄。IO 在 _on_fill 的鎖外呼叫。
+        """
+        if not self._output_dir:
+            return
+        try:
+            import csv as _csv
+            from datetime import datetime as _dt
+            self._output_dir.mkdir(exist_ok=True)
+            f = self._output_dir / f"{_dt.now().strftime('%Y-%m-%d')}_fills.csv"
+            new = not f.exists()
+            with f.open("a", newline="", encoding="utf-8") as fh:
+                w = _csv.writer(fh)
+                if new:
+                    w.writerow(["recv_time", "symbol", "action", "price", "lots",
+                                "quantity", "order_no", "filled_no",
+                                "broker_filled_time", "strategy"])
+                w.writerow([
+                    _dt.now().isoformat(timespec="seconds"),
+                    fill.get("symbol", ""), fill.get("action", ""),
+                    fill.get("price", 0), fill.get("lots", 0), fill.get("quantity", 0),
+                    fill.get("order_no", ""), fill.get("filled_no", ""),
+                    fill.get("filled_time", ""), 1 if is_strategy else 0,
+                ])
+        except Exception as e:
+            logger.error(f"[session] 寫成交台帳失敗: {e}")
+
     def _on_fill(self, fill: dict):
-        """成交回報 → 更新 filled_lots/avg_price。去重 (day-trade 模式)。"""
+        """成交回報 → 更新 filled_lots/avg_price。去重 (day-trade 模式) + 落檔台帳。"""
         key = f"{fill['order_no']}:{fill['filled_no']}:{fill['filled_time']}:{fill['lots']}"
         with self._lock:
             if key in self._processed_fills:
@@ -875,10 +906,14 @@ class TradingSession:
             self._processed_fills.add(key)
             # 只認「策略下過的單」(order_no ∈ order_log) — 同帳號手動單的成交
             # 不能混進策略部位 (否則差額算錯 + 出場連手動部位一起賣)
-            if fill["order_no"] not in self.order_log:
-                logger.info(f"[session] 非策略單成交,忽略: {fill['symbol']} "
-                            f"order={fill['order_no']} {fill['lots']} 張")
-                return
+            is_strategy = fill["order_no"] in self.order_log
+        # 每筆成交都落檔 (鎖外 IO;含非策略單 → 完整成交台帳,重啟不丟)
+        self._append_fill_csv(fill, is_strategy)
+        if not is_strategy:
+            logger.info(f"[session] 非策略單成交,忽略 (僅落檔): {fill['symbol']} "
+                        f"order={fill['order_no']} {fill['lots']} 張")
+            return
+        with self._lock:
             # 委託總表同步 (前端顯示)
             row = self.order_log.get(fill["order_no"])
             if row is not None:

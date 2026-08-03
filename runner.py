@@ -324,6 +324,7 @@ class Runner:
             logger.warning(f"[runner] 收盤撤單例外: {e}")
         # 存「今日買到、未出場」的持倉 → 隔日賣清單 (13:24 當下持倉算隔夜)
         self._write_overnight_file()
+        self._append_positions_history()   # 每日收盤 append 一行 (不覆蓋, 累積歷史台帳)
         self.trader.stop()
         self.subscriber.stop()
         # 收盤即把今日成交載回 session.overnight → 隔日賣頁立刻顯示 (庫存對帳為準)。
@@ -382,6 +383,28 @@ class Runner:
                            f"{[h['symbol'] for h in holdings]}")
         except Exception as e:
             logger.warning(f"[runner] 存隔日賣清單失敗: {e}")
+
+    def _append_positions_history(self):
+        """每日收盤 append 一行當日持倉快照到 positions_history.jsonl (不覆蓋,累積歷史台帳)。
+
+        與 overnight_holdings.json (每天覆蓋) 不同 — 這支保留每天的持倉,供事後 P&L/檢討。
+        """
+        import json as _json
+        try:
+            holdings = self.session.get_overnight_candidates()
+            line = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "holdings": holdings,
+            }
+            f = Path(__file__).parent / "output" / "positions_history.jsonl"
+            f.parent.mkdir(exist_ok=True)
+            with f.open("a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(line, ensure_ascii=False) + "\n")
+            logger.warning(f"[runner] 持倉歷史 append: {len(holdings)} 檔 "
+                           f"{[h['symbol'] for h in holdings]}")
+        except Exception as e:
+            logger.warning(f"[runner] 寫持倉歷史失敗: {e}")
 
     def track_overnight(self, symbol: str) -> bool:
         """前端手動加入一檔隔日賣標的: 加清單 + 盤中即時訂閱 + 立即寫回檔案 (持久化)。
