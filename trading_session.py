@@ -774,13 +774,36 @@ class TradingSession:
         threading.Thread(target=self._overnight_sell_worker, args=(symbol,),
                          name=f"overnight-{symbol}", daemon=True).start()
 
+    def _held_lots(self, symbol: str) -> int:
+        """查券商庫存中該檔現股張數 (賣出上限用)。連線中查詢失敗回 -1;不在庫存回 0。"""
+        if not self._broker_ready():
+            return -1
+        try:
+            for r in self.broker.get_inventories():
+                if r["symbol"] == symbol:
+                    return int(r["lots"])
+            return 0
+        except Exception as e:
+            logger.error(f"[session] 查 {symbol} 庫存張數失敗: {e}")
+            return -1
+
     def _overnight_sell_worker(self, symbol: str):
         import ticks
         with self._lock:
             o = self.overnight.get(symbol)
             if o is None:
                 return
-            bid1, ask1, lots = o["bid1"], o["ask1"], o["lots"]
+            bid1, ask1, want_lots = o["bid1"], o["ask1"], o["lots"]
+        # 安全上限: 賣出張數以「當下券商實際庫存」為準,絕不超賣。
+        # (防清單張數被灌大 → 超賣被拒 → 無限重試狂送單;2026-08-03 實測 bug)
+        held = self._held_lots(symbol)
+        lots = want_lots if held < 0 else min(want_lots, held)
+        if lots <= 0:
+            logger.critical(f"[session] 隔日賣 {symbol} 可賣張數 0 (清單 {want_lots}/庫存 {held}) → 不賣")
+            with self._lock:
+                if symbol in self.overnight:
+                    self.overnight[symbol]["sell_placed"] = False
+            return
         price = ticks.overnight_sell_price(bid1, ask1)
         if price <= 0:
             logger.critical(f"[session] ⚠ 隔日賣 {symbol} 無有效委買一價 → 無法賣,{lots} 張需人工")
@@ -788,14 +811,19 @@ class TradingSession:
                 if symbol in self.overnight:
                     self.overnight[symbol]["sell_placed"] = False   # 允許下一筆成交再試
             return
-        # 賣單: 重試到委託成功為止 (全域 50/s 閘門;kill switch 關才中止)
+        # 賣單: **有限次**重試 (非無限);kill switch / 使用者暫停(skip) / 標的移除 都會即刻停。
+        # (2026-08-03 修: 原本 while True 只看 kill switch → 超賣被拒時狂送單、按暫停也停不下來)
+        MAX_ATTEMPTS = 5
         attempt = 0
-        while True:
-            if not self.is_live():
+        while attempt < MAX_ATTEMPTS:
+            with self._lock:
+                o = self.overnight.get(symbol)
+                paused = (o is None) or o["skip"]
+            if not self.is_live() or paused:
                 with self._lock:
                     if symbol in self.overnight:
                         self.overnight[symbol]["sell_placed"] = False
-                logger.error(f"[session] 隔日賣 {symbol} 中止 (kill switch)")
+                logger.warning(f"[session] 隔日賣 {symbol} 中止賣出 (kill switch / 暫停 / 已移除)")
                 return
             self._gate()
             attempt += 1
@@ -811,8 +839,10 @@ class TradingSession:
                                f"(委買一 {bid1} 委賣一 {ask1})")
                 return
             except Exception as e:
-                logger.error(f"[session] 隔日賣 {symbol} 委託失敗 (第 {attempt} 次): {e}")
+                logger.error(f"[session] 隔日賣 {symbol} 委託失敗 (第 {attempt}/{MAX_ATTEMPTS} 次): {e}")
                 time.sleep(self.order_min_interval)
+        # 重試用盡 → 停手 (sell_placed 保持 True,不再被下一筆成交觸發),等人工
+        logger.critical(f"[session] 隔日賣 {symbol} 連 {MAX_ATTEMPTS} 次委託失敗 → 停手,需人工檢查")
 
     def overnight_status(self) -> list:
         """給前端「隔日賣標的」分頁 — 每檔含賣出狀態 (五檔由 API 端補)。"""
