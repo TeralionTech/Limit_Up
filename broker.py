@@ -299,17 +299,20 @@ class RealOrderClient:
             if not sym:
                 continue
             otype = _norm_enum(getattr(inv, "order_type", ""))
+            # 可賣張數 = tradable_qty (可賣量),退回 lastday_qty。**不可用 lastday+today 相加** —
+            # 留倉部位在富邦會同時出現在 lastday_qty 與 today_qty,相加 → 1 張變 2 張 (2026-08-03
+            # 實測 bug,對齊 day_trade fubon_adapter 的 `qty = tradable or lastday` 寫法)。
+            tradable = int(_attr(inv, "tradable_qty", default=0) or 0)
             lastday = int(_attr(inv, "lastday_qty", default=0) or 0)
             today = int(_attr(inv, "today_qty", default=0) or 0)
-            net = lastday + today
-            # 診斷: 印出每檔的 lastday/today 拆分 (查「持倉1張卻算2張」根因;T+2 結算可能重複計)
-            logger.info(f"[broker] 庫存明細 {sym}: lastday_qty={lastday} today_qty={today} "
-                        f"net={net} ({net // 1000} 張) type={otype}")
+            qty = tradable or lastday
+            logger.info(f"[broker] 庫存明細 {sym}: 可賣={tradable} 昨日={lastday} 今日={today} "
+                        f"→ 採用 {qty} ({qty // 1000} 張) type={otype}")
             if otype in ("Short", "Margin", "SBL"):
                 continue                          # 私人部位不碰
-            if net <= 0:
+            if qty <= 0:
                 continue                          # 只處理多單 (可賣)
-            out.append({"symbol": sym, "lots": net // 1000, "order_type": otype})
+            out.append({"symbol": sym, "lots": qty // 1000, "order_type": otype})
         logger.info(f"[broker] get_inventories → {out}")
         return out
 
