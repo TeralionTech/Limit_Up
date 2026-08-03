@@ -299,13 +299,18 @@ class RealOrderClient:
             if not sym:
                 continue
             otype = _norm_enum(getattr(inv, "order_type", ""))
+            lastday = int(_attr(inv, "lastday_qty", default=0) or 0)
+            today = int(_attr(inv, "today_qty", default=0) or 0)
+            net = lastday + today
+            # 診斷: 印出每檔的 lastday/today 拆分 (查「持倉1張卻算2張」根因;T+2 結算可能重複計)
+            logger.info(f"[broker] 庫存明細 {sym}: lastday_qty={lastday} today_qty={today} "
+                        f"net={net} ({net // 1000} 張) type={otype}")
             if otype in ("Short", "Margin", "SBL"):
                 continue                          # 私人部位不碰
-            net = int(_attr(inv, "lastday_qty", default=0) or 0) + \
-                  int(_attr(inv, "today_qty", default=0) or 0)
             if net <= 0:
                 continue                          # 只處理多單 (可賣)
             out.append({"symbol": sym, "lots": net // 1000, "order_type": otype})
+        logger.info(f"[broker] get_inventories → {out}")
         return out
 
     def get_order_filled_lots(self, order_no: str) -> int:
