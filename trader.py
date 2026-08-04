@@ -54,7 +54,7 @@ class Holding:
         self.pulled_reason = ""
         self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
         self.book_tick_count = 0         # 累計 books tick 數 (排隊中量減半檢查的暖機: >=3)
-        self.prev_bid1_size: Optional[int] = None   # 上一 tick 委買量基準 (市價+限價合計)
+        self.prev_bid1_size: Optional[int] = None   # 上一 tick 委買量基準 (一般股=市價列;處置股=限價列)
         # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
         self.warning = ""
         self._sample_ts = 0.0            # 上次取樣時間 (epoch)
@@ -73,7 +73,7 @@ class Trader:
 
     def __init__(self, watchlist, limit_ups, cfg,
                  recorder=None, state=None, unsub_fn: Optional[Callable] = None,
-                 session=None):
+                 session=None, dispositions: Optional[dict] = None):
         """
         watchlist: List[str] — filter 結束時的 marked 名單
         limit_ups: Dict[str, float] — 每檔漲停價
@@ -81,11 +81,13 @@ class Trader:
         state: state.State — 第一盤淘汰要同步 unmark (可 None)
         unsub_fn: callable(symbol) — 第一盤淘汰要退訂 (可 None)
         session: trading_session.TradingSession — real+armed 時同步掛真單 (可 None = 純監控)
+        dispositions: Dict[str, bool] — 處置股名單 (量減半基準用限價列;可 None)
         """
         self.holdings: Dict[str, Holding] = {
             s: Holding(s, limit_ups.get(s, 0.0)) for s in watchlist
         }
         self.cfg = cfg
+        self.dispositions: dict = dispositions or {}
         self.recorder = recorder
         self.state = state
         self.unsub_fn = unsub_fn
@@ -118,16 +120,18 @@ class Trader:
 
         # 委買一拆三用途 (2026-08-04 定案 — 市價彙總列 price=0 佔第一列的處理):
         #   顯示 = 原始第一列 (市價排隊時顯示 0 × 彙總量,忠實盤面)
-        #   規則 = 市價列+限價列**合計** (漲停前線總買量;跨 tick 可比,不會跳列互比誤撤)
+        #   規則 = 一般股**只看市價列** (搶漲停的積極買盤;限價列波動不觸發撤單)
+        #          處置股 = 限價列 (處置股禁下市價單,永遠沒有市價列)
         #   定價 = 第一個 price>0 限價檔位 (處置股出場限價賣不能拿 0;6243 教訓)
         raw_bid1_price = float(_pick(bids[0], "price") or 0) if bids else 0.0
         raw_bid1_size = int(_pick(bids[0], "size") or 0) if bids else 0
         raw_ask1_price = float(_pick(asks[0], "price") or 0) if asks else 0.0
         raw_ask1_size = int(_pick(asks[0], "size") or 0) if asks else 0
         limit_bid1_price, limit_bid1_size = _first_priced_level(bids)
-        # 市價彙總列只會佔第一列 (price=0);沒有市價列時合計=限價列,不重複計
+        # 市價彙總列只會佔第一列 (price=0)
         mkt_bid_size = raw_bid1_size if (bids and raw_bid1_price <= 0) else 0
-        bid_total = mkt_bid_size + limit_bid1_size
+        # 注意: 一般股若全程沒有市價排隊,基準恆為 0 → 量減半規則不啟動 (無此保護)
+        bid_basis = limit_bid1_size if self.dispositions.get(symbol) else mkt_bid_size
         # 委賣「任一檔」有量 (市價賣單 price=0 也算真賣單)
         asks_any = any(int(_pick(a, "size") or 0) > 0 for a in asks) if asks else False
 
@@ -147,8 +151,8 @@ class Trader:
         if asks_any and self.session is not None and self.session.has_exposure(symbol):
             self.session.exit_position(symbol, "ask_appeared")
 
-        # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與量減半規則同 = 合計) ===
-        self._update_decline_warning(h, bid_total)
+        # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與量減半規則同) ===
+        self._update_decline_warning(h, bid_basis)
 
         # === 第一盤: 開盤第一筆 books ===
         if not h.first_books_seen:
@@ -163,7 +167,7 @@ class Trader:
                 self._fail_first(h, f"first_books_ask_appeared ({raw_ask1_price} × {raw_ask1_size})")
                 return
             self._maybe_enter_tracking(h)
-            h.prev_bid1_size = bid_total
+            h.prev_bid1_size = bid_basis
             return
 
         h.book_tick_count += 1
@@ -171,27 +175,27 @@ class Trader:
         # === 盤中追蹤: 撤單條件 (只剩量減半) ===
         # 註: 原「委買一跌下漲停」條件已移除 — 盤中市價單會佔五檔第一列且 price=0
         # (例 0.00 × 1561, 漲停價買單在第二列), 拿 bids[0] 價格比會誤判跌下漲停。
-        qty_halved = bool(h.prev_bid1_size) and bid_total < h.prev_bid1_size * 0.5
+        qty_halved = bool(h.prev_bid1_size) and bid_basis < h.prev_bid1_size * 0.5
         if h.status == Holding.TRACKING:
-            # 委買量 (市價+限價合計) 在兩 tick 之間減少 1/2 以上
+            # 委買量基準 (一般股=市價列;處置股=限價列) 在兩 tick 之間減少 1/2 以上
             #   暖機: 第 3 筆成交後才判 — 避免開盤瞬間拿「盤前累積量」當基準造成誤撤。
             #   (prev_bid1_size 每 tick 都更新，到第 3 筆成交時基準已是盤後即時量)
             if h.trade_count >= 3 and qty_halved:
-                self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid_total})")
+                self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid_basis})")
         elif (h.status == Holding.WAITING and qty_halved and h.book_tick_count >= 3
               and self.session is not None and self.session.has_pending(symbol)):
             # [real] 全鎖死無成交股 (WAITING, 沒有首筆成交) 排隊中的預掛單也要受
             # 「量減半→撤單」保護 (規格 #3 主場景)。暖機改用 book tick 數 (≥3)。
             # 只撤委託、Holding 狀態不動 (監控續跑)。
             logger.warning(f"[trader] {symbol} 排隊中量減半 "
-                           f"({h.prev_bid1_size} → {bid_total}) → 撤預掛單")
+                           f"({h.prev_bid1_size} → {bid_basis}) → 撤預掛單")
             try:
                 # async — 這裡在行情 thread 上,同步撤單會卡同 socket 其他股票的 tick
                 self.session.cancel_symbol_orders_async(symbol, "qty_drop_half_queued")
             except Exception as e:
                 logger.error(f"[trader] {symbol} 撤排隊委託失敗: {e}")
 
-        h.prev_bid1_size = bid_total
+        h.prev_bid1_size = bid_basis
 
     def _update_decline_warning(self, h: Holding, bid1_size: int):
         """每 BID_DECLINE_SAMPLE_SEC 取樣一次委買一量;

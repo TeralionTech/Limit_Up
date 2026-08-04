@@ -334,6 +334,7 @@ class Runner:
             state=self.state,                                   # 第一盤淘汰同步 unmark
             unsub_fn=self._unsub_symbol,                        # + 退訂 (隔日賣標的不退)
             session=self.session,                               # 交易會話 (sim = 純監控)
+            dispositions=self.dispositions,                     # 處置股量減半基準用限價列
         )
         # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
         self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
