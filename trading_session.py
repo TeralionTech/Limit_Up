@@ -256,7 +256,8 @@ class TradingSession:
                 client = RealOrderClient(log_path)
                 client.on_fill = self._on_fill
                 client.on_order = self._on_order
-                client.on_disconnect = lambda: logger.error("[session] 交易 WS 斷線!")
+                client.on_disconnect = lambda: logger.critical("[session] ⚠ 交易 WS 斷線! (自動重連中)")
+                client.on_reconnected = self._on_broker_reconnected   # 重連成功 → 補收
                 client.connect(account_id, password, pfx_path, pfx_password, is_test)
                 with self._lock:
                     # 換掉舊 client (若有)
@@ -994,6 +995,70 @@ class TradingSession:
                 })
             return sorted(out, key=lambda x: x["symbol"])
 
+    # ─── 斷線補收 (2026-08-06,3587 事故) ───────────────────
+
+    def _on_broker_reconnected(self):
+        """交易 WS 自動重連成功 (broker relogin thread 上執行) → 補收 + 庫存對帳。"""
+        logger.critical("[session] ⚠ 交易 WS 已自動重連 — 開始補收斷線期間遺失的回報")
+        try:
+            self.reconcile_orders()
+        except Exception as e:
+            logger.exception(f"[session] 補收對帳例外: {e}")
+        try:
+            self.refresh_overnight_inventory()
+        except Exception as e:
+            logger.error(f"[session] 重連後庫存對帳例外: {e}")
+
+    def reconcile_orders(self):
+        """斷線補收 — 以券商權威成交量校正策略單。
+
+        放寬 2026-07-29「絕不從查詢寫回 filled_lots」的定案 (使用者定案 2026-08-06):
+        **僅限此情境**、僅策略單 (order_log 內)、以券商回傳**覆寫非累加**。
+        理由: 斷線期間遺失的成交回報永遠不會補送,不從查詢補就永遠隱形
+        (2026-08-05 3587: 市價買成交但回報遺失 → 部位對系統隱形一整天)。
+        與晚到回報不會雙算 — _on_fill 有單筆委託封頂 (見該處註解)。"""
+        if not self._broker_ready():
+            return
+        self._query_gate()
+        try:
+            auth_map = self.broker.get_filled_map()
+        except Exception as e:
+            logger.error(f"[session] 補收查詢失敗: {e}")
+            return
+        recovered = 0
+        with self._lock:
+            for order_no, row in self.order_log.items():
+                auth = auth_map.get(order_no)
+                if auth is None:
+                    continue
+                delta = auth - row["filled_lots"]
+                if delta <= 0:
+                    continue
+                row["filled_lots"] = auth                     # 覆寫非累加
+                if row["filled_lots"] >= row["lots"]:
+                    row["status"] = "filled"
+                st = self.trades.get(row["symbol"])
+                if st is not None:
+                    if row["action"] == "buy":
+                        prev_cost = st.avg_price * st.filled_lots
+                        st.filled_lots += delta
+                        # 回報遺失 → 無成交價可用,以漲停價近似 (保守偏高)
+                        st.avg_price = (prev_cost + st.limit_up * delta) / st.filled_lots
+                        st.budget_reserved = max(
+                            0.0, st.budget_reserved - delta * st.limit_up * 1000)
+                        if st.order_no == order_no and st.filled_lots >= st.target_lots:
+                            st.order_status = "done"
+                            st.order_no = ""
+                    else:
+                        st.filled_lots = max(0, st.filled_lots - delta)
+                recovered += delta
+                logger.critical(f"[session] ⚠ 補收 {row['symbol']} {row['action']} "
+                                f"{delta} 張 (order {order_no},斷線期間回報遺失)")
+        if recovered:
+            logger.critical(f"[session] 補收對帳完成 — 共補 {recovered} 張")
+        else:
+            logger.warning("[session] 補收對帳完成 — 無差異")
+
     # ─── broker 回報 ───────────────────────────────────────
 
     def _append_fill_csv(self, fill: dict, is_strategy: bool):
@@ -1045,27 +1110,34 @@ class TradingSession:
         with self._lock:
             # 委託總表同步 (前端顯示)
             row = self.order_log.get(fill["order_no"])
+            # **單筆委託封頂** (2026-08-06): 一張委託的成交總量不可能超過委託量 —
+            # 以 row 剩餘量封頂記帳,讓「斷線補收對帳」與晚到/重複回報天然冪等,
+            # 不會雙算 (也根絕 2026-07-29 那類重複計算)。
+            lots = fill["lots"]
             if row is not None:
-                row["filled_lots"] += fill["lots"]
+                lots = max(0, min(lots, row["lots"] - row["filled_lots"]))
+                row["filled_lots"] += lots
                 if row["filled_lots"] >= row["lots"]:
                     row["status"] = "filled"
+            if lots <= 0:
+                return      # 該委託已記滿 (補收已入帳的晚到回報) → 不再動部位
             st = self.trades.get(fill["symbol"])
             if st is None:
                 logger.warning(f"[session] 未知標的成交回報: {fill}")
                 return
             if fill["action"] == "buy":
                 prev_cost = st.avg_price * st.filled_lots
-                st.filled_lots += fill["lots"]
+                st.filled_lots += lots
                 if st.filled_lots > 0:
-                    st.avg_price = (prev_cost + fill["price"] * fill["lots"]) / st.filled_lots
+                    st.avg_price = (prev_cost + fill["price"] * lots) / st.filled_lots
                 # 保留轉消耗 (預算不變式;晚到的 fill 若保留已被釋放,floor 0 保底)
                 st.budget_reserved = max(
-                    0.0, st.budget_reserved - fill["lots"] * st.limit_up * 1000)
+                    0.0, st.budget_reserved - lots * st.limit_up * 1000)
                 if st.filled_lots >= st.target_lots:
                     st.order_status = "done"
                     st.order_no = ""
             else:   # sell (出場)
-                st.filled_lots = max(0, st.filled_lots - fill["lots"])
+                st.filled_lots = max(0, st.filled_lots - lots)
 
     def _on_order(self, rpt: dict):
         """委託回報 — 交易所拒單時標 rejected (place_order 同步成功但交易所退)。"""

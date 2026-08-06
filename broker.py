@@ -67,6 +67,17 @@ class RealOrderClient:
         self.on_fill: Optional[Callable[[dict], None]] = None
         self.on_order: Optional[Callable[[dict], None]] = None
         self.on_disconnect: Optional[Callable[[], None]] = None
+        self.on_reconnected: Optional[Callable[[], None]] = None   # 重連成功 → session 補收
+        # 自動重連 (2026-08-05 實盤事故: 交易 WS 盤中斷線 → 回報遺失+撤單全失敗,
+        # v1「不自動重連」決策廢除)。憑證存記憶體供重登入。
+        self._account_id = ""
+        self._password = ""
+        self._pfx_path = ""
+        self._pfx_password = ""
+        self._relogin_lock = threading.Lock()
+        self._relogin_timer: Optional[threading.Timer] = None
+        self._relogin_first_fail: Optional[float] = None
+        self._stopping = False
         # CSV log
         self._lock = threading.Lock()
         self.log_path = log_path
@@ -89,6 +100,13 @@ class RealOrderClient:
         from fubon_neo.sdk import FubonSDK
 
         self.is_test = is_test
+        # 憑證存記憶體 — 交易 WS 斷線 (code=300) 自動重登入用
+        self._account_id = account_id
+        self._password = password
+        self._pfx_path = pfx_path
+        self._pfx_password = pfx_password
+        self._stopping = False
+        self._relogin_first_fail = None
         if is_test:
             sdk = FubonSDK(30, 2, url=FUBON_TEST_URL)
             logger.info("[broker] 使用富邦【測試環境】")
@@ -130,6 +148,13 @@ class RealOrderClient:
                     f"({'測試' if is_test else '正式'}環境)")
 
     def disconnect(self):
+        # 手動斷線 → 停掉自動重連 (timer 不准把連線拉回來)
+        self._stopping = True
+        if self._relogin_timer is not None:
+            try:
+                self._relogin_timer.cancel()
+            except Exception:
+                pass
         self.connected = False
         self.healthy = False
         if self.sdk:
@@ -155,6 +180,103 @@ class RealOrderClient:
             raise RuntimeError("broker 未連線")
         if not self.healthy:
             raise RuntimeError("broker 連線不健康 (交易 WS 斷線?) — 請重新連線")
+
+    # ─── 自動重連 (2026-08-06,仿 day-trade fubon_adapter re_login) ──────
+
+    def re_login(self):
+        """交易 WS 斷線 (code=300) 自動重連 — **atomic swap**。
+
+        關鍵: 用臨時 new_sdk 嘗試 login,**成功後才**替換 self.sdk — 失敗時舊 SDK
+        保留 (不會換成空殼害後續全掛),排 5 秒後重試直到成功或手動 disconnect。
+        成功後呼叫 on_reconnected (session 的權威對帳補收 hook — 斷線期間遺失的
+        成交回報永遠不會補送,不補收部位就隱形;2026-08-05 3587 事故)。"""
+        if not self._relogin_lock.acquire(blocking=False):
+            logger.warning("[broker] 已有重連程序執行中 — 略過")
+            return
+        try:
+            if self._stopping:
+                return
+            logger.critical("[broker] ⚠ 交易 WS 自動重連開始...")
+            from fubon_neo.sdk import FubonSDK
+            new_sdk = None
+            try:
+                new_sdk = FubonSDK(30, 2, url=FUBON_TEST_URL) if self.is_test else FubonSDK()
+                if self._pfx_password == "":
+                    accounts = new_sdk.login(self._account_id, self._password, self._pfx_path)
+                else:
+                    accounts = new_sdk.login(self._account_id, self._password,
+                                             self._pfx_path, self._pfx_password)
+            except Exception as e:
+                logger.error(f"[broker] 重連 login 例外: {e} (舊 SDK 保留,5 秒後重試)")
+                self._safe_logout(new_sdk)
+                self._schedule_relogin_retry()
+                return
+            if not accounts or getattr(accounts, "is_success", None) is not True:
+                reason = getattr(accounts, "message", None) or "login 回空/失敗"
+                logger.error(f"[broker] 重連 login 失敗: {reason} (舊 SDK 保留,5 秒後重試)")
+                self._safe_logout(new_sdk)
+                self._schedule_relogin_retry()
+                return
+            data = getattr(accounts, "data", None) or []
+            if not data:
+                logger.error("[broker] 重連成功但無帳戶 — 5 秒後重試")
+                self._safe_logout(new_sdk)
+                self._schedule_relogin_retry()
+                return
+            # 用原帳號比對找回同一帳戶 (多帳戶時不能亂挑)
+            account = next((a for a in data
+                            if str(getattr(a, "account", "")) == self.account_no), None)
+            if account is None:
+                logger.warning(f"[broker] 重連找不到原帳戶 {self.account_no} — 用第一個帳戶")
+                account = data[0]
+
+            # login 成功 → 才登出舊 SDK + atomic swap + 重註冊回報
+            self._safe_logout(self.sdk)
+            new_sdk.set_on_filled(self._handle_filled)
+            new_sdk.set_on_order(self._handle_order)
+            new_sdk.set_on_order_changed(self._handle_order)
+            new_sdk.set_on_event(self._handle_event)
+            self.sdk = new_sdk
+            self.account = account
+            self.account_no = str(getattr(account, "account", ""))
+            self.connected = True
+            self.healthy = True
+            self.error_msg = ""
+            self._relogin_first_fail = None
+            logger.critical("[broker] ✅ 交易 WS 自動重連成功 — 觸發權威對帳補收")
+            if self.on_reconnected:
+                try:
+                    self.on_reconnected()
+                except Exception as e:
+                    logger.exception(f"[broker] on_reconnected hook 例外: {e}")
+        except Exception as e:
+            logger.exception(f"[broker] 重連流程異常: {e} — 5 秒後重試")
+            self._schedule_relogin_retry()
+        finally:
+            self._relogin_lock.release()
+
+    @staticmethod
+    def _safe_logout(sdk):
+        if sdk is not None:
+            try:
+                sdk.logout()
+            except Exception:
+                pass
+
+    def _schedule_relogin_retry(self):
+        """重連失敗 → 5 秒後再試 (直到成功或手動 disconnect)。>10 分鐘未恢復 → CRITICAL。"""
+        if self._stopping:
+            return
+        if self._relogin_first_fail is None:
+            self._relogin_first_fail = time.time()
+        elapsed = time.time() - self._relogin_first_fail
+        if elapsed > 600:
+            logger.critical(f"[broker] ⚠⚠ 交易 WS 已斷線 {int(elapsed / 60)} 分鐘,"
+                            f"自動重連持續失敗 — 需人工檢查")
+        t = threading.Timer(5.0, self.re_login)
+        t.daemon = True
+        self._relogin_timer = t
+        t.start()
 
     # ─── 下單 ──────────────────────────────────────────────
 
@@ -326,6 +448,19 @@ class RealOrderClient:
         filled_qty = int(_attr(obj, "filled_qty", "filledQty", default=0) or 0)
         return filled_qty // 1000
 
+    def get_filled_map(self) -> dict:
+        """一次查回**所有**委託的權威已成交張數 {order_no: lots} — 斷線補收對帳用
+        (一次 REST 拿全部,不逐單查)。查詢失敗 raise,caller 處理。"""
+        self._require_ready()
+        result = self.sdk.stock.get_order_results(self.account)
+        out = {}
+        if result and getattr(result, "is_success", False):
+            for o in (result.data or []):
+                no = str(getattr(o, "order_no", ""))
+                if no:
+                    out[no] = int(_attr(o, "filled_qty", "filledQty", default=0) or 0) // 1000
+        return out
+
     def get_pending_orders(self) -> list:
         """回當前委託清單 (重連/重啟重建 pending 用)。每項 dict。"""
         self._require_ready()
@@ -402,12 +537,20 @@ class RealOrderClient:
         logger.warning(f"[broker] 事件 code={code}: {content}")
         if str(code) == "300":     # 交易 WS 斷線
             self.healthy = False
-            self.error_msg = "交易 WS 斷線 (event 300) — 請重新連線"
+            self.error_msg = "交易 WS 斷線 (event 300) — 自動重連中"
+            logger.critical("[broker] ⚠ 交易 WS 斷線 (code=300) — 啟動自動重連")
             if self.on_disconnect:
                 try:
                     self.on_disconnect()
                 except Exception:
                     pass
+            # cheap guard: 重連已在跑就不再開 thread (re_login 內部 lock 也會擋)
+            if self._relogin_lock.locked():
+                logger.warning("[broker] code=300 但重連已在進行 — skip")
+                return
+            if not self._stopping:
+                threading.Thread(target=self.re_login,
+                                 name="broker-relogin", daemon=True).start()
 
     # ─── CSV ──────────────────────────────────────────────
 
