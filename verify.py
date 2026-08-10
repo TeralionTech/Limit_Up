@@ -4,11 +4,13 @@
     python verify.py
 
 跑 4 個測試 (~30 秒)，任何一步 fail 會清楚指出問題:
-    1. Login  — 主帳號 + 副帳號 (若 .env 有設) 都驗，兩者執行時都會開 socket
-    2. REST  — 拿股票清單 + 對 sample 5 檔拿漲停價
-    3. WS    — 訂閱 1 檔看能否連線 (盤外可能沒 tick，只驗連線)
+    1. .env  — 必填欄位齊全
+    2. Login — 主帳號 + **所有**已設定的副帳號 (最多兩個) 逐一驗,
+               照 subscriber 的 account plan 來 (設幾個驗幾個)
+    3. REST  — 拿股票清單 + 對 sample 5 檔拿漲停價
+    4. WS    — 訂閱 1 檔看能否連線 (盤外可能沒 tick，只驗連線)
 
-跑完看綠燈全亮就可以正式跑 filter.py。
+跑完看綠燈全亮就可以正式跑。
 """
 from __future__ import annotations
 
@@ -97,16 +99,24 @@ def main():
     if sdk is None:
         return 1
 
-    # 副帳號 (選填) — 執行時 subscriber 會用它多開 5 個 socket，一定要一起驗，
-    # 否則副帳號憑證錯也不會被發現，直到開盤 socket 開不起來、覆蓋率砍半。
-    if cfg.account_id_2:
-        sdk2 = _login_account(FubonSDK, cfg.account_id_2, cfg.password_2,
-                              cfg.pfx_path_2, cfg.pfx_password_2, label="副帳號")
-        if sdk2 is None:
-            _fail("副帳號 login 失敗 — 開盤時副帳號 5 個 socket 會開不起來 (覆蓋率砍半)")
-            return 1
-    else:
+    # 副帳號們 (選填,最多兩個) — 照 subscriber 的 account plan 逐一驗 (跟開盤執行
+    # 同一份計畫,設幾個驗幾個)。憑證錯不先驗出來,開盤 socket 就開不起來、
+    # 覆蓋率無聲掉一截 (2026-08-10 副帳號憑證異常 → 少收一半才被發現)。
+    from subscriber import Subscriber
+    sub_accounts = [p for p in Subscriber._account_plan(cfg) if p[0] != "primary"]
+    if not sub_accounts:
         _info("(未設副帳號，只驗主帳號)")
+    login_fail = False
+    for label_en, acct, pwd, pfx, pfxpwd, n in sub_accounts:
+        label = {"secondary": "副帳號", "tertiary": "副帳號3"}.get(label_en, label_en)
+        sdk_n = _login_account(FubonSDK, acct, pwd, pfx, pfxpwd,
+                               label=f"{label} ({str(acct)[:3]}***)")
+        if sdk_n is None:
+            _fail(f"{label} login 失敗 — 開盤時該帳號 {n} 條 socket 開不起來 "
+                  f"(覆蓋率少 ~{n * 199} 檔)")
+            login_fail = True         # 不提早 return — 其餘帳號照驗,一次看全
+    if login_fail:
+        return 1
 
     # ─── 3. REST — 拿股票清單 + sample 漲停價 ───────────
     print("\n=== [3/4] REST API 測試 ===")
