@@ -48,12 +48,18 @@ class Config:
     bid_decline_minutes: int  # 連續遞減幾分鐘 = discard
     bid_decline_sample_sec: int  # 每 N 秒抓一次 bid 五檔總量 sample
     skip_trader: bool      # true → 篩選完不進 trader，改成常駐收 tick (LIVE_SUBSCRIBE)
-    # 富邦副帳號 (選填 — 多開 sockets 監控更多股票)
+    # 富邦副帳號 (選填 — 多開 sockets 監控更多股票;每帳號富邦上限 5 條)
     # dataclass 規則: 有預設值的欄位必須放最後
     account_id_2: str = ""
     password_2: str = ""
     pfx_path_2: str = ""
     pfx_password_2: str = ""
+    account_id_3: str = ""
+    password_3: str = ""
+    pfx_path_3: str = ""
+    pfx_password_3: str = ""
+    socket_count_2: int = 0    # 副帳號各自的 socket 數 (0/未設 → 同 SOCKET_COUNT)
+    socket_count_3: int = 0
 
 
 def load_config() -> Config:
@@ -72,13 +78,21 @@ def load_config() -> Config:
     if not Path(pfx_path).exists():
         raise ConfigError(f"[config] PFX 憑證檔案不存在: {pfx_path}")
 
-    # 副帳號 (選填)
+    # 副帳號 (選填,最多兩個 — 收資料容量/冗餘用)
     account_id_2 = os.environ.get("FUBON_ACCOUNT_ID_2", "").strip()
     password_2 = os.environ.get("FUBON_PASSWORD_2", "").strip()
     pfx_path_2 = os.environ.get("FUBON_PFX_PATH_2", "").strip()
     pfx_password_2 = os.environ.get("FUBON_PFX_PASSWORD_2", "").strip()
     if account_id_2 and pfx_path_2 and not Path(pfx_path_2).exists():
         raise ConfigError(f"[config] 副帳號 PFX 不存在: {pfx_path_2}")
+    account_id_3 = os.environ.get("FUBON_ACCOUNT_ID_3", "").strip()
+    password_3 = os.environ.get("FUBON_PASSWORD_3", "").strip()
+    pfx_path_3 = os.environ.get("FUBON_PFX_PATH_3", "").strip()
+    pfx_password_3 = os.environ.get("FUBON_PFX_PASSWORD_3", "").strip()
+    if account_id_3 and pfx_path_3 and not Path(pfx_path_3).exists():
+        raise ConfigError(f"[config] 副帳號3 PFX 不存在: {pfx_path_3}")
+
+    socket_count = int(os.environ.get("SOCKET_COUNT", "5"))
 
     return Config(
         account_id=account_id,
@@ -89,10 +103,16 @@ def load_config() -> Config:
         password_2=password_2,
         pfx_path_2=pfx_path_2,
         pfx_password_2=pfx_password_2,
+        account_id_3=account_id_3,
+        password_3=password_3,
+        pfx_path_3=pfx_path_3,
+        pfx_password_3=pfx_password_3,
+        socket_count_2=int(os.environ.get("SOCKET_COUNT_2", "0") or 0),
+        socket_count_3=int(os.environ.get("SOCKET_COUNT_3", "0") or 0),
         universe=os.environ.get("UNIVERSE", "twse+tpex").strip().lower(),
         batch_size=int(os.environ.get("BATCH_SIZE", "199")),
         batch_rotate_sec=int(os.environ.get("BATCH_ROTATE_SEC", "30")),
-        socket_count=int(os.environ.get("SOCKET_COUNT", "5")),
+        socket_count=socket_count,
         end_time=os.environ.get("END_TIME", "09:00:00").strip(),
         limit_up_fetch_deadline=os.environ.get("LIMIT_UP_FETCH_DEADLINE", "08:28").strip(),
         limit_up_max_per_min=int(os.environ.get("LIMIT_UP_MAX_PER_MIN", "250")),

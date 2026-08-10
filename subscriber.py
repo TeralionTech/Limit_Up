@@ -285,69 +285,95 @@ class Subscriber:
 
     # ─── Multi-SDK: 開 N 個 login sessions ───────────────────
 
+    @staticmethod
+    def _account_plan(cfg) -> list:
+        """收資料帳號計畫 [(label, account_id, password, pfx_path, pfx_password, n_sockets)]。
+
+        主帳號 + 有設定的副帳號們 (最多兩個);每帳號 socket 數各自可調
+        (SOCKET_COUNT / SOCKET_COUNT_2 / SOCKET_COUNT_3,富邦每帳號上限 5 條)。
+        純函式 — 可離線測試。"""
+        if cfg is None:
+            return []
+        primary_n = max(1, int(getattr(cfg, "socket_count", 5) or 5))
+        plan = [("primary", cfg.account_id, cfg.password,
+                 cfg.pfx_path, cfg.pfx_password, primary_n)]
+        for label, sfx in (("secondary", "_2"), ("tertiary", "_3")):
+            acct = getattr(cfg, f"account_id{sfx}", "") or ""
+            pfx = getattr(cfg, f"pfx_path{sfx}", "") or ""
+            if acct and pfx:
+                n = int(getattr(cfg, f"socket_count{sfx}", 0) or 0) or primary_n
+                plan.append((label, acct,
+                             getattr(cfg, f"password{sfx}", "") or "",
+                             pfx, getattr(cfg, f"pfx_password{sfx}", "") or "",
+                             max(1, n)))
+        return plan
+
     def _try_multi_sdk(self) -> bool:
-        """開 primary 帳號 socket_count 個 + secondary 帳號 socket_count 個 (若有設)。
-        Primary 首個 socket 用已 login 的 primary_sdk，剩下 socket_count-1 個額外 login。
-        """
+        """照 account plan 開 sockets — 主帳號 socket #1 沿用已登入的 primary_sdk,
+        其餘每條各自 login 一個新 SDK。單條登入失敗自動重試 (見 _login_extra_sdk);
+        某帳號 0 條成功 → CRITICAL 點名 (2026-08-10: 副帳號憑證異常只有 WARNING,
+        無聲少收一半資料才被人工發現)。"""
         try:
             from fubon_neo.sdk import FubonSDK
         except ImportError:
             logger.error("[subscriber] fubon_neo 未安裝")
             return False
 
-        cfg = self.login_cfg
-        sockets = [self.primary_sdk.marketdata.websocket_client.stock]  # primary 首個
-
-        # Primary 剩下的
-        for i in range(1, self.socket_count):
-            ws = self._login_extra_sdk(FubonSDK, cfg.account_id, cfg.password,
-                                        cfg.pfx_path, cfg.pfx_password,
-                                        label=f"primary #{i+1}/{self.socket_count}")
-            if ws is None:
-                if i == 1:
-                    return False   # 連第 2 個 primary 都開不了 → multi-SDK 不行
-                logger.warning(f"[subscriber] primary 只開 {len(sockets)} 個 sockets 就 fail")
-                break
-            sockets.append(ws)
-
-        # Secondary 帳號 (若有設)
-        if cfg.account_id_2 and cfg.pfx_path_2:
-            logger.info(f"[subscriber] 偵測到副帳號 {cfg.account_id_2[:3]}***，"
-                        f"再開 {self.socket_count} 個 sockets")
-            for i in range(self.socket_count):
-                ws = self._login_extra_sdk(FubonSDK, cfg.account_id_2, cfg.password_2,
-                                            cfg.pfx_path_2, cfg.pfx_password_2,
-                                            label=f"secondary #{i+1}/{self.socket_count}")
+        sockets = []
+        summary = []
+        for label, acct, pwd, pfx, pfxpwd, n in self._account_plan(self.login_cfg):
+            opened = 0
+            for i in range(n):
+                if label == "primary" and i == 0:
+                    sockets.append(self.primary_sdk.marketdata.websocket_client.stock)
+                    opened += 1
+                    continue
+                ws = self._login_extra_sdk(FubonSDK, acct, pwd, pfx, pfxpwd,
+                                           label=f"{label} #{i+1}/{n}")
                 if ws is None:
-                    logger.warning(f"[subscriber] secondary #{i+1} fail — 只用已開的 {len(sockets)}")
+                    logger.error(f"[subscriber] {label} 只開 {opened}/{n} 條就放棄")
                     break
                 sockets.append(ws)
-
+                opened += 1
+            if opened == 0:
+                logger.critical(f"[subscriber] ⚠⚠ {label} 帳號 ({str(acct)[:3]}***) 一條 socket "
+                                f"都沒開成 — 監控容量少 {n * self.batch_size} 檔,"
+                                f"盡快檢查該帳號憑證/密碼!")
+            summary.append(f"{opened} {label}")
         self._sockets = sockets
-        logger.info(f"[subscriber] 共開 {len(sockets)} 個 sockets "
-                    f"({self.socket_count} primary + "
-                    f"{len(sockets) - self.socket_count if len(sockets) > self.socket_count else 0} secondary)")
+        logger.info(f"[subscriber] 共開 {len(sockets)} 個 sockets ({' + '.join(summary)})")
         return len(sockets) >= 2
 
-    def _login_extra_sdk(self, FubonSDK, account_id, password, pfx_path, pfx_password, label=""):
-        """開一個新 SDK login + init_realtime + 回 ws client。fail 回 None."""
-        try:
-            sdk = FubonSDK()
-            if pfx_password == "":
-                accounts = sdk.login(account_id, password, pfx_path)
-            else:
-                accounts = sdk.login(account_id, password, pfx_path, pfx_password)
-            if not accounts:
-                raise RuntimeError("login 回空 accounts")
-            if getattr(accounts, "is_success", None) is False:
-                raise RuntimeError(f"is_success=False: {getattr(accounts, 'message', '?')}")
-            sdk.init_realtime()
-            self._extra_sdks.append(sdk)
-            logger.info(f"[subscriber] {label} login OK")
-            return sdk.marketdata.websocket_client.stock
-        except Exception as e:
-            logger.error(f"[subscriber] {label} login 失敗: {e}")
-            return None
+    def _login_extra_sdk(self, FubonSDK, account_id, password, pfx_path, pfx_password,
+                         label="", retries=2):
+        """開一個新 SDK login + init_realtime + 回 ws client。
+        失敗自動重試 retries 次 (間隔 2s) — 暫時性登入失敗不再一次就放棄整條
+        (2026-08-10 教訓)。全失敗回 None。"""
+        import time as _t
+        for attempt in range(1 + retries):
+            try:
+                sdk = FubonSDK()
+                if pfx_password == "":
+                    accounts = sdk.login(account_id, password, pfx_path)
+                else:
+                    accounts = sdk.login(account_id, password, pfx_path, pfx_password)
+                if not accounts:
+                    raise RuntimeError("login 回空 accounts")
+                if getattr(accounts, "is_success", None) is False:
+                    raise RuntimeError(f"is_success=False: {getattr(accounts, 'message', '?')}")
+                sdk.init_realtime()
+                self._extra_sdks.append(sdk)
+                logger.info(f"[subscriber] {label} login OK"
+                            f"{f' (第 {attempt + 1} 次嘗試)' if attempt else ''}")
+                return sdk.marketdata.websocket_client.stock
+            except Exception as e:
+                if attempt < retries:
+                    logger.warning(f"[subscriber] {label} login 失敗 (第 {attempt + 1} 次,"
+                                   f"2 秒後重試): {e}")
+                    _t.sleep(2)
+                else:
+                    logger.error(f"[subscriber] {label} login 失敗 (共試 {attempt + 1} 次後放棄): {e}")
+        return None
 
     # ─── Multi-socket 主 loop ────────────────────────────────
 
@@ -361,10 +387,12 @@ class Subscriber:
         n_sockets = len(self._sockets)
         capacity = self.batch_size * n_sockets
         if len(self.universe) > capacity:
-            logger.warning(f"[subscriber] ⚠ universe {len(self.universe)} 檔 > 監控容量 "
-                           f"{capacity} 檔 ({n_sockets} sockets × {self.batch_size})")
-            logger.warning(f"[subscriber] ⚠ 只監控前 {capacity} 檔 (按 symbol 排序)，"
-                           f"剩下 {len(self.universe) - capacity} 檔跳過")
+            # CRITICAL — 2026-08-10: 副帳號憑證掛掉只有 WARNING → 無聲少收一半資料
+            logger.critical(f"[subscriber] ⚠⚠ universe {len(self.universe)} 檔 > 監控容量 "
+                            f"{capacity} 檔 ({n_sockets} sockets × {self.batch_size}) — "
+                            f"有帳號沒開成 socket?")
+            logger.critical(f"[subscriber] ⚠⚠ 只監控前 {capacity} 檔 (按 symbol 排序)，"
+                            f"剩下 {len(self.universe) - capacity} 檔**收不到資料**")
             self.universe = self.universe[:capacity]
         else:
             logger.info(f"[subscriber] universe {len(self.universe)} 檔 <= 容量 {capacity} 檔，"
@@ -610,11 +638,12 @@ class Subscriber:
                             self.on_trade(symbol, data)
                         except Exception as e:
                             self._log_handler_exc(socket_idx, e)
-                    # 存 snapshot
+                    # 存 snapshot (is_trial: 盤前試撮 tick 標記 — 9:00 種子化時要跳過)
                     with self._snap_lock:
                         self._latest_trade[symbol] = {
                             "price": data.get("price"),
                             "size": data.get("size") or data.get("qty"),
+                            "is_trial": bool(data.get("isTrial")),
                             "ts": datetime.now().isoformat(timespec="microseconds"),
                         }
 

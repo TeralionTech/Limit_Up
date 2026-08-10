@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, time as dtime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
@@ -82,6 +82,9 @@ class Runner:
         self._timer_threads: list = []
         # overnight_holdings.json 檔案鎖 — 13:24 主流程與前端 add/remove API 都會寫
         self._overnight_file_lock = threading.Lock()
+        # 逐筆撮合開始時間 (= cfg.end_time,_run_all_phases 覆寫) — 此前的 trades
+        # 都是試撮,不可觸發任何下單 (2026-08-10 2491 事故)
+        self._trade_start_time = dtime(9, 0)
 
     # ─── 對外 API ────────────────────────────────────────────
 
@@ -182,6 +185,7 @@ class Runner:
         self.cfg = load_config()
         for k, v in self._param_overrides.items():
             setattr(self.cfg, k, v)
+        self._trade_start_time = self._parse_time_hhmm(self.cfg.end_time) or dtime(9, 0)
 
         # 每日重置交易 state (新交易日 → 清前日 trades/委託表/預算 + armed=False;
         # 同日手動重啟 → 保留當日 state。連線不動。)
@@ -346,8 +350,15 @@ class Runner:
             try:
                 _snap = self.subscriber.get_latest_snapshot(_sym)
                 _lt = (_snap or {}).get("last_trade")
-                if _lt and _lt.get("price"):
-                    self.trader.on_trade(_sym, _lt)
+                if not _lt or not _lt.get("price"):
+                    continue
+                # 盤前試撮殘留的 snapshot 不能種子化成首筆成交 (2026-08-10)
+                if _lt.get("is_trial"):
+                    continue
+                _ts = str(_lt.get("ts") or "")
+                if len(_ts) >= 19 and _ts[11:19] < self.cfg.end_time:
+                    continue
+                self.trader.on_trade(_sym, _lt)
             except Exception:
                 pass
 
@@ -398,6 +409,13 @@ class Runner:
            冪等旗標在 session 內 — 重複 tick / trader 接手後都不會重複下單)
         2. 隔日賣標的收到成交 → 觸發隔日賣 (今日活躍標的不觸發,尊重「只賣非今日搶單」)
         armed/is_live 閘門都在 session 內,sim/未 armed 完全不動作。"""
+        # 試撮 tick 不是真成交 — 集合競價時段 (8:30-9:00) 富邦會推 isTrial=true 的
+        # 模擬撮合 tick;誤當首筆成交會在競價時段狂下市價單被拒 (2026-08-10 2491 事故)
+        if _pick(trade_data, "isTrial"):
+            return
+        # 逐筆撮合開始前不可能有真成交 — isTrial 欄位缺失時的雙保險
+        if datetime.now().time() < self._trade_start_time:
+            return
         price = float(_pick(trade_data, "price") or 0)
         if price <= 0:
             return

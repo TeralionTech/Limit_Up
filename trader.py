@@ -219,6 +219,10 @@ class Trader:
             logger.warning(f"[trader] ⚠ {h.symbol} {h.warning}")
 
     def on_trade(self, symbol: str, trade_data: dict):
+        # 試撮 tick (集合競價的模擬撮合,isTrial=true) 不是真成交 —
+        # 不記首筆、不觸發任何單 (2026-08-10 2491 事故;深度防禦,主要過濾在 runner)
+        if _pick(trade_data, "isTrial"):
+            return
         h = self.holdings.get(symbol)
         # 隔日賣觸發: 收到成交 → 委買一價賣出。今日標的**活躍中** (WAITING/TRACKING) 時不觸發
         # (尊重「只賣非今日搶單」原則);h 為 None 或今日已淘汰/撤單 → 由隔日賣接手賣昨天的量。
