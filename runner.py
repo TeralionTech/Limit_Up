@@ -57,6 +57,7 @@ class Runner:
         self.sdk = None
         self.universe: list = []
         self.limit_ups: Dict[str, float] = {}
+        self.limit_downs: Dict[str, float] = {}   # symbol → 跌停價 (出場限價賣用,2026-08-12)
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
         self.state = None                # state.State
         self.subscriber = None
@@ -239,6 +240,14 @@ class Runner:
         # 8:30 起就收得到五檔+成交 (隔日賣標的可能不在漲停母體裡)
         self._load_overnight_file(output_dir)
         overnight_syms = self.session.overnight_symbols()
+        # 隔日賣標的補查跌停價 (出場=跌停價限價賣;它們可能不在今日 limit_ups 抓取範圍)
+        _stock = self.sdk.marketdata.rest_client.stock
+        for _s in overnight_syms:
+            if _s not in self.limit_downs:
+                self._query_limit_up(_stock, _s)
+        # 跌停價/處置股名單交給交易會話 (所有出場含隔日賣 = 跌停價限價賣,2026-08-12 定案)
+        self.session.set_limit_downs(self.limit_downs)
+        self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
         sub_universe = [s for s in self.universe if s in self.limit_ups]
         for s in overnight_syms:
             if s not in sub_universe:
@@ -651,6 +660,7 @@ class Runner:
         today = datetime.now().strftime("%Y-%m-%d")
         cache_file = output_dir / f"{today}_limit_ups.json"
         disp_file = output_dir / f"{today}_dispositions.json"
+        down_file = output_dir / f"{today}_limit_downs.json"
 
         # 讀 cache
         if cache_file.exists():
@@ -671,6 +681,13 @@ class Runner:
                                 self.dispositions = {k: bool(v) for k, v in _json.load(f).items()}
                         except Exception:
                             pass
+                    # 跌停價 cache (best-effort;缺 → 出場走市價賣兜底)
+                    if down_file.exists():
+                        try:
+                            with down_file.open(encoding="utf-8") as f:
+                                self.limit_downs = {k: float(v) for k, v in _json.load(f).items()}
+                        except Exception:
+                            pass
                     return {k: float(v) for k, v in cached.items()}
             except Exception as e:
                 logger.warning(f"[runner] cache 讀失敗 ({e})，改走 REST 重抓")
@@ -687,8 +704,10 @@ class Runner:
                 n_disp = sum(1 for v in self.dispositions.values() if v)
                 with disp_file.open("w", encoding="utf-8") as f:
                     _json.dump(self.dispositions, f, ensure_ascii=False, indent=2)
+                with down_file.open("w", encoding="utf-8") as f:
+                    _json.dump(self.limit_downs, f, ensure_ascii=False, indent=2)
                 logger.info(f"[runner] cache 已寫 {cache_file.name} ({len(result)} 檔,"
-                            f"其中處置股 {n_disp} 檔)")
+                            f"其中處置股 {n_disp} 檔,跌停價 {len(self.limit_downs)} 檔)")
             except Exception as e:
                 logger.warning(f"[runner] cache 寫失敗: {e}")
         return result
@@ -754,12 +773,16 @@ class Runner:
 
     def _query_limit_up(self, stock, sym: str):
         """查單檔漲停價 — 回 float 或 None (空值/例外都回 None，交給重試補)。
-        順便把 isDisposition (處置股) 記進 self.dispositions (下單機制要用)。"""
+        順便記 isDisposition (處置股,下單機制用) 與 limitDownPrice (跌停價,
+        出場跌停限價賣用,2026-08-12 — 同一個回應,零額外 REST 成本)。"""
         try:
             resp = stock.intraday.ticker(symbol=sym)
             up = resp.get("limitUpPrice") or resp.get("limit_up")
             if up:
                 self.dispositions[sym] = bool(resp.get("isDisposition"))
+                down = resp.get("limitDownPrice")
+                if down:
+                    self.limit_downs[sym] = float(down)
             return float(up) if up else None
         except Exception:
             return None

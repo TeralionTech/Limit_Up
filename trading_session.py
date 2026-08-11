@@ -116,6 +116,10 @@ class TradingSession:
         self.order_log: Dict[str, dict] = {}
         # 處置股名單 (runner 從 ticker.isDisposition 填) — 影響下單機制
         self.dispositions: Dict[str, bool] = {}
+        # 跌停價名單 (runner 從 ticker.limitDownPrice 填) — 所有出場含隔日賣
+        # 都掛「跌停價限價賣」(2026-08-12 定案: 成交優先權等同市價,但集合競價
+        # 時段合法、處置股合法、永不被「不可市價」拒單)
+        self.limit_downs: Dict[str, float] = {}
         # 隔日賣標的 (昨天買到、收盤未出場的持倉) — 隔天開盤第一筆成交後委買一價賣出
         self.overnight: Dict[str, dict] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
@@ -154,6 +158,7 @@ class TradingSession:
             self.budget_used = 0.0
             self.armed = False
             self.dispositions = {}
+            self.limit_downs = {}    # 每日價格不同,新日清空由 runner 重填
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
             self._pre_orders_date = ""   # 新交易日 → 允許今日預掛
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
@@ -165,6 +170,12 @@ class TradingSession:
             self.dispositions = dict(dispositions or {})
         n = sum(1 for v in self.dispositions.values() if v)
         logger.info(f"[session] 處置股名單: {n} 檔")
+
+    def set_limit_downs(self, limit_downs: Dict[str, float]):
+        """runner 抓完 ticker 後把跌停價名單交進來 (出場跌停限價賣用)。"""
+        with self._lock:
+            self.limit_downs = dict(limit_downs or {})
+        logger.info(f"[session] 跌停價名單: {len(self.limit_downs)} 檔")
 
     def update_bid1(self, symbol: str, bid1_price: float):
         """trader 每 tick 更新委買一價 (處置股出場限價賣用)。只對有下單的檔記錄。"""
@@ -620,7 +631,7 @@ class TradingSession:
             logger.critical(f"[session] ⚠ {symbol} 撤單失敗 — 委託可能仍掛在券商端: {e}")
 
     def exit_position(self, symbol: str, reason: str):
-        """委賣出現 → 立刻出場: 撤 pending + 市價賣出全部已成交。(背景 thread)
+        """出場: 撤 pending + **跌停價限價賣**出全部已成交。(背景 thread)
         閘門 = _can_manage (非 is_live) — 關 kill switch / WS 不健康時出場仍要能動。"""
         if not self._can_manage():
             if self.mode == "real":
@@ -632,36 +643,37 @@ class TradingSession:
 
     def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str,
                        max_tries: Optional[int] = None) -> bool:
-        """賣出 lots 張。處置股 → 委買一價**限價**賣 (不能下市價);其餘 → 市價賣。
-        max_tries=None → 預設 DEFAULT_SELL_MAX_TRIES 次 (原「重試到成功為止」2026-08 修 —
-        持續被拒會無限狂送;用盡由 caller 記 CRITICAL + sell_failed 旗標,下一個
-        委賣 tick 仍可再觸發出場,行情節奏非熱迴圈);給整數 → 最多試幾次
-        (緊急全平用,避免 API thread 卡死)。成功回 True。
-        送單全程過全域閘門 (50/s);失敗後單檔指數退避 (0.2→…→5s)。"""
+        """賣出 lots 張 — **跌停價限價賣** (使用者定案 2026-08-12,不分股種):
+        限價=跌停 → 可 cross 任何買價,成交優先權等同市價單,但集合競價時段合法、
+        處置股合法、永不被「不可市價」拒單。
+        查無跌停價: 一般股退回市價賣兜底 (盤中合法);處置股 CRITICAL 需人工。
+        max_tries=None → 預設 DEFAULT_SELL_MAX_TRIES 次;給整數 → 最多試幾次
+        (緊急全平用)。成功回 True。失敗後單檔指數退避 (0.2→…→5s)。"""
         disp = st.is_disposition
+        down = float(self.limit_downs.get(symbol) or 0)
+        if down <= 0 and disp:
+            logger.critical(f"[session] ⚠ {symbol} 處置股出場但查無跌停價 → 無法限價賣 "
+                            f"(處置股不可市價),部位 {lots} 張需人工處理")
+            return False
         tries = max_tries if max_tries is not None else DEFAULT_SELL_MAX_TRIES
         attempt = 0
         while attempt < tries:
             # _can_manage (非 is_live): 關 kill switch 不該讓賣單送不出去 (2026-08 修)
             if not self._can_manage():
                 return False
-            bid1 = st.last_bid1_price     # 每次重讀 (限價賣價隨市場更新)
-            if disp and bid1 <= 0:
-                logger.critical(f"[session] ⚠ {symbol} 處置股出場但無委買一價 → 無法限價賣,"
-                                f"部位 {lots} 張需人工處理")
-                return False
             self._rate.acquire()      # 爆發式 45/s 窗口
             attempt += 1
             try:
-                if disp:
-                    sell_no = self.broker.place_limit_sell(symbol, bid1, lots, reason)
-                    self._log_order(sell_no, symbol, "sell", "limit_sell", lots, bid1)
-                    logger.warning(f"[session] ⚠ {symbol} 處置股出場 — 委買一價 {bid1} "
-                                   f"限價賣 {lots} 張 ({reason})")
+                if down > 0:
+                    sell_no = self.broker.place_limit_sell(symbol, down, lots, reason)
+                    self._log_order(sell_no, symbol, "sell", "limit_sell", lots, down)
+                    logger.warning(f"[session] ⚠ {symbol} 出場 — 跌停價 {down} 限價賣 "
+                                   f"{lots} 張 ({reason})")
                 else:
                     sell_no = self.broker.place_market_sell(symbol, lots, reason)
                     self._log_order(sell_no, symbol, "sell", "market_sell", lots, 0)
-                    logger.warning(f"[session] ⚠ {symbol} 出場 — 市價賣 {lots} 張 ({reason})")
+                    logger.warning(f"[session] ⚠ {symbol} 出場 — 查無跌停價,市價賣兜底 "
+                                   f"{lots} 張 ({reason})")
                 st.sell_failed = False    # 賣單送出成功 → 解除先前失敗旗標
                 return True
             except Exception as e:
@@ -935,9 +947,16 @@ class TradingSession:
                 if symbol in self.overnight:
                     self.overnight[symbol]["sell_placed"] = False
             return
-        price = ticks.overnight_sell_price(bid1, ask1)
+        # 賣價 = 跌停價限價 (2026-08-12 定案,不再管委買/委賣價差);
+        # 查無跌停價 → 退回舊委買一價公式兜底
+        price = float(self.limit_downs.get(symbol) or 0)
         if price <= 0:
-            logger.critical(f"[session] ⚠ 隔日賣 {symbol} 無有效委買一價 → 無法賣,{lots} 張需人工")
+            price = ticks.overnight_sell_price(bid1, ask1)
+            if price > 0:
+                logger.warning(f"[session] 隔日賣 {symbol} 查無跌停價 → 退回委買一價公式 {price}")
+        if price <= 0:
+            logger.critical(f"[session] ⚠ 隔日賣 {symbol} 查無跌停價也無委買一價 → 無法賣,"
+                            f"{lots} 張需人工")
             with self._lock:
                 if symbol in self.overnight:
                     self.overnight[symbol]["sell_placed"] = False   # 允許下一筆成交再試
@@ -966,8 +985,7 @@ class TradingSession:
                     if o is not None:
                         o["sell_order_no"] = no
                         o["sell_price"] = price
-                logger.warning(f"[session] 🌙 隔日賣 {symbol} — {price} 限價賣 {lots} 張 "
-                               f"(委買一 {bid1} 委賣一 {ask1})")
+                logger.warning(f"[session] 🌙 隔日賣 {symbol} — 跌停價 {price} 限價賣 {lots} 張")
                 return
             except Exception as e:
                 logger.error(f"[session] 隔日賣 {symbol} 委託失敗 (第 {attempt}/{MAX_ATTEMPTS} 次): {e}")

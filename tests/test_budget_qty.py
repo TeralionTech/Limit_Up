@@ -2,7 +2,8 @@
 
 設定: per_symbol_budget=100,000、漲停價 45 元 → _calc_lots = 100k // 45k = **2 張**,
 下成**一張委託 2000 股** (不是兩張 1 張的單)。
-撤單不帶數量 — 交易所語意 = 撤「該委託的未成交餘量」;出場賣 filled_lots 全量。
+撤單不帶數量 — 交易所語意 = 撤「該委託的未成交餘量」;
+出場賣 filled_lots 全量 (2026-08-12 起 = 跌停價限價賣)。
 """
 import time
 from types import SimpleNamespace
@@ -11,11 +12,13 @@ from test_session_money import make_session, _fill
 from trader import Trader
 
 LIMIT = 45.0
+DOWN = 36.9                                       # 跌停價 (出場限價賣用)
 COST_PER_LOT = 45_000
 
 
 def _mk():
     s = make_session(per_symbol=100_000)          # 依金額: 每檔 10 萬
+    s.set_limit_downs({"1101": DOWN})
     s.place_pre_orders(["1101"], {"1101": LIMIT})
     return s
 
@@ -46,19 +49,20 @@ class TestBudget100kTwoLots:
         st = s.trades["1101"]
         assert st.filled_lots == 1
         assert s.budget_used == 1 * COST_PER_LOT
-        s._exit_worker("1101", "ask_appeared")
-        assert ("market_sell", "1101", None, 1) in s.broker.placed
+        s._exit_worker("1101", "mkt_queue_gone")
+        assert ("limit_sell", "1101", DOWN, 1) in s.broker.placed
 
     def test_exit_sells_exactly_2_after_full_fill(self):
-        # 2 張全成 → 出場 → 市價賣 2 張 (張數 = filled_lots,不多不少)
+        # 2 張全成 → 出場 → 跌停價限價賣 2 張 (張數 = filled_lots,不多不少)
         s = _mk()
         s._on_fill(_fill(s.trades["1101"].order_no, "1101", 2, LIMIT))
-        s._exit_worker("1101", "ask_appeared")
-        sells = [c for c in s.broker.placed if c[0] == "market_sell"]
-        assert sells == [("market_sell", "1101", None, 2)]
+        s._exit_worker("1101", "mkt_queue_gone")
+        sells = [c for c in s.broker.placed if c[0] == "limit_sell"]
+        assert sells == [("limit_sell", "1101", DOWN, 2)]
 
-    def test_end_to_end_ask_appears_sells_2(self):
-        # 端到端: 五檔出現委賣 → trader 觸發出場 → 背景 thread 市價賣 2 張
+    def test_end_to_end_queue_gone_sells_2(self):
+        # 端到端 (2026-08-12 訊號): 市價買隊伍曾出現後歸零 → trader 觸發出場
+        # → 背景 thread 跌停價限價賣 2 張
         s = _mk()
         s._on_fill(_fill(s.trades["1101"].order_no, "1101", 2, LIMIT))
         t = Trader(watchlist=["1101"], limit_ups={"1101": LIMIT},
@@ -66,14 +70,14 @@ class TestBudget100kTwoLots:
                                        bid_decline_sample_sec=60,
                                        bid_decline_minutes=5),
                    session=s)
-        t.on_book("1101", [{"price": LIMIT, "size": 500}], [])       # 首筆乾淨
-        t.on_book("1101", [{"price": LIMIT, "size": 500}],
-                  [{"price": 45.5, "size": 3}])                      # 委賣出現!
+        t.on_book("1101", [{"price": 0.0, "size": 300},
+                           {"price": LIMIT, "size": 500}], [])       # 市價隊伍在 (arm)
+        t.on_book("1101", [{"price": LIMIT, "size": 500}], [])       # 市價隊伍沒有了!
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not any(
-                c[0] == "market_sell" for c in s.broker.placed):
+                c[0] == "limit_sell" for c in s.broker.placed):
             time.sleep(0.01)
-        assert ("market_sell", "1101", None, 2) in s.broker.placed
+        assert ("limit_sell", "1101", DOWN, 2) in s.broker.placed
         assert s.trades["1101"].exited is True
 
     def test_overbuy_2x_exit_sells_all_4(self):
@@ -89,8 +93,8 @@ class TestBudget100kTwoLots:
         s._on_fill(_fill(chase_no, "1101", 2, LIMIT, filled_no="F2"))
         st = s.trades["1101"]
         assert st.filled_lots == 4
-        s._exit_worker("1101", "ask_appeared")
-        assert ("market_sell", "1101", None, 4) in s.broker.placed
+        s._exit_worker("1101", "mkt_queue_gone")
+        assert ("limit_sell", "1101", DOWN, 4) in s.broker.placed
         # 附註: 超買時 budget_used 低估實際花費 (保留只做過一份) — 已接受的近似
         assert s.budget_used == 2 * COST_PER_LOT
 

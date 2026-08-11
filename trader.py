@@ -14,7 +14,8 @@
         委買一量在兩個 tick 之間減少 1/2 以上 (第 3 筆成交後才開始判)
       (原「委買一價格不是漲停價」條件已移除 — 盤中市價單佔五檔第一列且 price=0 會誤判)
       [real] 撤單同步撤掉該檔 pending 委託
-    - [real] 任一檔委賣出現 → 立刻出場 (撤委託 + 市價賣出全部已成交)
+    - [real] 支撐隊伍消失 → 立刻出場 (2026-08-12: 一般股=市價買隊伍歸零、
+      處置股=漲停價買單消失;撤委託 + **跌停價限價賣**全部已成交)
     - 警示 (不動作): 委買一量每 BID_DECLINE_SAMPLE_SEC 取樣,
       連續 BID_DECLINE_MINUTES 分鐘遞減 → warning 顯示於前端
     - 撤單後**持續收資料** (不退訂，狀態停在撤單)
@@ -52,6 +53,7 @@ class Holding:
         self.first_fail_reason = ""      # 非空 = 第一盤淘汰原因
         # 盤中追蹤
         self.pulled_reason = ""
+        self.support_seen = False        # 支撐隊伍出現過 (出場訊號「沒有了」的轉移語意)
         self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
         self.book_tick_count = 0         # 累計 books tick 數 (排隊中量減半檢查的暖機: >=3)
         self.prev_bid1_size: Optional[int] = None   # 上一 tick 委買量基準 (一般股=市價列;處置股=限價列)
@@ -131,7 +133,8 @@ class Trader:
         # 市價彙總列只會佔第一列 (price=0)
         mkt_bid_size = raw_bid1_size if (bids and raw_bid1_price <= 0) else 0
         # 注意: 一般股若全程沒有市價排隊,基準恆為 0 → 量減半規則不啟動 (無此保護)
-        bid_basis = limit_bid1_size if self.dispositions.get(symbol) else mkt_bid_size
+        is_disp = bool(self.dispositions.get(symbol))
+        bid_basis = limit_bid1_size if is_disp else mkt_bid_size
         # 委賣「任一檔」有量 (市價賣單 price=0 也算真賣單)
         asks_any = any(int(_pick(a, "size") or 0) > 0 for a in asks) if asks else False
 
@@ -146,10 +149,22 @@ class Trader:
         if self.session is not None:
             self.session.update_bid1(symbol, limit_bid1_price)
 
-        # === [real] 委賣出現 → 立刻出場 (撤委託 + 賣出全部已成交;處置股用委買一價限價) ===
+        # === [real] 出場訊號 (2026-08-12 定案): 支撐隊伍「消失」→ 立刻出場,
+        # 不再等委賣出現 (賣壓走市價單吃穿時委賣可能不掛出,訊號會晚):
+        #   一般股: 市價買隊伍曾出現後歸零 = 漲停要打開的前兆
+        #   處置股: 漲停價買單消失 (限價列跌下漲停/清空;處置股本來就沒有市價列)
+        # support_seen 轉移語意 —「沒有了」代表曾經有,避免開盤首 tick 隊伍未成形就誤觸。
         # exited flag 在 session 內防重複;has_exposure 先擋掉無單無倉的檔避免每 tick 開 thread
-        if asks_any and self.session is not None and self.session.has_exposure(symbol):
-            self.session.exit_position(symbol, "ask_appeared")
+        if is_disp:
+            support_now = h.limit_up > 0 and limit_bid1_price >= h.limit_up - 0.001
+        else:
+            support_now = mkt_bid_size > 0
+        if support_now:
+            h.support_seen = True
+        elif (h.support_seen and self.session is not None
+              and self.session.has_exposure(symbol)):
+            self.session.exit_position(
+                symbol, "limit_up_bid_gone" if is_disp else "mkt_queue_gone")
 
         # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與量減半規則同) ===
         self._update_decline_warning(h, bid_basis)
