@@ -75,11 +75,14 @@ class TestSupportGoneExit:
         assert s.trades["2330"].exited is True
 
     def test_ask_appearing_alone_does_not_exit(self):
-        # 舊訊號已替換: 委賣出現但市價隊伍還在 → 不出場
+        # ⚠ 人造盤面 (盤中不可能: 市價買在排隊時賣單會立刻撮合,掛不上委賣側) —
+        # 這是**程式碼回歸保護**,不是市場情境: 證明「ask 觸發出場」已移除,
+        # 誰把 asks_any → exit 加回去這裡就會紅。真實時序中市價列歸零必先於委賣掛出,
+        # 新訊號嚴格早於舊訊號。
         s = _session_with_position(lots=2)
         t = self._trader(s)
         t.on_book("2330", MKT_PRESENT, [])
-        t.on_book("2330", MKT_PRESENT, ASK_LIMIT)     # 委賣出現,市價隊伍仍在
+        t.on_book("2330", MKT_PRESENT, ASK_LIMIT)     # 資料層強塞委賣,市價隊伍仍在
         time.sleep(0.3)
         assert _sells(s.broker) == []
 
