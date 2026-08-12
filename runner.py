@@ -222,21 +222,9 @@ class Runner:
         self.session.set_dispositions(self.dispositions)
 
         # T30 禁單名單 (全額交割/每筆需 100% 預收) — API 下單必被拒,預掛/市價追
-        # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 負責;
-        # 檔案是舊的 → 照用 + CRITICAL;全缺 → 無保護 + CRITICAL (使用者定案)。
-        import t30 as _t30
-        t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
-        untradable, t30_meta = _t30.load_untradable(t30_dir)
-        if t30_meta["missing_all"]:
-            logger.critical(f"[runner] ⚠⚠ T30 檔案全缺 ({t30_dir}) — 今日**無全額交割名單保護**,"
-                            f"全額交割股可能觸發狂送單!請檢查 hit-limit-up-t30.timer")
-        else:
-            stale = [n for n, i in t30_meta["files"].items() if i["ok"] and i["stale"]]
-            if stale:
-                logger.critical(f"[runner] ⚠ T30 檔非今日 ({', '.join(stale)}) — "
-                                f"全額交割名單可能過時 (照用,請檢查取檔 timer)")
-            logger.info(f"[runner] T30 禁單名單: {len(untradable)} 檔 (全額交割/需預收)")
-        self.session.set_untradable(untradable)
+        # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 08:10 負責
+        # (券商 08:00 才更新檔);此處先載一次,08:59:58 預掛前會**再載一次**拿當日最新。
+        self._load_t30_untradable()
 
         # Phase 4: Subscribe
         self.phase = Phase.SUBSCRIBE
@@ -559,6 +547,24 @@ class Runner:
         self._write_overnight_file()
         return removed
 
+    def _load_t30_untradable(self):
+        """載入 T30 禁單名單 → session。檔案是舊的 → 照用 + CRITICAL;
+        全缺 → 空名單無保護 + CRITICAL (使用者定案 2026-08-12)。
+        呼叫兩次: runner 開跑時 (可能還是昨檔) + 08:59:58 預掛前 (timer 08:10 取的新檔)。"""
+        import t30 as _t30
+        t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
+        untradable, t30_meta = _t30.load_untradable(t30_dir)
+        if t30_meta["missing_all"]:
+            logger.critical(f"[runner] ⚠⚠ T30 檔案全缺 ({t30_dir}) — 今日**無全額交割名單保護**,"
+                            f"全額交割股可能觸發狂送單!請檢查 hit-limit-up-t30.timer")
+        else:
+            stale = [n for n, i in t30_meta["files"].items() if i["ok"] and i["stale"]]
+            if stale:
+                logger.critical(f"[runner] ⚠ T30 檔非今日 ({', '.join(stale)}) — "
+                                f"全額交割名單可能過時 (照用,請檢查取檔 timer)")
+            logger.info(f"[runner] T30 禁單名單: {len(untradable)} 檔 (全額交割/需預收)")
+        self.session.set_untradable(untradable)
+
     def abandon_symbol(self, symbol: str) -> bool:
         """前端「取消追蹤」(2026-08-12) — 停止該檔一切自動化 (含出場),使用者自負。
         場景: 某檔一直下單失敗 (如全額交割股) 的單檔煞車,比全域暫停精準。"""
@@ -612,6 +618,12 @@ class Runner:
                 self.subscriber.subscribe_trades_for(marked)
             except Exception as e:
                 logger.warning(f"[runner] 預掛時訂 trades 失敗: {e}")
+            # T30 名單下單前重載 — 券商 08:00 更新、timer 08:10 取,runner 開跑時
+            # (走 cache 快路徑可能 08:00 就載了) 拿到的可能還是昨檔;此刻檔案必是最新
+            try:
+                self._load_t30_untradable()
+            except Exception as e:
+                logger.error(f"[runner] 預掛前重載 T30 名單失敗 (沿用既有名單): {e}")
             # 搶市價單: **現在**就掛上 on_trade — 9:00:00 開盤撮合 tick 一到就能
             # 瞬間觸發市價追,不等 9:00 轉場建 Trader (轉場要 1~3 秒,錯過最快進場時機)。
             # on_book 不動 (filter 的 unmark 規則到 9:00 前照跑)。
