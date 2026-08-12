@@ -120,6 +120,9 @@ class TradingSession:
         # 都掛「跌停價限價賣」(2026-08-12 定案: 成交優先權等同市價,但集合競價
         # 時段合法、處置股合法、永不被「不可市價」拒單)
         self.limit_downs: Dict[str, float] = {}
+        # T30 禁單名單 (全額交割 SETTYPE≠0 / 每筆需 100% 預收 MARK-W=2) —
+        # API 下單必被拒,預掛/市價追一律跳過 (2026-08-12 狂送單事故)
+        self.untradable: set = set()
         # 隔日賣標的 (昨天買到、收盤未出場的持倉) — 隔天開盤第一筆成交後委買一價賣出
         self.overnight: Dict[str, dict] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
@@ -159,6 +162,7 @@ class TradingSession:
             self.armed = False
             self.dispositions = {}
             self.limit_downs = {}    # 每日價格不同,新日清空由 runner 重填
+            self.untradable = set()  # T30 名單每日重載
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
             self._pre_orders_date = ""   # 新交易日 → 允許今日預掛
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
@@ -176,6 +180,12 @@ class TradingSession:
         with self._lock:
             self.limit_downs = dict(limit_downs or {})
         logger.info(f"[session] 跌停價名單: {len(self.limit_downs)} 檔")
+
+    def set_untradable(self, symbols: set):
+        """runner 從 T30 檔載入禁單名單 (全額交割 / 每筆需 100% 預收)。"""
+        with self._lock:
+            self.untradable = set(symbols or ())
+        logger.info(f"[session] T30 禁單名單 (全額交割/需預收): {len(self.untradable)} 檔")
 
     def update_bid1(self, symbol: str, bid1_price: float):
         """trader 每 tick 更新委買一價 (處置股出場限價賣用)。只對有下單的檔記錄。"""
@@ -439,6 +449,12 @@ class TradingSession:
                 st = self.trades.get(sym) or SymbolTrade(sym, limit_up)
                 self.trades[sym] = st
                 st.is_disposition = self.dispositions.get(sym, False)
+                # T30 禁單: 全額交割/每筆需 100% 預收 — API 下單必被拒,整檔跳過
+                # (stopped_reason 同時擋掉 9:00 的市價追,狂送單根絕)
+                if sym in self.untradable:
+                    st.stopped_reason = "full_cash_delivery"
+                    logger.warning(f"[session] {sym} 全額交割/需預收款券 (T30) → 跳過不下單")
+                    continue
                 if st.stopped_reason or st.order_no:
                     continue
                 # 只做漲停價 <= MAX_STOCK_PRICE 的股票 (0 = 不限)

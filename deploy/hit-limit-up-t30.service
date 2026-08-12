@@ -1,0 +1,9 @@
+[Unit]
+Description=Fetch T30V full-cash-delivery files (T30V.TSE / T30V.OTC)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/hit_limit_up/repo/deploy/fetch_t30.sh
+TimeoutStartSec=2100

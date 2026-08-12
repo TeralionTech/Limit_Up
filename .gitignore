@@ -1,5 +1,7 @@
 .env
+t30.env
 output/
+input/
 __pycache__/
 *.pyc
 .venv/

@@ -221,6 +221,23 @@ class Runner:
         # 把處置股名單交給交易會話 (下單機制: 處置股不撤預掛/不下市價買、出場改委買一價賣)
         self.session.set_dispositions(self.dispositions)
 
+        # T30 禁單名單 (全額交割/每筆需 100% 預收) — API 下單必被拒,預掛/市價追
+        # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 負責;
+        # 檔案是舊的 → 照用 + CRITICAL;全缺 → 無保護 + CRITICAL (使用者定案)。
+        import t30 as _t30
+        t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
+        untradable, t30_meta = _t30.load_untradable(t30_dir)
+        if t30_meta["missing_all"]:
+            logger.critical(f"[runner] ⚠⚠ T30 檔案全缺 ({t30_dir}) — 今日**無全額交割名單保護**,"
+                            f"全額交割股可能觸發狂送單!請檢查 hit-limit-up-t30.timer")
+        else:
+            stale = [n for n, i in t30_meta["files"].items() if i["ok"] and i["stale"]]
+            if stale:
+                logger.critical(f"[runner] ⚠ T30 檔非今日 ({', '.join(stale)}) — "
+                                f"全額交割名單可能過時 (照用,請檢查取檔 timer)")
+            logger.info(f"[runner] T30 禁單名單: {len(untradable)} 檔 (全額交割/需預收)")
+        self.session.set_untradable(untradable)
+
         # Phase 4: Subscribe
         self.phase = Phase.SUBSCRIBE
         from state import State

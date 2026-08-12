@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily T30 fetch before market pre-open (Mon-Fri 08:00 Asia/Taipei)
+
+[Timer]
+OnCalendar=Mon..Fri 08:00:00 Asia/Taipei
+Persistent=false
+
+[Install]
+WantedBy=timers.target
