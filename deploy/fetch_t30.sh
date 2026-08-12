@@ -35,6 +35,7 @@ DEST_DIR="${DEST_DIR:-/opt/hit_limit_up/repo/input/t30}"
 DEADLINE="${DEADLINE:-08:25}"
 RETRY_SEC="${RETRY_SEC:-180}"
 JUMP_HOST="${JUMP_HOST:-}"
+BROKER_PORT="${BROKER_PORT:-22}"     # 券商主機 SSH port (實際環境是 3350)
 
 command -v sshpass >/dev/null || { echo "[fetch_t30] VPS 缺 sshpass: apt-get install -y sshpass"; exit 1; }
 mkdir -p "$DEST_DIR"
@@ -42,12 +43,12 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-# ProxyJump 鏈: 有中繼 VPS → "中繼,券商主機";沒有 → 只有券商主機
+# ProxyJump 鏈: 有中繼 VPS → "中繼,券商主機:port";沒有 → 只有券商主機
 if [ -n "$JUMP_HOST" ]; then
-    JUMP_CHAIN="$JUMP_HOST,$BROKER_HOST"
+    JUMP_CHAIN="$JUMP_HOST,$BROKER_HOST:$BROKER_PORT"
     BROKER_JUMP_OPT="-o ProxyJump=$JUMP_HOST"     # 備援路徑連券商主機用
 else
-    JUMP_CHAIN="$BROKER_HOST"
+    JUMP_CHAIN="$BROKER_HOST:$BROKER_PORT"
     BROKER_JUMP_OPT=""
 fi
 
@@ -63,14 +64,15 @@ fetch_proxyjump() {
 fetch_twohop() {
     # 備援 — 密碼會出現在券商主機的行程列表,僅在 ProxyJump 全鏈不可用時使用
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST" "
+    ssh -p "$BROKER_PORT" $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST" "
         command -v sshpass >/dev/null || { echo '券商主機缺 sshpass (備援路徑需要)'; exit 9; }
         rm -f /tmp/T30V.TSE /tmp/T30V.OTC
         sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.TSE /tmp/ &&
         sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.OTC /tmp/
     " || return 1
     # shellcheck disable=SC2086
-    scp $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST:/tmp/T30V.TSE" "$BROKER_HOST:/tmp/T30V.OTC" "$TMP/" || return 1
+    scp -P "$BROKER_PORT" $SSH_OPTS $BROKER_JUMP_OPT \
+        "$BROKER_HOST:/tmp/T30V.TSE" "$BROKER_HOST:/tmp/T30V.OTC" "$TMP/" || return 1
 }
 
 valid() {  # $1=檔案 → size > 0 且為 100 的整數倍 (T30 定長記錄)
