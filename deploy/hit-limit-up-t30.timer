@@ -1,8 +1,8 @@
 [Unit]
-Description=Daily T30 fetch before market pre-open (Mon-Fri 08:10 Asia/Taipei; 券商 08:00 更新檔)
+Description=Daily T30 fetch before market pre-open (Mon-Fri 08:05 Asia/Taipei; 券商 08:00 更新檔)
 
 [Timer]
-OnCalendar=Mon..Fri 08:10:00 Asia/Taipei
+OnCalendar=Mon..Fri 08:05:00 Asia/Taipei
 Persistent=false
 
 [Install]

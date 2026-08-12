@@ -222,8 +222,9 @@ class Runner:
         self.session.set_dispositions(self.dispositions)
 
         # T30 禁單名單 (全額交割/每筆需 100% 預收) — API 下單必被拒,預掛/市價追
-        # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 08:10 負責
-        # (券商 08:00 才更新檔);此處先載一次,08:59:58 預掛前會**再載一次**拿當日最新。
+        # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 08:05 負責
+        # (券商 08:00 更新檔,留 5 分鐘餘裕);漲停價要抓 ~8 分鐘以上,
+        # 走到這裡新檔已就位,單次載入即可。
         self._load_t30_untradable()
 
         # Phase 4: Subscribe
@@ -548,9 +549,9 @@ class Runner:
         return removed
 
     def _load_t30_untradable(self):
-        """載入 T30 禁單名單 → session。檔案是舊的 → 照用 + CRITICAL;
-        全缺 → 空名單無保護 + CRITICAL (使用者定案 2026-08-12)。
-        呼叫兩次: runner 開跑時 (可能還是昨檔) + 08:59:58 預掛前 (timer 08:10 取的新檔)。"""
+        """載入 T30 禁單名單 → session (漲停價抓完後單次載入 — 正常流程此時已晚於
+        timer 08:05 取檔)。檔案是舊的 → 照用 + CRITICAL;全缺 → 空名單無保護 +
+        CRITICAL (使用者定案 2026-08-12)。"""
         import t30 as _t30
         t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
         untradable, t30_meta = _t30.load_untradable(t30_dir)
@@ -618,12 +619,6 @@ class Runner:
                 self.subscriber.subscribe_trades_for(marked)
             except Exception as e:
                 logger.warning(f"[runner] 預掛時訂 trades 失敗: {e}")
-            # T30 名單下單前重載 — 券商 08:00 更新、timer 08:10 取,runner 開跑時
-            # (走 cache 快路徑可能 08:00 就載了) 拿到的可能還是昨檔;此刻檔案必是最新
-            try:
-                self._load_t30_untradable()
-            except Exception as e:
-                logger.error(f"[runner] 預掛前重載 T30 名單失敗 (沿用既有名單): {e}")
             # 搶市價單: **現在**就掛上 on_trade — 9:00:00 開盤撮合 tick 一到就能
             # 瞬間觸發市價追,不等 9:00 轉場建 Trader (轉場要 1~3 秒,錯過最快進場時機)。
             # on_book 不動 (filter 的 unmark 規則到 9:00 前照跑)。
