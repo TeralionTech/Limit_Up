@@ -41,6 +41,23 @@ export default function SimPage() {
     }
   }
 
+  const [trackMsg, setTrackMsg] = useState('')
+
+  async function abandonSymbol(row: TrackingRow) {
+    if (!window.confirm(
+      `⚠ 確定取消追蹤 ${row.symbol}?\n\n` +
+      `系統將停止此檔「一切」自動動作:\n` +
+      `・撤掉排隊中委託、不再進場追單\n` +
+      `・已成交/成交中的持倉「不再自動出場」— 需自行處理 (使用者自負)`)) return
+    try {
+      await api.traderAbandon(row.symbol)
+      setTrackMsg(`✓ 已取消追蹤 ${row.symbol} (持倉自負)`)
+      window.setTimeout(() => setTrackMsg(''), 5000)
+    } catch (e: any) {
+      setTrackMsg(`✗ 取消追蹤失敗: ${e.message}`)
+    }
+  }
+
   return (
     <div className="space-y-4">
       {/* 交易模式 (模擬/真實) — 連線/預算/開始交易 */}
@@ -118,6 +135,7 @@ export default function SimPage() {
           {/* 區塊 2: 盤中追蹤 */}
           <section className="bg-white rounded-lg shadow p-4">
             <h2 className="font-semibold mb-3">📈 區塊 2 — 盤中追蹤 (第一盤通過的標的)</h2>
+            {trackMsg && <div className="text-sm mb-2">{trackMsg}</div>}
             {sum.tracking && sum.tracking.length > 0 ? (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -130,10 +148,14 @@ export default function SimPage() {
                       <th className="text-left py-2 px-2">狀態</th>
                       <th className="text-left py-2 px-2">委託/成交</th>
                       <th className="text-left py-2 px-2">警示</th>
+                      <th className="text-center py-2 px-2">操作</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {sum.tracking.map(row => <TrackingTr key={row.symbol} row={row} />)}
+                    {sum.tracking.map(row => (
+                      <TrackingTr key={row.symbol} row={row}
+                                  onAbandon={() => abandonSymbol(row)} />
+                    ))}
                   </tbody>
                 </table>
               </div>
@@ -229,10 +251,11 @@ function TradeCell({ trade }: { trade?: SymbolTrade | null }) {
 }
 
 
-function TrackingTr({ row }: { row: TrackingRow }) {
+function TrackingTr({ row, onAbandon }: { row: TrackingRow; onAbandon: () => void }) {
   const bidAtLimit = Math.abs(row.bid1_price - row.limit_up) < 0.001
+  const abandoned = row.status === 'abandoned'
   return (
-    <tr className={`border-b ${row.status === 'pulled' ? 'bg-red-50' : ''}`}>
+    <tr className={`border-b ${row.status === 'pulled' ? 'bg-red-50' : abandoned ? 'bg-gray-100' : ''}`}>
       <td className="py-1.5 px-2 font-mono font-semibold">
         {row.symbol}
         {row.first_tick && <span title="開盤即鎖 (8:30 首筆報價就漲停)" className="ml-1">🔒</span>}
@@ -243,7 +266,11 @@ function TrackingTr({ row }: { row: TrackingRow }) {
       </td>
       <td className="py-1.5 px-2 text-right font-mono">{row.bid1_size?.toLocaleString()}</td>
       <td className="py-1.5 px-2 text-xs">
-        {row.status === 'pulled' ? (
+        {abandoned ? (
+          <span className="bg-gray-200 text-gray-700 px-2 py-0.5 rounded" title="使用者取消追蹤 — 一切自動化停止">
+            已取消追蹤
+          </span>
+        ) : row.status === 'pulled' ? (
           <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded" title={row.pulled_reason}>
             撤單 — {pullLabel(row.pulled_reason)}
           </span>
@@ -256,6 +283,17 @@ function TrackingTr({ row }: { row: TrackingRow }) {
         {row.warning
           ? <span className="bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded" title={row.warning}>⚠ 量遞減</span>
           : <span className="text-gray-300">—</span>}
+      </td>
+      <td className="py-1.5 px-2 text-center whitespace-nowrap">
+        {abandoned ? (
+          <span className="text-gray-400 text-xs">已停止</span>
+        ) : (
+          <button onClick={onAbandon}
+                  title="停止此檔一切自動動作 (撤單+不進場+不自動出場),持倉自負"
+                  className="px-2 py-1 rounded text-xs font-medium border border-red-400 text-red-700 hover:bg-red-50">
+            取消追蹤
+          </button>
+        )}
       </td>
     </tr>
   )

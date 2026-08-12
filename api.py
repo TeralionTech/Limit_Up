@@ -139,6 +139,20 @@ def set_trader_params(p: TraderParams):
     return {"ok": True, "applied": applied}
 
 
+class AbandonReq(BaseModel):
+    symbol: str
+
+
+@router.post("/trader/abandon")
+def trader_abandon(req: AbandonReq):
+    """取消追蹤一檔 (2026-08-12): 停止該檔一切自動化 — 撤 pending、不再進場、
+    **不再自動出場**;持倉使用者自負。某檔狂下單失敗時的單檔煞車。"""
+    found = Runner.get().abandon_symbol(req.symbol)
+    if not found:
+        raise HTTPException(400, f"{req.symbol} 不在今日追蹤/交易紀錄中")
+    return {"ok": True}
+
+
 # ─── 交易 (模擬/真實執行頁) ──────────────────────────────────
 # pfx 憑證用 base64 JSON 傳 (避免 multipart 需額外裝 python-multipart)
 

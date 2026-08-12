@@ -28,6 +28,11 @@ _HARD_MIN_INTERVAL = 0.02      # order_min_interval (追單失敗退避) 的下�
 # 隔日賣 5 次上限見 _overnight_sell_worker, fd451ce):
 DEFAULT_SELL_MAX_TRIES = 8     # 出場賣: 指數退避 0.2→…→5s;用盡記 CRITICAL + sell_failed 旗標
 
+# 出場 worker 讀到 0 張時「等成交回報」的窗口 — 量減半/出場觸發的同一瞬間可能
+# 剛好成交 (回報比行情 tick 慢 ~百 ms 級);等到就照樣賣掉,沒等到 → exited 回退,
+# 晚到的部位由下一個出場訊號接手 (2026-08-12 使用者確認的競態處理)
+_EXIT_FILL_WAIT_SEC = 3.0
+
 
 class SendRateLimiter:
     """爆發式送單風控 — 滑動窗口: 過去 1 秒內 < max_per_sec 筆就**立刻放行**,
@@ -648,7 +653,12 @@ class TradingSession:
 
     def exit_position(self, symbol: str, reason: str):
         """出場: 撤 pending + **跌停價限價賣**出全部已成交。(背景 thread)
-        閘門 = _can_manage (非 is_live) — 關 kill switch / WS 不健康時出場仍要能動。"""
+        閘門 = _can_manage (非 is_live) — 關 kill switch / WS 不健康時出場仍要能動。
+        使用者「取消追蹤」(manual_abandon) 的檔 → 一切自動化停止,不出場 (自負)。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is not None and st.stopped_reason == "manual_abandon":
+                return
         if not self._can_manage():
             if self.mode == "real":
                 logger.critical(f"[session] ⚠ {symbol} 出場請求但 broker 未連線 — "
@@ -656,6 +666,28 @@ class TradingSession:
             return
         threading.Thread(target=self._exit_worker, args=(symbol, reason),
                          name=f"exit-{symbol}", daemon=True).start()
+
+    def abandon_symbol(self, symbol: str) -> bool:
+        """前端「取消追蹤」(2026-08-12): 停止該檔**一切**自動化 — 使用者自負。
+
+        - stopped_reason=manual_abandon → 殺市價追迴圈 (狂送單的單檔煞車) + 擋後續進場
+        - exited=True → 關出場自動化 (支撐消失訊號不再賣;持倉由使用者自行處理)
+        - 撤掉 pending 委託 (同步,API thread 一次往返)
+        回 True = session 有這檔的交易紀錄。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is None:
+                return False
+            st.stopped_reason = "manual_abandon"     # 覆寫 — 優先權最高
+            st.exited = True
+            lots = st.filled_lots
+        try:
+            self.cancel_symbol_orders(symbol, "manual_abandon")
+        except Exception as e:
+            logger.error(f"[session] {symbol} 取消追蹤撤單例外: {e}")
+        logger.warning(f"[session] ⚠ {symbol} 使用者取消追蹤 — 停止該檔一切自動化 (含出場),"
+                       f"持倉 {lots} 張使用者自負")
+        return True
 
     def _sell_position(self, symbol: str, st: "SymbolTrade", lots: int, reason: str,
                        max_tries: Optional[int] = None) -> bool:
@@ -706,13 +738,33 @@ class TradingSession:
         self.cancel_symbol_orders(symbol, reason)
         with self._lock:
             lots = st.filled_lots
+        if lots == 0:
+            # 競態: 觸發出場的同一瞬間可能剛好成交 (量減半常常正是自己的單被吃掉),
+            # 成交回報比行情 tick 慢 → 等回報最多 _EXIT_FILL_WAIT_SEC 秒,
+            # 搶到的部位照樣賣掉 (撤單此時會被券商拒「已成交」— 無妨,部位為準)
+            import time as _t
+            deadline = _t.monotonic() + _EXIT_FILL_WAIT_SEC
+            while _t.monotonic() < deadline:
+                _t.sleep(0.1)
+                with self._lock:
+                    lots = st.filled_lots
+                if lots > 0:
+                    break
         if lots > 0:
             if not self._sell_position(symbol, st, lots, reason):
                 with self._lock:
-                    st.exited = False       # 未賣成 → 下一個委賣 tick 可再觸發 (行情節奏,非熱迴圈)
+                    if st.stopped_reason != "manual_abandon":   # 取消追蹤的檔不回退
+                        st.exited = False   # 未賣成 → 下一個委賣 tick 可再觸發 (行情節奏)
                     st.sell_failed = True   # 前端顯示「需人工」
                 logger.critical(f"[session] ⚠⚠ {symbol} 出場賣單連續失敗,部位 {lots} 張仍在 — "
                                 f"需人工處理 ({reason})")
+        else:
+            # 等滿窗口仍無部位 → exited 回退 — 否則回報更晚落地時,部位會永遠
+            # 沒有出場保護 (has_exposure 被 exited=True 擋死;2026-08-05 3587 教訓)。
+            # 取消追蹤 (manual_abandon) 的檔不回退 — 自動化已由使用者關閉。
+            with self._lock:
+                if st.stopped_reason != "manual_abandon":
+                    st.exited = False
 
     def cancel_all_pending(self, reason: str):
         """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。

@@ -559,6 +559,19 @@ class Runner:
         self._write_overnight_file()
         return removed
 
+    def abandon_symbol(self, symbol: str) -> bool:
+        """前端「取消追蹤」(2026-08-12) — 停止該檔一切自動化 (含出場),使用者自負。
+        場景: 某檔一直下單失敗 (如全額交割股) 的單檔煞車,比全域暫停精準。"""
+        found = self.session.abandon_symbol(symbol)
+        if self.trader is not None:
+            from trader import Holding
+            h = self.trader.holdings.get(symbol)
+            if h is not None:
+                h.status = Holding.ABANDONED
+                h.pulled_reason = "manual_abandon"
+                found = True
+        return found
+
     def _start_pre_order_timer(self):
         """背景 thread: 等到 PRE_ORDER_TIME (08:59:58) → 對當下 marked 清單預掛限價單。
         現在時間已過 PRE_ORDER_TIME → 不掛 (只在正常 8:00 流程有效)。"""

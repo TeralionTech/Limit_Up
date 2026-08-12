@@ -40,6 +40,7 @@ class Holding:
     DISCARDED_FIRST = "discarded_first"  # 第一盤檢查淘汰
     TRACKING = "tracking"                # 追蹤中
     PULLED = "pulled"                    # 撤單 (仍持續收資料)
+    ABANDONED = "abandoned"              # 使用者取消追蹤 (一切自動化停止,自負)
 
     def __init__(self, symbol: str, limit_up: float):
         self.symbol = symbol
@@ -326,15 +327,16 @@ class Trader:
                        f"{' (持倉→市價出場,不退訂)' if has_position else ''}")
 
     def _pull(self, h: Holding, reason: str):
-        """盤中撤單 — 標狀態 + [real] 撤該檔 pending 委託。持續收資料 (不退訂)。"""
+        """盤中撤單 — 標狀態 + [real] 撤 pending **並賣出已成交部位** (2026-08-12 定案:
+        量減半常常正是自己的單被吃掉 — 撤單被券商拒「已成交」時部位要照樣出掉)。
+        exit_position 背景 thread 內含「等成交回報」競態窗口。持續收資料 (不退訂)。"""
         h.status = Holding.PULLED
         h.pulled_reason = reason
         if self.session is not None:
             try:
-                # async — _pull 由 on_book (行情 thread) 呼叫,同步 REST 會卡 tick
-                self.session.cancel_symbol_orders_async(h.symbol, reason)
+                self.session.exit_position(h.symbol, reason)
             except Exception as e:
-                logger.error(f"[trader] {h.symbol} 撤委託失敗: {e}")
+                logger.error(f"[trader] {h.symbol} 撤單/出場失敗: {e}")
         logger.warning(f"[trader] {h.symbol} 撤單 — {reason}")
 
     # ─── summary (API / 前端兩區塊) ────────────────────────
@@ -357,7 +359,7 @@ class Trader:
                 "fail_reason": h.first_fail_reason,
                 "trade": trade,
             })
-            if h.status in (Holding.TRACKING, Holding.PULLED):
+            if h.status in (Holding.TRACKING, Holding.PULLED, Holding.ABANDONED):
                 tracking.append({
                     "symbol": s,
                     "limit_up": h.limit_up,

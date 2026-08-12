@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# fetch_t30.sh — 每日 8:30 前從券商檔案主機抓 T30V.TSE / T30V.OTC 到 VPS。
+# fetch_t30.sh — 每日 8:30 前從券商檔案主機抓 T30V.TSE / T30V.OTC 到本機 (limit-up VPS)。
 #
-# 鏈路: VPS --(ssh 金鑰)--> 券商主機(Linux) --(sftp 密碼)--> 10.83.11.100
-# 主路徑: ProxyJump 一條命令打穿兩跳 (sshpass 只需裝在 VPS: apt-get install -y sshpass)
-# 備援:   券商主機禁 TCP forwarding 時,ssh 進去跑 sftp batch 再 scp 回來
+# 鏈路 (limit-up VPS 連不到券商主機,要多經過一台中繼 VPS):
+#   limit-up VPS --(ssh 金鑰)--> 中繼 VPS (JUMP_HOST, 例 root@45.32.53.219)
+#                --(ssh 金鑰)--> 券商主機 (BROKER_HOST, Linux)
+#                --(sftp 密碼)--> 檔案主機 10.83.11.100
+# 主路徑: ProxyJump 逗號鏈一條命令打穿三跳 (sshpass 只需裝在 limit-up VPS)
+# 備援:   券商主機禁 TCP forwarding 時,ssh -J 進券商主機跑 sftp 再 scp 回來
 #         (需券商主機也有 sshpass)
+# 金鑰需求: limit-up VPS 的公鑰要同時授權在「中繼 VPS」與「券商主機」
+#           (中繼 VPS → 券商主機 這段由 ProxyJump 隧道打穿,不需中繼機本身有金鑰)
 #
 # 設定檔: /opt/hit_limit_up/secrets/t30.env (chmod 600,不進 git):
+#   JUMP_HOST=root@45.32.53.219               (中繼 VPS;留空 = 不經中繼直連)
 #   BROKER_HOST=user@券商主機IP
 #   SFTP_HOST=10.83.11.100
 #   SFTP_USER=kc
@@ -28,6 +34,7 @@ ENV_FILE="${ENV_FILE:-/opt/hit_limit_up/secrets/t30.env}"
 DEST_DIR="${DEST_DIR:-/opt/hit_limit_up/repo/input/t30}"
 DEADLINE="${DEADLINE:-08:25}"
 RETRY_SEC="${RETRY_SEC:-180}"
+JUMP_HOST="${JUMP_HOST:-}"
 
 command -v sshpass >/dev/null || { echo "[fetch_t30] VPS 缺 sshpass: apt-get install -y sshpass"; exit 1; }
 mkdir -p "$DEST_DIR"
@@ -35,27 +42,35 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+# ProxyJump 鏈: 有中繼 VPS → "中繼,券商主機";沒有 → 只有券商主機
+if [ -n "$JUMP_HOST" ]; then
+    JUMP_CHAIN="$JUMP_HOST,$BROKER_HOST"
+    BROKER_JUMP_OPT="-o ProxyJump=$JUMP_HOST"     # 備援路徑連券商主機用
+else
+    JUMP_CHAIN="$BROKER_HOST"
+    BROKER_JUMP_OPT=""
+fi
 
 fetch_proxyjump() {
     local f
     for f in T30V.TSE T30V.OTC; do
         # shellcheck disable=SC2086
-        sshpass -p "$SFTP_PASS" sftp $SSH_OPTS -o ProxyJump="$BROKER_HOST" \
+        sshpass -p "$SFTP_PASS" sftp $SSH_OPTS -o ProxyJump="$JUMP_CHAIN" \
             "$SFTP_USER@$SFTP_HOST:$f" "$TMP/" || return 1
     done
 }
 
 fetch_twohop() {
-    # 備援 — 密碼會出現在券商主機的行程列表,僅在 ProxyJump 不可用時使用
+    # 備援 — 密碼會出現在券商主機的行程列表,僅在 ProxyJump 全鏈不可用時使用
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$BROKER_HOST" "
+    ssh $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST" "
         command -v sshpass >/dev/null || { echo '券商主機缺 sshpass (備援路徑需要)'; exit 9; }
         rm -f /tmp/T30V.TSE /tmp/T30V.OTC
         sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.TSE /tmp/ &&
         sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.OTC /tmp/
     " || return 1
     # shellcheck disable=SC2086
-    scp $SSH_OPTS "$BROKER_HOST:/tmp/T30V.TSE" "$BROKER_HOST:/tmp/T30V.OTC" "$TMP/" || return 1
+    scp $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST:/tmp/T30V.TSE" "$BROKER_HOST:/tmp/T30V.OTC" "$TMP/" || return 1
 }
 
 valid() {  # $1=檔案 → size > 0 且為 100 的整數倍 (T30 定長記錄)

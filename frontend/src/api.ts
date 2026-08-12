@@ -55,6 +55,10 @@ export const api = {
     req<{ ok: boolean }>('/api/trading/cancel_order', {
       method: 'POST', body: JSON.stringify({ order_no }),
     }),
+  traderAbandon: (symbol: string) =>
+    req<{ ok: boolean }>('/api/trader/abandon', {
+      method: 'POST', body: JSON.stringify({ symbol }),
+    }),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -162,7 +166,7 @@ export interface TrackingRow {
   bid1_size: number
   ask1_price: number
   ask1_size: number
-  status: 'tracking' | 'pulled'
+  status: 'tracking' | 'pulled' | 'abandoned'
   pulled_reason: string
   warning?: string
   last_trade_price: number

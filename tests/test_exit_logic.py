@@ -289,6 +289,107 @@ class TestCloseAll:
 
 # ═══ F. 隔日賣出場 ═════════════════════════════════════════════════
 
+class TestPullFillRace:
+    """量減半×剛好成交的競態 (2026-08-12 使用者確認):
+    pull 不再只撤單 — 改走 exit_position (撤+賣);出場 worker 讀到 0 張時
+    等成交回報 (_EXIT_FILL_WAIT_SEC),搶到的部位照樣跌停價賣掉。"""
+
+    def test_exit_worker_waits_for_late_fill_then_sells(self, monkeypatch):
+        import threading
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.0)
+        s = _session_with_position(lots=0)             # 預掛 2 張 pending,未成交
+        pre_no = s.trades["2330"].order_no
+        # 0.3 秒後成交回報才到 (模擬「撤單瞬間其實已成交」)
+        threading.Timer(0.3, lambda: s._on_fill(_fill(pre_no, "2330", 2, LIMIT))).start()
+        s._exit_worker("2330", "qty_drop_half")        # 同步呼叫 — 內含等待窗口
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed   # 搶到的 2 張賣掉了
+        assert s.trades["2330"].exited is True
+        kinds = [c[0] for c in s.broker.calls]
+        assert kinds.index("cancel") < kinds.index("limit_sell")    # 先撤後賣
+
+    def test_exit_worker_rolls_back_when_no_fill(self, monkeypatch):
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
+        s = _session_with_position(lots=0)
+        pre_no = s.trades["2330"].order_no
+        s._exit_worker("2330", "qty_drop_half")
+        st = s.trades["2330"]
+        assert _sells(s.broker) == []                  # 沒部位 → 不賣
+        assert st.exited is False                      # 回退 — 晚到的成交仍有出場保護
+        # 回報更晚才落地 → 部位出現 → 下一次出場觸發能正常賣掉 (鏈路自癒)
+        s._on_fill(_fill(pre_no, "2330", 2, LIMIT))
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
+
+    def test_pull_now_exits_position_end_to_end(self, monkeypatch):
+        import threading
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.5)
+        s = _session_with_position(lots=0)
+        s.trades["2330"].first_trade_fired = True      # 擋市價追,單測 pull 路徑
+        pre_no = s.trades["2330"].order_no
+        t = Trader(watchlist=["2330"], limit_ups={"2330": LIMIT}, cfg=_cfg(), session=s)
+        t.on_book("2330", [{"price": 0.0, "size": 1561}, {"price": LIMIT, "size": 500}], [])
+        for _ in range(3):
+            t.on_trade("2330", {"price": LIMIT, "size": 50})
+        # 量減半 tick → pull → 背景 exit worker (撤 + 等回報 + 賣)
+        threading.Timer(0.3, lambda: s._on_fill(_fill(pre_no, "2330", 2, LIMIT))).start()
+        t.on_book("2330", [{"price": 0.0, "size": 700}, {"price": LIMIT, "size": 500}], [])
+        assert t.holdings["2330"].status == Holding.PULLED
+        assert _wait(lambda: _sells(s.broker), timeout=4), "pull 後搶到的部位沒被賣掉"
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
+
+
+class TestAbandon:
+    """前端「取消追蹤」(2026-08-12): 停止該檔一切自動化,使用者自負 —
+    狂送單的單檔煞車 (全額交割股事故的手動出口)。"""
+
+    def test_abandon_kills_chase_spam(self):
+        # 場景重現: 市價追持續被拒狂送 → 取消追蹤 → 立刻停
+        s = make_session()
+        s.place_pre_orders(["9103"], {"9103": 50.0})
+        calls = {"n": 0}
+
+        def _always_fail(symbol, lots):
+            calls["n"] += 1
+            raise RuntimeError("委託失敗 (全額交割)")
+        s.broker.place_market_buy = _always_fail
+        s.on_first_trade("9103", True)                 # 背景 thread 開始狂送
+        assert _wait(lambda: calls["n"] >= 3), "狂送沒發生 (測試前置失敗)"
+        assert s.abandon_symbol("9103") is True
+        assert _wait(lambda: s.budget_used == 0)       # 追單迴圈中止 → 預算全釋放
+        time.sleep(0.3)
+        n_after = calls["n"]
+        time.sleep(0.4)
+        assert calls["n"] == n_after                   # 不再送單
+        assert s.trades["9103"].stopped_reason == "manual_abandon"
+        # 預掛也撤了 (abandon 撤一次;chase worker 中止後照流程再補撤同一單,無害)
+        assert len(s.broker.cancelled) >= 1
+
+    def test_abandon_disables_exit_automation(self):
+        # 取消追蹤後: 有持倉也不再自動出場 (使用者自負)
+        s = _session_with_position(lots=2)
+        s.abandon_symbol("2330")
+        s.exit_position("2330", "mkt_queue_gone")      # 支撐消失訊號進來
+        time.sleep(0.3)
+        assert _sells(s.broker) == []                  # 不賣 — 自動化已停
+        assert s.trades["2330"].exited is True
+
+    def test_abandon_unknown_symbol(self):
+        s = make_session()
+        assert s.abandon_symbol("0000") is False
+
+    def test_runner_abandon_marks_holding(self):
+        from runner import Runner
+        from trader import Holding as H
+        r = Runner()
+        r.trader = Trader(watchlist=["2330"], limit_ups={"2330": 100.0}, cfg=_cfg())
+        assert r.abandon_symbol("2330") is True
+        assert r.trader.holdings["2330"].status == H.ABANDONED
+        assert r.abandon_symbol("9999") is False       # 兩邊都查無 → False
+
+
 class _InvBroker(FakeBroker):
     def __init__(self, inventories=None):
         super().__init__()
