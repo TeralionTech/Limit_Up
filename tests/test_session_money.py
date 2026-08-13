@@ -361,6 +361,71 @@ class TestAsyncCancel:
         assert s.budget_used == 0                    # 保留已釋放
 
 
+class TestFatalReject:
+    """致命拒因 (全額交割/預收圈存) — 第一筆被拒就停,不再狂送。
+    2026-08-13 6225 事故: T30 名單漏抓時的第二層保險。"""
+
+    FATAL_MSG = "全額處置股,預收或圈存不足,請洽營業員[4385166]"
+
+    def test_pre_order_fatal_reject_stops_symbol(self):
+        s = make_session()
+
+        def _fatal(symbol, price, lots):
+            raise RuntimeError(self.FATAL_MSG)
+        s.broker.place_limit_buy = _fatal
+        s.place_pre_orders(["6225"], {"6225": 36.75})
+        assert s.trades["6225"].stopped_reason == "fatal_reject"
+        assert s.budget_used == 0
+        # 9:00 首筆成交來了也不追 (stopped_reason 擋)
+        s._first_trade_worker("6225", True)
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
+
+    def test_chase_stops_after_first_fatal_reject(self):
+        s = make_session()
+        s.place_pre_orders(["6225"], {"6225": 36.75})
+        calls = {"n": 0}
+
+        def _fatal(symbol, lots):
+            calls["n"] += 1
+            raise RuntimeError(self.FATAL_MSG)
+        s.broker.place_market_buy = _fatal
+        s._first_trade_worker("6225", True)
+        assert calls["n"] == 1                           # 只送 1 筆就停 (原本會無限狂送)
+        assert s.trades["6225"].stopped_reason == "fatal_reject"
+        assert s.budget_used == 0                        # 保留全釋放
+
+    def test_non_fatal_reject_keeps_retrying(self):
+        # 對照組: 非致命拒因照舊「試到成功為止」
+        s = make_session()
+        s.place_pre_orders(["1101"], {"1101": 50.0})
+        fails = {"n": 0}
+        orig = s.broker.place_market_buy
+
+        def _flaky(symbol, lots):
+            if fails["n"] < 5:
+                fails["n"] += 1
+                raise RuntimeError("busy")               # 無致命關鍵字
+            return orig(symbol, lots)
+        s.broker.place_market_buy = _flaky
+        s._first_trade_worker("1101", True)
+        assert fails["n"] == 5                           # 有重試
+        assert s.trades["1101"].order_kind == "market_buy"   # 最終成功
+
+    def test_sell_fatal_reject_stops_immediately(self):
+        s = make_session()
+        s.place_pre_orders(["1101"], {"1101": 50.0})
+        s._on_fill(_fill(s.trades["1101"].order_no, "1101", 4, 50.0))
+        st = s.trades["1101"]
+        calls = {"n": 0}
+
+        def _fatal(symbol, lots, reason=""):
+            calls["n"] += 1
+            raise RuntimeError(self.FATAL_MSG)
+        s.broker.place_market_sell = _fatal              # 無跌停價 → market 兜底路徑
+        assert s._sell_position("1101", st, 4, "test") is False
+        assert calls["n"] == 1                           # 1 筆即停,不燒滿 8 次重試
+
+
 class TestSellRetryBounded:
     def test_sell_gives_up_after_max_tries(self):
         # Fix: 賣單重試有上限 (原 while True 會無限狂送)

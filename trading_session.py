@@ -33,6 +33,16 @@ DEFAULT_SELL_MAX_TRIES = 8     # 出場賣: 指數退避 0.2→…→5s;用盡�
 # 晚到的部位由下一個出場訊號接手 (2026-08-12 使用者確認的競態處理)
 _EXIT_FILL_WAIT_SEC = 3.0
 
+# 致命拒因關鍵字 — 拒單訊息含這些字 = 該檔今日 API 下單必不成功 (全額交割/
+# 處置股預收圈存),重試無意義 → 第一筆被拒就停止該檔
+# (2026-08-13 6225 事故「全額處置股,預收或圈存不足」: T30 名單漏抓時的第二層保險)
+_FATAL_REJECT_KEYWORDS = ("全額", "預收", "圈存")
+
+
+def _is_fatal_reject(err) -> bool:
+    msg = str(err)
+    return any(k in msg for k in _FATAL_REJECT_KEYWORDS)
+
 
 class SendRateLimiter:
     """爆發式送單風控 — 滑動窗口: 過去 1 秒內 < max_per_sec 筆就**立刻放行**,
@@ -483,9 +493,17 @@ class TradingSession:
                     st.order_status = "pending"
                 self._log_order(order_no, sym, "buy", "pre_limit", lots, limit_up)
             except Exception as e:
-                logger.error(f"[session] {sym} 預掛失敗 (不重試,9:00 市價追會救): {e}")
-                with self._lock:
-                    self._release_budget(st)                 # 釋放 (追單時重新保留)
+                if _is_fatal_reject(e):
+                    # 致命拒因 (全額交割/預收圈存) — 今日必不成功,市價追也不准救
+                    with self._lock:
+                        st.stopped_reason = "fatal_reject"
+                        self._release_budget(st)
+                    logger.critical(f"[session] ⚠ {sym} 預掛致命拒因 → 今日停止此檔 "
+                                    f"(T30 名單可能漏抓,請檢查): {e}")
+                else:
+                    logger.error(f"[session] {sym} 預掛失敗 (不重試,9:00 市價追會救): {e}")
+                    with self._lock:
+                        self._release_budget(st)             # 釋放 (追單時重新保留)
         logger.warning("[session] 預掛限價單完成")
 
     # ─── 9:00 後事件 (trader 呼叫) ─────────────────────────
@@ -593,6 +611,14 @@ class TradingSession:
                     chased_ok = True
                     break
                 except Exception as e:
+                    if _is_fatal_reject(e):
+                        # 致命拒因 — 第一筆被拒就停,不再狂送 (2026-08-13 6225 事故)
+                        with self._lock:
+                            st.stopped_reason = "fatal_reject"
+                        abort_reason = "fatal_reject"
+                        logger.critical(f"[session] ⚠ {symbol} 市價追致命拒因 → 立即放棄"
+                                        f"此檔 (T30 名單可能漏抓,請檢查): {e}")
+                        break
                     # log 防洪: 前 5 次全印,之後每 50 次一次 (無上限重試最壞 5 log/s/檔)
                     if attempt <= 5 or attempt % 50 == 0:
                         logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,"
@@ -725,6 +751,11 @@ class TradingSession:
                 st.sell_failed = False    # 賣單送出成功 → 解除先前失敗旗標
                 return True
             except Exception as e:
+                if _is_fatal_reject(e):
+                    # 致命拒因 — 重試無意義,立即交人工 (caller 的 sell_failed 路徑接手)
+                    logger.critical(f"[session] ⚠ {symbol} 出場賣單致命拒因 → 停止重試,"
+                                    f"需人工處理: {e}")
+                    return False
                 logger.error(f"[session] {symbol} 出場賣單失敗 (第 {attempt}/{tries} 次): {e}")
                 time.sleep(min(self.order_min_interval * (2 ** (attempt - 1)), 5.0))  # 指數退避
         return False    # 重試用盡
