@@ -37,6 +37,8 @@ DEADLINE="${DEADLINE:-08:25}"
 RETRY_SEC="${RETRY_SEC:-180}"
 JUMP_HOST="${JUMP_HOST:-}"
 BROKER_PORT="${BROKER_PORT:-22}"     # 券商主機 SSH port (實際環境是 3350)
+SFTP_DIR="${SFTP_DIR:-}"             # 檔案主機上 T30V.* 所在目錄 (空 = 登入預設目錄)
+RPATH="${SFTP_DIR:+$SFTP_DIR/}"      # 遠端路徑前綴
 
 command -v sshpass >/dev/null || { echo "[fetch_t30] VPS 缺 sshpass: apt-get install -y sshpass"; exit 1; }
 mkdir -p "$DEST_DIR"
@@ -58,7 +60,7 @@ fetch_proxyjump() {
     for f in T30V.TSE T30V.OTC; do
         # shellcheck disable=SC2086
         sshpass -p "$SFTP_PASS" sftp $SSH_OPTS -o ProxyJump="$JUMP_CHAIN" \
-            "$SFTP_USER@$SFTP_HOST:$f" "$TMP/" || return 1
+            "$SFTP_USER@$SFTP_HOST:${RPATH}$f" "$TMP/" || return 1
     done
 }
 
@@ -68,8 +70,8 @@ fetch_twohop() {
     ssh -p "$BROKER_PORT" $SSH_OPTS $BROKER_JUMP_OPT "$BROKER_HOST" "
         command -v sshpass >/dev/null || { echo '券商主機缺 sshpass (備援路徑需要)'; exit 9; }
         rm -f /tmp/T30V.TSE /tmp/T30V.OTC
-        sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.TSE /tmp/ &&
-        sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:T30V.OTC /tmp/
+        sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:${RPATH}T30V.TSE /tmp/ &&
+        sshpass -p '$SFTP_PASS' sftp -o StrictHostKeyChecking=accept-new $SFTP_USER@$SFTP_HOST:${RPATH}T30V.OTC /tmp/
     " || return 1
     # shellcheck disable=SC2086
     scp -P "$BROKER_PORT" $SSH_OPTS $BROKER_JUMP_OPT \
