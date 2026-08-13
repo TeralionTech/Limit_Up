@@ -108,18 +108,16 @@ def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
     unsub_ref = {"fn": None or callable(symbol)} — subscriber 建好後由 caller 填
     subscriber.request_unsubscribe。unmark 成功時呼叫，讓被淘汰股立即退訂。
 
-    邏輯 (user 定案 2026-07-09; 2026-07-16 加 PRE_ORDER_TIME):
+    邏輯 (user 定案 2026-07-09; 2026-08-13 量減半改批次判):
     - Mark: 只有委買單 (asks 全空) 且委買一 == 漲停價
-    - Unmark (永久淘汰 + 退訂): 委賣一出現單子，或委買一價格 != 漲停
-    - bid 減半檢查分時段:
-        08:30–FINAL_CHECK_START: 只記錄委買一最大單量
-        FINAL_CHECK_START–PRE_ORDER_TIME (08:59:58): 當下量 < 最大量 × ratio → unmark
-        PRE_ORDER_TIME–END_TIME: 不再做量減半淘汰 (真實模式此時已預掛限價單、名單凍結;
-          但出現賣單/跌下漲停的 unmark 照常跑 → runner 會同步撤該檔預掛單)
+    - Unmark (永久淘汰 + 退訂): 委賣一出現單子，或委買一價格 != 漲停 (全程逐 tick)
+    - bid 量: 8:30–PRE_ORDER_TIME (08:59:58) 每 tick 記錄 max+last;
+      量減半淘汰**不再逐 tick 判** — 08:59:58 預掛前由 runner 呼叫
+      state.final_check_all() 一次性批次判,判完清單即定案
+    - PRE_ORDER_TIME 之後: 量不再影響;賣單/跌下漲停 unmark 照常跑
+      (→ runner 會同步撤該檔預掛單)
     """
     from datetime import time as _time_cls
-    fc_hh, fc_mm, fc_ss = map(int, cfg.final_check_start.split(":"))
-    final_check_start = _time_cls(fc_hh, fc_mm, fc_ss)
     po_hh, po_mm, po_ss = map(int, cfg.pre_order_time.split(":"))
     pre_order_time = _time_cls(po_hh, po_mm, po_ss)
 
@@ -184,19 +182,12 @@ def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
                 _unsubscribe(symbol)
             return
 
-        # bid 量處理 — 分時段
-        now = datetime.now().time()
-        if now < final_check_start:
-            # 08:30–08:59: 只記錄最大委買一量
+        # bid 量記錄 — 08:59:58 (預掛) 前每 tick 記 max+last;量減半淘汰改由
+        # runner 在 08:59:58 預掛前呼叫 state.final_check_all() 一次性批次判
+        # (2026-08-13 定案,取代原 08:59:00 起的逐 tick 判)
+        if datetime.now().time() < pre_order_time:
             state.update_max_bid(symbol, bid1_size)
-        elif now < pre_order_time:
-            # 08:59:00–08:59:58 final check: 當下量 < 最大量 × ratio → unmark
-            should_unmark, prev_max = state.check_final_bid_drop(symbol, bid1_size)
-            if should_unmark and state.unmark_bid_dropped(symbol, bid1_size, prev_max):
-                logger.info(f"✗ UNMARK {symbol} final check bid {prev_max} → {bid1_size} 張 "
-                            f"({round(bid1_size/max(prev_max,1)*100)}%) → 淘汰+退訂")
-                _unsubscribe(symbol)
-        # 08:59:58 之後: 名單凍結,不再量減半淘汰 (預掛單已出;賣單/跌下漲停 unmark 照常在上面跑)
+        # 08:59:58 之後: 名單凍結,量不再影響 (預掛單已出;賣單/跌下漲停 unmark 照常在上面跑)
 
     return _on_book
 

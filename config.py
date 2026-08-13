@@ -32,7 +32,7 @@ class Config:
     end_time: str          # "09:00:00" 停止篩選時間 (轉入 trader)
     limit_up_fetch_deadline: str  # "08:28" — 漲停價抓取重試截止 (盤前試撮 8:30 前留 buffer)
     limit_up_max_per_min: int  # 250 — 漲停價 REST 抓取節流上限 (富邦日內行情限 300/min，留 margin)
-    final_check_start: str  # "08:59:00" — 此時起 bid 減半 final check (之前只記錄 max)
+    final_check_start: str  # (deprecated 2026-08-13) 量減半改 08:59:58 預掛前批次判,此欄不再使用
     pre_order_time: str    # "08:59:58" — 真實模式預掛漲停價限價單時點 (final check 窗口也到此為止)
     max_stock_price: float  # 500 — 只做漲停價 ≤ 此價的股票 (0 = 不限制)
     order_min_interval_sec: float  # 0.2 — 市價追單「失敗後」單檔退避 (送單速率由 ORDER_MAX_PER_SEC 管)

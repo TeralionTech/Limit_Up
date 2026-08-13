@@ -96,16 +96,16 @@ class TestBidDropWindows:
         h("2330", [{"price": 100.0, "size": 5}], NO_ASKS)
         assert state.is_marked("2330")
 
-    def test_final_check_window_unmarks_on_half_drop(self):
-        # final_check_start="00:00:00" → 全程在 final check 窗口
+    def test_no_per_tick_drop_batch_check_at_preorder(self):
+        # 2026-08-13: 量減半**不再逐 tick 淘汰** — handler 只記錄 max+last,
+        # 08:59:58 由 runner 呼叫 state.final_check_all() 一次性批次判
         state = State(bid_drop_ratio=0.5)
-        calls = []
-        h = _mk(state, {"2330": 100.0}, cfg=_cfg("00:00:00", "23:59:59"),
-                unsub_calls=calls)
+        h = _mk(state, {"2330": 100.0}, cfg=_cfg("00:00:00", "23:59:59"))
         h("2330", [{"price": 100.0, "size": 100}], NO_ASKS)   # mark, max=100
-        h("2330", [{"price": 100.0, "size": 40}], NO_ASKS)    # 40 < 100*0.5 → 淘汰
+        h("2330", [{"price": 100.0, "size": 40}], NO_ASKS)    # 減半但 tick 不淘汰
+        assert state.is_marked("2330")                        # 逐 tick 不再刷
+        assert state.final_check_all() == [("2330", 40, 100)]  # 批次判刷掉
         assert state.is_discarded("2330")
-        assert calls == ["2330"]
 
     def test_after_pre_order_time_list_is_frozen(self):
         # now >= pre_order_time → 量減半不再淘汰 (預掛單已出);賣單 unmark 照常

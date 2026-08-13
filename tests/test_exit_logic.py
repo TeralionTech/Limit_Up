@@ -390,6 +390,37 @@ class TestAbandon:
         assert r.abandon_symbol("9999") is False       # 兩邊都查無 → False
 
 
+class TestPreorderSweep:
+    """封口 sweep (2026-08-13): 預掛下單進行中被 tick 淘汰 → 淘汰當下撤單 no-op
+    (單還沒掛) → 預掛完成後 sweep 補撤,無時間縫隙。"""
+
+    def test_sweep_cancels_raced_unmark(self):
+        from runner import Runner
+        from state import State
+        r = Runner()
+        r.session = make_session()
+        r.state = State()
+        r.state.mark("1101", 100.0, 50, 100.0)
+        r.session.place_pre_orders(["1101"], {"1101": 100.0})   # 單掛出去了
+        r.state.unmark_ask_appeared("1101", 100.5, 3)           # 下單後才被 tick 淘汰
+        r._sweep_unmarked_pre_orders(["1101"])
+        assert len(r.session.broker.cancelled) == 1             # sweep 補撤到了
+        assert r.session.trades["1101"].order_status == "cancelled"
+        assert r.session.budget_used == 0
+
+    def test_sweep_noop_when_still_marked(self):
+        from runner import Runner
+        from state import State
+        r = Runner()
+        r.session = make_session()
+        r.state = State()
+        r.state.mark("1101", 100.0, 50, 100.0)
+        r.session.place_pre_orders(["1101"], {"1101": 100.0})
+        r._sweep_unmarked_pre_orders(["1101"])                  # 沒被淘汰 → 不動
+        assert r.session.broker.cancelled == []
+        assert r.session.trades["1101"].order_status == "pending"
+
+
 class _InvBroker(FakeBroker):
     def __init__(self, inventories=None):
         super().__init__()

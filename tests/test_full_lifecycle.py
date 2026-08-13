@@ -74,9 +74,15 @@ class TestFullLifecycle:
 
         # ── 8:30 篩選 ──
         state = _run_filter_phase(s)
-        marked = state.get_marked_prioritized()
 
-        # ── 08:59:58 預掛 (只有 A;B 已淘汰、C 沒 mark) ──
+        # ── 08:59:58 批次 final check (2026-08-13): D 曾衝 100 張、最後剩 30 → 刷掉 ──
+        state.mark("5678", 20.0, 100, 20.0)
+        state.update_max_bid("5678", 30)
+        assert state.final_check_all() == [("5678", 30, 100)]
+        marked = state.get_marked_prioritized()
+        assert marked == [A]                                 # 清單就此定案
+
+        # ── 08:59:58 預掛 (只有 A;B 已淘汰、C 沒 mark、D 量減半刷掉) ──
         s.place_pre_orders(marked, LIMIT_UPS)
         assert [c[1] for c in s.broker.placed] == [A]
         assert s.trades[A].target_lots == 2

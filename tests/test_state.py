@@ -48,6 +48,45 @@ class TestBidDrop:
         assert s.check_final_bid_drop("9999", 10) == (False, 0)
 
 
+class TestFinalCheckAll:
+    """08:59:58 預掛前的一次性批次判 (2026-08-13 定案,取代逐 tick final check)。"""
+
+    def test_batch_drops_only_halved(self):
+        s = State(bid_drop_ratio=0.5)
+        s.mark("1111", 100.0, 100, 100.0)
+        s.mark("2222", 50.0, 100, 50.0)
+        s.update_max_bid("1111", 200)
+        s.update_max_bid("1111", 150)      # last=150 ≥ 200×0.5 → 保留
+        s.update_max_bid("2222", 200)
+        s.update_max_bid("2222", 80)       # last=80 < 200×0.5 → 刷掉
+        dropped = s.final_check_all()
+        assert dropped == [("2222", 80, 200)]
+        assert s.is_marked("1111")
+        assert s.is_discarded("2222")
+
+    def test_last_tracks_latest_not_max(self):
+        # last 是「最新一筆」— 量掉下來會如實反映 (不是只記高點)
+        s = State(bid_drop_ratio=0.5)
+        s.mark("1111", 100.0, 100, 100.0)
+        s.update_max_bid("1111", 500)
+        s.update_max_bid("1111", 100)      # 衝高又掉 → last=100 < 250 → 刷
+        assert s.final_check_all() == [("1111", 100, 500)]
+
+    def test_mark_only_no_further_ticks_kept(self):
+        # 只有 mark 那筆 (last == max) → 100% 沒減半 → 保留
+        s = State(bid_drop_ratio=0.5)
+        s.mark("1111", 100.0, 100, 100.0)
+        assert s.final_check_all() == []
+        assert s.is_marked("1111")
+
+    def test_empty_and_zero_max_noop(self):
+        s = State()
+        assert s.final_check_all() == []
+        s.mark("1111", 100.0, 0, 100.0)    # max=0 → 不判
+        assert s.final_check_all() == []
+        assert s.is_marked("1111")
+
+
 class TestPrioritized:
     def test_first_tick_symbols_come_first(self):
         s = State()

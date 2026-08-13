@@ -27,8 +27,10 @@ class State:
         # 「開盤即鎖」— 第一筆真實報價 (委買非空) 就滿足 mark 條件的強勢股 (顯示/分析用)
         self.first_tick_limit_up: Set[str] = set()
         self.history: Dict[str, List[dict]] = {}         # symbol → [event, ...]
-        # mark 之後追蹤該 symbol 看過的 bid1 max size (只在 8:30–8:59 更新)
+        # mark 之後追蹤該 symbol 的 bid1 量: max (歷史最高) + last (最新一筆)
+        # — 08:59:58 批次 final check 用 (2026-08-13 定案)
         self._max_bid_size: Dict[str, int] = {}
+        self._last_bid1_size: Dict[str, int] = {}
         self._bid_drop_ratio = bid_drop_ratio
         # stats 增量計數器 — mark/_unmark 時維護,stats() 變 O(1)
         # (原本每次五趟全掃 history、拿的又是跟 tick handler 同一把鎖,
@@ -54,6 +56,7 @@ class State:
             if was_new:
                 self._mark_events += 1
                 self._max_bid_size[symbol] = max(bid1_size, 0)
+                self._last_bid1_size[symbol] = max(bid1_size, 0)
                 if first_tick:
                     self.first_tick_limit_up.add(symbol)
                 self.history.setdefault(symbol, []).append({
@@ -99,6 +102,7 @@ class State:
             self.marked.discard(symbol)
             self.discarded.add(symbol)          # 永久淘汰，不能 re-mark
             self._max_bid_size.pop(symbol, None)
+            self._last_bid1_size.pop(symbol, None)
             self._unmark_events += 1
             self._unmark_reasons[reason] = self._unmark_reasons.get(reason, 0) + 1
             event = {
@@ -113,12 +117,34 @@ class State:
     # ─── bid1_size 追蹤 (分時段) ────────────────────────────
 
     def update_max_bid(self, symbol: str, current_bid1_size: int):
-        """08:30–08:59 用 — 只更新委買一(漲停價)最大單量，不觸發 unmark。"""
+        """8:30 起每 tick 呼叫 — 記錄 max (只往上) 與 last (最新量),不觸發 unmark。
+        08:59:58 的 final_check_all 拿這兩個值批次判。"""
         with self._lock:
             if symbol not in self.marked:
                 return
+            self._last_bid1_size[symbol] = current_bid1_size
             if current_bid1_size > self._max_bid_size.get(symbol, 0):
                 self._max_bid_size[symbol] = current_bid1_size
+
+    def final_check_all(self) -> list:
+        """08:59:58 預掛前的**一次性批次判** (2026-08-13 定案,取代逐 tick final check):
+        每檔 marked — 最新委買一量 (last) < mark 以來最高量 (max) × ratio → 淘汰。
+
+        兩階段避免鎖重入 (Lock 非 RLock): 鎖內取快照選受害者 → 鎖外逐檔
+        unmark_bid_dropped (冪等 — 若 tick 在兩階段之間搶先淘汰,這裡自然 no-op)。
+        回 [(symbol, last, max), ...] = 實際被刷掉的,供 caller log/退訂。"""
+        with self._lock:
+            candidates = []
+            for symbol in self.marked:
+                prev_max = self._max_bid_size.get(symbol, 0)
+                last = self._last_bid1_size.get(symbol, 0)
+                if prev_max > 0 and last < prev_max * self._bid_drop_ratio:
+                    candidates.append((symbol, last, prev_max))
+        dropped = []
+        for symbol, last, prev_max in candidates:
+            if self.unmark_bid_dropped(symbol, last, prev_max):
+                dropped.append((symbol, last, prev_max))
+        return dropped
 
     def check_final_bid_drop(self, symbol: str, current_bid1_size: int):
         """08:59–09:00 final check — 比較當下量 vs 8:30–8:59 最大量，不更新 max。

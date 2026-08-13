@@ -608,6 +608,17 @@ class Runner:
                 stop_event.wait(0.01 if remaining < 1 else remaining - 0.5)
             if stop_event.is_set():
                 return
+            # 量減半 final check — 一次性批次判 (2026-08-13 定案,取代逐 tick 判):
+            # 最新委買量 < mark 以來最高量 × ratio → 刷掉;判完清單即定案。
+            # 與逐 tick 淘汰共用 State 鎖 + unmark 冪等,不打架。
+            if self.state is not None:
+                for _sym, _last, _max in self.state.final_check_all():
+                    logger.warning(f"[runner] ✗ final check {_sym} 量減半 "
+                                   f"({_max} → {_last} 張) → 淘汰+退訂")
+                    try:
+                        self._unsub_symbol(_sym)
+                    except Exception:
+                        pass
             # 開盤即鎖 (first_tick) 優先下單+吃預算,再盤中鎖;各組內照代號
             marked = self.state.get_marked_prioritized() if self.state else []
             if not marked:
@@ -630,10 +641,24 @@ class Runner:
                 self.session.place_pre_orders(marked, self.limit_ups, stop_event)
             except Exception as e:
                 logger.exception(f"[runner] 預掛例外: {e}")
+            # 封口 sweep: 下單期間被 tick 淘汰的檔,其撤單當時可能 no-op (單還沒掛)
+            # → 這裡補撤 (沒單的檔 cancel 自然 no-op)。sweep 之後才淘汰的,
+            # 由淘汰自身的撤單路徑處理 (st 已存在) — 兩側無縫覆蓋。
+            self._sweep_unmarked_pre_orders(marked)
 
         t = threading.Thread(target=_timer, name="pre-order-timer", daemon=True)
         t.start()
         self._timer_threads.append(t)
+
+    def _sweep_unmarked_pre_orders(self, symbols):
+        """預掛完成後的封口對帳 — 下單進行中被 tick 淘汰的檔,淘汰當下的撤單是
+        no-op (單還沒掛出),這裡補撤。與逐 tick 淘汰路徑兩側覆蓋,無時間縫隙。"""
+        for sym in symbols:
+            try:
+                if self.state is not None and self.state.is_discarded(sym):
+                    self.session.cancel_symbol_orders(sym, "unmarked_during_preorder")
+            except Exception as e:
+                logger.error(f"[runner] 預掛後 sweep {sym} 補撤例外: {e}")
 
     def _start_cancel_pending_timer(self):
         """背景 thread: CANCEL_PENDING_TIME (13:23) 到 → 撤所有未成交委託 (持倉不動)。"""
