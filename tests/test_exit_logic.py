@@ -353,7 +353,9 @@ class TestAbandon:
 
         def _always_fail(symbol, lots):
             calls["n"] += 1
-            raise RuntimeError("委託失敗 (全額交割)")
+            # 注意: 訊息不能含「全額/預收/圈存」— 那會觸發致命拒因偵測 1 筆即停,
+            # 這裡要測的是「非致命持續失敗的狂送」被手動取消追蹤煞停
+            raise RuntimeError("委託失敗 (連線逾時)")
         s.broker.place_market_buy = _always_fail
         s.on_first_trade("9103", True)                 # 背景 thread 開始狂送
         assert _wait(lambda: calls["n"] >= 3), "狂送沒發生 (測試前置失敗)"
