@@ -59,6 +59,14 @@ export const api = {
     req<{ ok: boolean }>('/api/trader/abandon', {
       method: 'POST', body: JSON.stringify({ symbol }),
     }),
+  // ─── 帳務台帳 (每日手動損益) ───
+  pnlList: () => req<{ records: PnlRecord[]; total: number }>('/api/pnl'),
+  pnlUpsert: (p: { date: string; pnl: number; note?: string }) =>
+    req<{ ok: boolean }>('/api/pnl', { method: 'POST', body: JSON.stringify(p) }),
+  pnlDelete: (date: string) =>
+    req<{ ok: boolean; removed: boolean }>('/api/pnl/delete', {
+      method: 'POST', body: JSON.stringify({ date }),
+    }),
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -215,6 +223,14 @@ export interface OrderRow {
   status: 'pending' | 'filled' | 'cancelled' | 'rejected'
   filled_lots: number
   ts: string
+}
+
+// 帳務台帳 row (每日手動輸入,後端已算好累積)
+export interface PnlRecord {
+  date: string          // YYYY-MM-DD
+  pnl: number           // 當日損益 (可負)
+  note: string
+  cumulative: number    // 累積損益 (依日期舊→新累加)
 }
 
 // 隔日賣標的 row (昨天買到未出場的持倉,今天要賣)

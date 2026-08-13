@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import pnl
 from runner import Runner
 
 router = APIRouter(prefix="/api", tags=["hit-limit-up"])
@@ -331,5 +332,46 @@ def trading_overnight_remove(req: OvernightSymbolReq):
     try:
         removed = Runner.get().untrack_overnight(req.symbol)
     except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "removed": removed}
+
+
+# ── 帳務台帳 (每日手動損益,獨立於交易流程) ─────────────────────────
+
+
+@router.get("/pnl")
+def pnl_list():
+    """全部記錄 (舊→新,含累積損益) + 總計。"""
+    records = pnl.load()
+    total = records[-1]["cumulative"] if records else 0.0
+    return {"records": records, "total": total}
+
+
+class PnlUpsertReq(BaseModel):
+    date: str
+    pnl: float
+    note: str = ""
+
+
+@router.post("/pnl")
+def pnl_upsert(req: PnlUpsertReq):
+    """新增或覆寫某一日損益 (同日期 = 修改)。"""
+    try:
+        pnl.upsert(req.date, req.pnl, req.note)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+class PnlDeleteReq(BaseModel):
+    date: str
+
+
+@router.post("/pnl/delete")
+def pnl_delete(req: PnlDeleteReq):
+    """刪除某一日記錄。"""
+    try:
+        removed = pnl.remove(req.date)
+    except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "removed": removed}

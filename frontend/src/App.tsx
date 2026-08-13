@@ -4,8 +4,9 @@ import FilterPage from './pages/FilterPage'
 import QuotePage from './pages/QuotePage'
 import SimPage from './pages/SimPage'
 import OvernightPage from './pages/OvernightPage'
+import PnlPage from './pages/PnlPage'
 
-type Tab = 'filter' | 'quote' | 'sim' | 'overnight'
+type Tab = 'filter' | 'quote' | 'sim' | 'overnight' | 'pnl'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('filter')
@@ -73,6 +74,7 @@ export default function App() {
           <TabBtn active={tab === 'quote'} onClick={() => setTab('quote')}>② 股票資料</TabBtn>
           <TabBtn active={tab === 'sim'} onClick={() => setTab('sim')}>③ 模擬/真實執行</TabBtn>
           <TabBtn active={tab === 'overnight'} onClick={() => setTab('overnight')}>④ 隔日賣標的</TabBtn>
+          <TabBtn active={tab === 'pnl'} onClick={() => setTab('pnl')}>⑤ 帳務</TabBtn>
         </div>
       </header>
 
@@ -81,6 +83,7 @@ export default function App() {
         {tab === 'quote' && <QuotePage />}
         {tab === 'sim' && <SimPage />}
         {tab === 'overnight' && <OvernightPage />}
+        {tab === 'pnl' && <PnlPage />}
       </main>
     </div>
   )
