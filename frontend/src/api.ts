@@ -245,6 +245,7 @@ export interface OvernightRow {
   sold_lots: number
   sell_status: string       // '' / pending / filled / cancelled / rejected
   skip: boolean             // 使用者按「不要賣」暫停
+  locked_now: boolean       // 目前鎖漲停中 (市價列/買牆在) → 抱著不賣
   books?: {
     bids: Array<{ price: number; size: number }>
     asks: Array<{ price: number; size: number }>

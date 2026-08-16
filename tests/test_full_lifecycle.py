@@ -175,3 +175,35 @@ class TestFullLifecycle:
         assert _sells(s.broker) == []                        # 沒部位 → 不賣
         assert s.budget_used == 0                            # 未成交保留全釋放
         assert s.trades[A].order_status == "cancelled"
+
+    def test_overnight_lock_hold_then_bid_drop_sell(self):
+        """案例 4 (2026-08-16 純盤面規則): 隔日賣標的今天又鎖漲停 → 抱著不賣;
+        盤中委買一跌下漲停 → 跌停價限價賣 → 成交 → 清單保留但收盤不帶明天。"""
+        from test_exit_logic import _InvBroker
+        D, UP_D, DOWN_D = "5285", 52.0, 41.5
+        s = make_session()
+        s.broker = _InvBroker([{"symbol": D, "lots": 3}])
+        s.load_overnight([{"symbol": D, "lots": 3, "avg_cost": 47.0}])
+        s.refresh_overnight_inventory()                      # 對帳 → reconciled + 張數以庫存為準
+        assert s.overnight[D]["reconciled"] is True
+        s.set_overnight_limit_ups({D: UP_D})
+        s.set_limit_downs({D: DOWN_D})
+
+        t = Trader(watchlist=[], limit_ups={}, cfg=_trader_cfg(), session=s)
+        # 9:00 開盤鎖著 (市價隊伍+買牆) → 抱著;成交 tick 不觸發任何隔日賣
+        t.on_book(D, [{"price": 0.0, "size": 900}, {"price": UP_D, "size": 400}], [])
+        t.on_trade(D, {"price": UP_D, "size": 120000})
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        assert s.overnight[D]["locked_now"] is True
+        # 盤中委買一跌下漲停 → 跌停價限價賣全部持倉
+        t.on_book(D, [{"price": 51.5, "size": 200}], [])
+        assert _wait(lambda: _sells(s.broker)), "跌下漲停後沒賣"
+        assert _sells(s.broker) == [("limit_sell", D, DOWN_D, 3)]
+        assert s.overnight[D]["locked_now"] is False
+        # 賣單成交 → sold_lots 記帳;清單不移除,但收盤不再帶到明天
+        sell_no = s.overnight[D]["sell_order_no"]
+        s._on_fill(_fill(sell_no, D, 3, DOWN_D, action="sell", filled_no="F41"))
+        assert s.overnight[D]["sold_lots"] == 3
+        assert D in s.overnight                              # 賣掉不移除清單
+        assert all(c["symbol"] != D for c in s.get_overnight_candidates())

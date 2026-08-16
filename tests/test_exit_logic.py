@@ -433,13 +433,15 @@ class _InvBroker(FakeBroker):
 
 
 def _overnight_session(list_lots=5, held_lots=2, bid1=50.0, ask1=0.0,
-                       skip=False, reconciled=True):
+                       skip=False, reconciled=True, limit_up=None):
     s = make_session()
     s.broker = _InvBroker([{"symbol": "9999", "lots": held_lots}] if held_lots else [])
     s.load_overnight([{"symbol": "9999", "lots": list_lots, "avg_cost": 10.0}])
     o = s.overnight["9999"]
     o["reconciled"] = reconciled
     o["skip"] = skip
+    if limit_up:
+        s.set_overnight_limit_ups({"9999": limit_up})
     s.update_overnight_book("9999", bid1, ask1)
     return s
 
@@ -447,20 +449,21 @@ def _overnight_session(list_lots=5, held_lots=2, bid1=50.0, ask1=0.0,
 class TestOvernightExit:
     def test_oversell_guard_sells_min_of_list_and_inventory(self):
         # 清單 5 張 / 庫存 2 張 → 只賣 2 (2026-08-03 超賣保護)
+        # 觸發 = book 驅動 (無漲停價資料+無市價列 → 開盤即賣 fallback)
         s = _overnight_session(list_lots=5, held_lots=2, bid1=50.0)
-        s.on_overnight_first_trade("9999")
+        s.update_overnight_book("9999", 50.0, 0.0, 0, 50.0)
         assert _wait(lambda: _sells(s.broker)), "隔日賣 2 秒內沒下單"
         assert _sells(s.broker) == [("limit_sell", "9999", 50.0, 2)]
 
     def test_skip_blocks_sell(self):
         s = _overnight_session(skip=True)
-        s.on_overnight_first_trade("9999")
+        s.update_overnight_book("9999", 50.0, 0.0, 0, 50.0)
         time.sleep(0.3)
         assert _sells(s.broker) == []
 
     def test_unreconciled_blocks_sell(self):
         s = _overnight_session(reconciled=False)
-        s.on_overnight_first_trade("9999")
+        s.update_overnight_book("9999", 50.0, 0.0, 0, 50.0)
         time.sleep(0.3)
         assert _sells(s.broker) == []
 
@@ -488,3 +491,188 @@ class TestOvernightExit:
         o["sell_placed"] = True
         s._overnight_sell_worker("9999")
         assert _sells(s.broker) == [("limit_sell", "9999", 41.5, 5)]   # 跌停價,非 50.8
+
+
+# ─── 隔日賣純盤面規則 (2026-08-16 定案): 委買一跌下漲停才賣,鎖著就抱 ──────
+
+UP_ON = 52.0       # 隔日賣標的今日漲停價
+DOWN_ON = 41.5     # 今日跌停價 (出場限價賣)
+# 鎖著 = 市價買隊伍在 (price=0 列) 或 限價委買一 >= 漲停價
+BOOK_MKT_AND_WALL = ([{"price": 0.0, "size": 800}, {"price": UP_ON, "size": 500}], [])
+BOOK_WALL_ONLY = ([{"price": UP_ON, "size": 500}], [])       # 限價買牆單獨鎖著
+BOOK_MKT_ONLY = ([{"price": 0.0, "size": 800}], [])          # 純市價列 (無限價檔)
+# price=0 防呆核心盤面: 市價隊伍在,但限價一檔已跌下漲停 → 仍算鎖著
+BOOK_MKT_WALL_BELOW = ([{"price": 0.0, "size": 800}, {"price": 51.5, "size": 300}], [])
+BOOK_NO_SUPPORT = ([{"price": 51.5, "size": 300}], [])       # 委買一跌下漲停
+
+
+def _hold_session(**kw):
+    kw.setdefault("held_lots", 5)
+    kw.setdefault("list_lots", 5)
+    kw.setdefault("limit_up", UP_ON)
+    s = _overnight_session(**kw)
+    s.set_limit_downs({"9999": DOWN_ON})
+    return s
+
+
+def _feed_book(s, book):
+    """模擬呼叫端 (trader/monitor) 的 book tick — 用同一個 helper 算欄位。"""
+    from trader import _overnight_book_fields
+    s.update_overnight_book("9999", *_overnight_book_fields(*book))
+
+
+class TestOvernightHold:
+    def test_locked_open_first_book_no_sell(self):
+        # 開盤鎖著 (市價隊伍+買牆) → 抱著不賣
+        s = _hold_session()
+        _feed_book(s, BOOK_MKT_AND_WALL)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+        assert s.overnight["9999"]["sell_placed"] is False
+
+    def test_bid_below_limit_up_first_book_sells(self):
+        # 開盤沒鎖 (委買一低於漲停) → 第一筆 book 即賣 (等效舊開盤即賣)
+        s = _hold_session()
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+        assert _sells(s.broker) == [("limit_sell", "9999", DOWN_ON, 5)]
+        assert s.overnight["9999"]["locked_now"] is False
+
+    def test_wall_only_locked_no_sell(self):
+        # 限價大買單鎖漲停 (市價列恆 0) — 買牆本身就是鎖著,不誤賣
+        s = _hold_session()
+        for _ in range(3):
+            _feed_book(s, BOOK_WALL_ONLY)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+
+    def test_mkt_row_present_wall_below_limit_no_sell(self):
+        # price=0 防呆核心: 市價隊伍在就是鎖著,限價列跌下漲停也不賣
+        s = _hold_session()
+        _feed_book(s, BOOK_MKT_WALL_BELOW)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+
+    def test_mkt_only_book_no_sell(self):
+        # 純市價列 book (無任何限價檔) → 鎖著 (不觸發空 book guard)
+        s = _hold_session()
+        _feed_book(s, BOOK_MKT_ONLY)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+
+    def test_lock_opens_then_bid_drops_sells(self):
+        # 鎖著一段時間 → 委買一跌下漲停 → 跌停價限價賣
+        s = _hold_session()
+        _feed_book(s, BOOK_MKT_AND_WALL)
+        _feed_book(s, BOOK_WALL_ONLY)
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+        assert _sells(s.broker) == [("limit_sell", "9999", DOWN_ON, 5)]
+
+    def test_missing_limit_up_with_mkt_row_no_sell(self):
+        # 查無漲停價但市價隊伍在 → 仍判鎖著 (比舊 fallback 聰明)
+        s = _hold_session(limit_up=None)
+        _feed_book(s, BOOK_MKT_AND_WALL)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+
+    def test_missing_limit_up_without_mkt_row_sells(self):
+        # 查無漲停價且無市價列 (買牆無從判斷) → 開盤即賣 (舊 fallback)
+        s = _hold_session(limit_up=None)
+        _feed_book(s, BOOK_WALL_ONLY)
+        assert _wait(lambda: _sells(s.broker))
+
+    def test_skip_blocks_then_resume_sells(self):
+        # skip 中訊號每 tick 持續但被閘門擋住 (不 spam);恢復後下一 tick 賣
+        s = _hold_session(skip=True)
+        for _ in range(3):
+            _feed_book(s, BOOK_NO_SUPPORT)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []
+        s.set_overnight_skip("9999", False)
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+
+    def test_disposition_same_rule(self):
+        # 處置股 (無市價列) 同一條規則 — 不需分流 (防未來加分流的回歸)
+        s = _hold_session()
+        s.set_dispositions({"9999": True})
+        _feed_book(s, BOOK_WALL_ONLY)
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+        assert _sells(s.broker) == [("limit_sell", "9999", DOWN_ON, 5)]
+
+    def test_all_day_lock_carries_to_next_day(self):
+        # 全天鎖著沒賣 → 13:24 get_overnight_candidates 以原張數帶到明天
+        s = _hold_session()
+        for _ in range(5):
+            _feed_book(s, BOOK_MKT_AND_WALL)
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        cands = {c["symbol"]: c for c in s.get_overnight_candidates()}
+        assert cands["9999"]["lots"] == 5
+
+    def test_sold_stays_in_list_and_drops_from_candidates(self):
+        # 賣掉 → sold_lots 記帳、**清單不移除** (顯示留到隔早對帳)、candidates 不帶
+        s = _hold_session()
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+        sell_no = s.overnight["9999"]["sell_order_no"]
+        s._on_fill(_fill(sell_no, "9999", 5, DOWN_ON, action="sell", filled_no="F77"))
+        assert s.overnight["9999"]["sold_lots"] == 5
+        assert "9999" in s.overnight                     # 賣掉不移除清單
+        assert all(c["symbol"] != "9999" for c in s.get_overnight_candidates())
+
+    def test_active_today_gate(self):
+        # 同檔今日有活單 → 隔日賣不觸發;今日出場 (exited) 後下一 tick 接手
+        s = _hold_session()
+        s.place_pre_orders(["9999"], {"9999": UP_ON})    # 今日預掛 → st 活著
+        _feed_book(s, BOOK_NO_SUPPORT)
+        time.sleep(0.3)
+        assert _sells(s.broker) == []                    # 閘門壓住
+        s.trades["9999"].exited = True                   # 今日已出場
+        _feed_book(s, BOOK_NO_SUPPORT)
+        assert _wait(lambda: _sells(s.broker))
+        assert _sells(s.broker) == [("limit_sell", "9999", DOWN_ON, 5)]
+
+    def test_empty_book_tick_no_action(self):
+        # 空 book tick → 不判不賣,locked_now 保持上一值
+        s = _hold_session()
+        _feed_book(s, BOOK_MKT_AND_WALL)
+        assert s.overnight["9999"]["locked_now"] is True
+        s.update_overnight_book("9999", 0.0, 0.0, 0, 0.0)
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+
+    def test_update_overnight_book_three_arg_compat(self):
+        # 3 參數舊簽名 = 純報價更新,不跑規則 (bid1 低於漲停也不誤觸)
+        s = _hold_session()
+        s.update_overnight_book("9999", 49.5, 50.5)
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        o = s.overnight["9999"]
+        assert o["bid1"] == 49.5 and o["ask1"] == 50.5
+
+    def test_handler_plumbing_via_trader(self):
+        # handler 層驗證: 真 Trader.on_book 串 session;on_trade 不再觸發隔日賣
+        s = _hold_session()
+        t = Trader(watchlist=[], limit_ups={}, cfg=_cfg(), session=s)
+        t.on_trade("9999", {"price": 51.5, "size": 120000})    # 成交 tick → 無任何效果
+        time.sleep(0.2)
+        assert _sells(s.broker) == []
+        t.on_book("9999", *BOOK_MKT_AND_WALL)                  # 鎖著 → 抱
+        time.sleep(0.1)
+        assert _sells(s.broker) == []
+        assert s.overnight["9999"]["locked_now"] is True
+        t.on_book("9999", *BOOK_NO_SUPPORT)                    # 跌下漲停 → 賣
+        assert _wait(lambda: _sells(s.broker))
+        assert _sells(s.broker) == [("limit_sell", "9999", DOWN_ON, 5)]

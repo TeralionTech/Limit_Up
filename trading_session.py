@@ -138,8 +138,12 @@ class TradingSession:
         # T30 禁單名單 (全額交割 SETTYPE≠0 / 每筆需 100% 預收 MARK-W=2) —
         # API 下單必被拒,預掛/市價追一律跳過 (2026-08-12 狂送單事故)
         self.untradable: set = set()
-        # 隔日賣標的 (昨天買到、收盤未出場的持倉) — 隔天開盤第一筆成交後委買一價賣出
+        # 隔日賣標的 (昨天買到、收盤未出場的持倉) — 純盤面規則 (2026-08-16 定案):
+        # 委買一跌下今日漲停 → 跌停價限價賣;鎖著 (市價列在/買牆在) → 抱著
         self.overnight: Dict[str, dict] = {}
+        # 隔日賣標的「今日漲停價」(鎖漲停續抱判斷用) — ⚠ 獨立於 runner.limit_ups,
+        # 絕不可混入 (filter closure 捕獲該 dict,混入會把昨日持倉當新標的預掛加碼)
+        self.overnight_limit_ups: Dict[str, float] = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
@@ -179,6 +183,7 @@ class TradingSession:
             self.limit_downs = {}    # 每日價格不同,新日清空由 runner 重填
             self.untradable = set()  # T30 名單每日重載
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
+            self.overnight_limit_ups = {}   # 每日漲停價不同,runner 補查重填
             self._pre_orders_date = ""   # 新交易日 → 允許今日預掛
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
                        f"armed=False (要交易請重新 arm)")
@@ -195,6 +200,12 @@ class TradingSession:
         with self._lock:
             self.limit_downs = dict(limit_downs or {})
         logger.info(f"[session] 跌停價名單: {len(self.limit_downs)} 檔")
+
+    def set_overnight_limit_ups(self, ups: Dict[str, float]):
+        """runner 補查隔日賣標的今日漲停價後交進來 (鎖漲停續抱判斷用)。"""
+        with self._lock:
+            self.overnight_limit_ups = dict(ups or {})
+        logger.info(f"[session] 隔日賣漲停價名單: {len(self.overnight_limit_ups)} 檔")
 
     def set_untradable(self, symbols: set):
         """runner 從 T30 檔載入禁單名單 (全額交割 / 每筆需 100% 預收)。"""
@@ -882,6 +893,7 @@ class TradingSession:
                     "skip": False,                    # 使用者按「不要賣」→ 暫停自動賣
                     "manual": False,                  # 昨日檔案帶入 → 非手動
                     "note": "待確認 (未對帳庫存)",
+                    "locked_now": False,              # 目前鎖漲停中 (顯示用)
                 }
         logger.warning(f"[session] 載入隔日賣清單: {len(self.overnight)} 檔 {list(self.overnight)}")
 
@@ -936,6 +948,7 @@ class TradingSession:
                 "skip": False,
                 "manual": True,                # 手動加入 → 對帳庫存 0 也不自動移除
                 "note": "手動加入,待對帳庫存",
+                "locked_now": False,
             }
         logger.warning(f"[session] 手動加入隔日賣: {symbol}")
         # 連線中 → 立即對帳庫存 (拿實際張數;沒庫存會被移除)
@@ -967,15 +980,52 @@ class TradingSession:
         with self._lock:
             return symbol in self.overnight
 
-    def update_overnight_book(self, symbol: str, bid1: float, ask1: float):
-        """trader 每 tick 更新隔日賣標的的委買一/委賣一價 (第一筆成交後算賣價用)。"""
+    def update_overnight_book(self, symbol: str, bid1: float, ask1: float,
+                              mkt_bid_size: int = 0, limit_bid1_price: float = None):
+        """trader/monitor 每 tick 更新隔日賣標的的委買/委賣一價 (算賣價用),
+        並跑**純盤面無狀態**賣出規則 (2026-08-16 定案,取代 hold_mode 版):
+
+          鎖著 = 市價買隊伍在 (mkt_bid_size>0;市價列 price=0 **絕不可當跌破**)
+                 或 限價委買一 >= 今日漲停價-0.001 (買牆在)
+          鎖著 → 抱著 (locked_now 顯示用);委買一跌下漲停 (含買單全空) → 跌停價限價賣。
+
+        - 開盤沒鎖的標的第一筆 book 即觸發賣 (等效舊開盤即賣);全天鎖著 → 不賣帶明天。
+        - 查無漲停價: 有市價列仍判鎖著;無市價列 → 觸發賣 (舊 fallback)。
+        - limit_bid1_price=None (3-arg 舊簽名) = 純報價更新,不跑規則 (防舊呼叫誤觸)。
+        - 今日活躍閘門 (「只賣非今日搶單」): 該檔今日單還活著 → 不觸發;今日出場
+          (exited) 後下一筆 tick 自然接手賣昨日的量。今日 _exit_worker 的 3 秒等回報
+          窗口內可能與隔日賣同刻並行掛兩張跌停賣單 — 正確 (今日賣 filled_lots、
+          隔日賣 min(清單,庫存),總量 ≤ 庫存)。
+        - 已知 parity 漏洞 (沿襲舊 trade 閘門,不修): 預掛非致命失敗 + SKIP_TRADER 時
+          st 無 stopped_reason 也不會 exited → 該檔隔日賣全日被壓制。
+        - 呼叫端 (trader/_monitor on_book) 9:00:00 起才掛上 → 試撮 book 天然到不了這裡。"""
+        trigger = False
         with self._lock:
             o = self.overnight.get(symbol)
-            if o is not None:
-                if bid1 > 0:
-                    o["bid1"] = bid1
-                if ask1 > 0:
-                    o["ask1"] = ask1
+            if o is None:
+                return
+            if bid1 > 0:
+                o["bid1"] = bid1
+            if ask1 > 0:
+                o["ask1"] = ask1
+            if limit_bid1_price is None:
+                return                    # 3-arg 舊簽名 → 純報價更新
+            if bid1 <= 0 and ask1 <= 0 and mkt_bid_size <= 0:
+                return                    # 空 book 雜訊 → 不判,locked_now 不動
+            limit_up = float(self.overnight_limit_ups.get(symbol) or 0)
+            locked = (mkt_bid_size > 0
+                      or (limit_up > 0 and limit_bid1_price >= limit_up - 0.001))
+            o["locked_now"] = locked
+            if not locked and not o["sell_placed"]:
+                st = self.trades.get(symbol)
+                active_today = (st is not None and not st.stopped_reason
+                                and not st.exited)
+                if not active_today:
+                    trigger = True
+        if trigger:
+            self._try_start_overnight_sell(
+                symbol, "overnight_bid_below_limit_up" if limit_up > 0
+                else "overnight_open_no_limit_up")
 
     def set_overnight_skip(self, symbol: str, skip: bool):
         """前端「不要賣 / 恢復賣出」— skip=True 暫停自動賣;若已下賣單則一併撤掉。"""
@@ -1000,11 +1050,11 @@ class TradingSession:
         logger.warning(f"[session] 隔日賣 {symbol} skip={skip}"
                        f"{' (已撤賣單)' if pending_no else ''}")
 
-    def on_overnight_first_trade(self, symbol: str):
-        """隔日賣標的收到成交 → (armed+連線時) 算賣價下限價賣。一次性 (背景 thread)。
+    def _try_start_overnight_sell(self, symbol: str, reason: str):
+        """隔日賣觸發共用閘門+佔位 (book 支撐消失 / trade 決策兩路共用)。
 
-        閘門**刻意用 is_live** (跟出場/撤單的 _can_manage 不同): 這是從行情「自動發起」
-        的新賣單,不是管理既有委託 — 未 armed 絕不自動下單的安全預設必須守住。"""
+        閘門重查一次 (呼叫端釋鎖後才進來,狀態可能已變);sell_placed 佔位冪等 —
+        重複觸發 (每 tick 訊號持續發) 不會重複下單。"""
         if not self.is_live():
             return
         with self._lock:
@@ -1013,6 +1063,7 @@ class TradingSession:
                     or not o["reconciled"] or o["skip"]):
                 return
             o["sell_placed"] = True      # 先佔位防重複觸發
+        logger.warning(f"[session] 隔日賣 {symbol} 觸發賣出 ({reason})")
         threading.Thread(target=self._overnight_sell_worker, args=(symbol,),
                          name=f"overnight-{symbol}", daemon=True).start()
 
@@ -1109,6 +1160,7 @@ class TradingSession:
                     "sold_lots": row["filled_lots"] if row else 0,
                     "sell_status": row["status"] if row else "",
                     "skip": o["skip"],
+                    "locked_now": o.get("locked_now", False),
                 })
             return sorted(out, key=lambda x: x["symbol"])
 
@@ -1238,9 +1290,16 @@ class TradingSession:
                     row["status"] = "filled"
             if lots <= 0:
                 return      # 該委託已記滿 (補收已入帳的晚到回報) → 不再動部位
+            # 隔日賣單成交 → 記 sold_lots (13:24 get_overnight_candidates 算 remaining 用;
+            # 2026-08-14 補 — 原本恆 0,賣光的檔會以原張數帶到明天,靠隔早對帳才清)
+            o = self.overnight.get(fill["symbol"])
+            if (o is not None and fill["action"] == "sell"
+                    and fill["order_no"] == o["sell_order_no"]):
+                o["sold_lots"] = min(o["lots"], o["sold_lots"] + lots)
             st = self.trades.get(fill["symbol"])
             if st is None:
-                logger.warning(f"[session] 未知標的成交回報: {fill}")
+                if o is None:
+                    logger.warning(f"[session] 未知標的成交回報: {fill}")
                 return
             if fill["action"] == "buy":
                 prev_cost = st.avg_price * st.filled_lots

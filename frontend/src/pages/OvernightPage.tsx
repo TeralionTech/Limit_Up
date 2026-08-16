@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api, OvernightRow } from '../api'
 
-// 隔日賣標的:昨天買到、收盤未出場的持倉,今天開盤第一筆成交後以委買一價賣出
+// 隔日賣標的:昨天買到、收盤未出場的持倉。純盤面規則 (2026-08-16):
+// 委買一跌下今日漲停 → 跌停價限價賣;還鎖著 (市價列/買牆在) → 抱著續追蹤
 export default function OvernightPage() {
   const [rows, setRows] = useState<OvernightRow[]>([])
   const [err, setErr] = useState('')
@@ -62,8 +63,9 @@ export default function OvernightPage() {
       <section className="bg-white rounded-lg shadow p-4">
         <h2 className="font-semibold mb-1">🌙 隔日賣標的 ({rows.length})</h2>
         <p className="text-xs text-gray-500 mb-3">
-          昨天買到、收盤未出場的持倉。今天開盤收到第一筆成交後,以委買一價限價賣出
-          (委買一委賣一價差 ≥ 5 tick 時改掛「賣一往下一檔」)。需真實模式已連線+開始交易才會實際賣。
+          昨天買到、收盤未出場的持倉。開盤後只要委買一價跌下今日漲停價,就以「跌停價限價」賣出
+          (實際成交在當下買價);還鎖著漲停 (市價買排隊或漲停價買牆在) 就抱著持續追蹤,
+          賣掉後仍留在清單到隔天對帳才清。需真實模式已連線+開始交易才會實際賣。
           按「不要賣」可暫停該檔 (已下賣單會一併撤掉)。
         </p>
         <div className="flex items-center gap-2 mb-3">
@@ -160,7 +162,9 @@ function OvernightTr({ row, onToggleSkip, onRemove }: {
 
 function SellStatus({ row }: { row: OvernightRow }) {
   if (!row.sell_placed) {
-    return <span className="bg-gray-100 text-gray-600 px-2 py-0.5 rounded">待開盤成交</span>
+    return row.locked_now
+      ? <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded font-medium">🔒 鎖漲停抱著</span>
+      : <span className="bg-gray-100 text-gray-600 px-2 py-0.5 rounded">盯盤中</span>
   }
   const statusLabel: Record<string, string> = {
     pending: '排隊中', filled: '已賣出', cancelled: '已撤', rejected: '被拒',

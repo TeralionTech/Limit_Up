@@ -8,13 +8,15 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import datetime, time as dtime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
 
 from config import Config, load_config
-from trader import _first_priced, _pick   # 輕量純函式 (monitor handler 每 tick 用,不 lazy import)
+from trader import (_first_priced, _overnight_book_fields,
+                    _pick)   # 輕量純函式 (monitor handler 每 tick 用,不 lazy import)
 
 logger = logging.getLogger(__name__)
 
@@ -246,14 +248,30 @@ class Runner:
         # 8:30 起就收得到五檔+成交 (隔日賣標的可能不在漲停母體裡)
         self._load_overnight_file(output_dir)
         overnight_syms = self.session.overnight_symbols()
-        # 隔日賣標的補查跌停價 (出場=跌停價限價賣;它們可能不在今日 limit_ups 抓取範圍)
+        # 隔日賣標的補查今日漲停/跌停價 (出場=跌停價限價賣;漲停價=鎖漲停續抱判斷。
+        # 它們可能不在今日 limit_ups 抓取範圍)。查無漲停價 → 該檔續抱功能停用退回開盤即賣。
+        # ⚠ 漲停價收進獨立 dict,**絕不寫 self.limit_ups** — filter handler closure
+        # 捕獲該 dict,混入會讓 8:30 篩選把昨日持倉當新標的 mark → 預掛買單加碼!
         _stock = self.sdk.marketdata.rest_client.stock
+        _overnight_ups: dict = {}
         for _s in overnight_syms:
-            if _s not in self.limit_downs:
-                self._query_limit_up(_stock, _s)
-        # 跌停價/處置股名單交給交易會話 (所有出場含隔日賣 = 跌停價限價賣,2026-08-12 定案)
+            up = self.limit_ups.get(_s)            # universe 抓過的直接複用
+            if up is None or _s not in self.limit_downs:
+                for _try in range(3):              # 小重試 (原本單次靜默失敗)
+                    got = self._query_limit_up(_stock, _s)   # 副作用寫 dispositions/limit_downs
+                    if got:
+                        up = up or got
+                        break
+                    time.sleep(1)
+            if up:
+                _overnight_ups[_s] = float(up)
+            else:
+                logger.warning(f"[runner] 隔日賣 {_s} 查無今日漲停價 → "
+                               f"鎖漲停判斷停用 (無市價列時開盤即賣)")
+        # 跌停價/處置股/隔日賣漲停價交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)
         self.session.set_limit_downs(self.limit_downs)
         self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
+        self.session.set_overnight_limit_ups(_overnight_ups)
         sub_universe = [s for s in self.universe if s in self.limit_ups]
         for s in overnight_syms:
             if s not in sub_universe:
@@ -411,18 +429,18 @@ class Runner:
 
     def _monitor_on_book(self, symbol: str, bids: list, asks: list):
         """9:00 後的看盤 handler — **不做 mark/unmark** (filter 規則對盤中 price=0
-        市價列會誤判)。只更新隔日賣標的的委買/委賣一價 (算賣價用)。"""
+        市價列會誤判)。轉送隔日賣標的的 book → session 跑純盤面賣出規則
+        (委買一跌下今日漲停 → 跌停價限價賣;鎖著 → 抱)。"""
         if self.session.has_overnight(symbol):
             self.session.update_overnight_book(
-                symbol, _first_priced(bids), _first_priced(asks))
+                symbol, *_overnight_book_fields(bids, asks))
 
     def _monitor_on_trade(self, symbol: str, trade_data):
         """monitor 期間的 trades handler — **08:59:58 就掛上** (見 _start_pre_order_timer),
         9:00:00 開盤撮合 tick 一到就觸發,不等 9:00 轉場建 Trader (轉場要 1~3 秒)。
 
-        1. 今日標的首筆成交 → 瞬間觸發市價追 (session.on_first_trade;
-           冪等旗標在 session 內 — 重複 tick / trader 接手後都不會重複下單)
-        2. 隔日賣標的收到成交 → 觸發隔日賣 (今日活躍標的不觸發,尊重「只賣非今日搶單」)
+        今日標的首筆成交 → 瞬間觸發市價追 (session.on_first_trade;
+        冪等旗標在 session 內 — 重複 tick / trader 接手後都不會重複下單)。
         armed/is_live 閘門都在 session 內,sim/未 armed 完全不動作。"""
         # 試撮 tick 不是真成交 — 集合競價時段 (8:30-9:00) 富邦會推 isTrial=true 的
         # 模擬撮合 tick;誤當首筆成交會在競價時段狂下市價單被拒 (2026-08-10 2491 事故)
@@ -438,12 +456,8 @@ class Runner:
         qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
         lots = qty // 1000 if qty >= 1000 else qty
         self.session.on_first_trade(symbol, lots >= self.cfg.first_trade_min_lots)
-        # 隔日賣觸發 — 該檔今日仍活躍 (有下單且未淘汰未出場) 時不觸發
-        if self.session.has_overnight(symbol):
-            stt = self.session.get_symbol_state(symbol)
-            active_today = bool(stt) and not stt["stopped_reason"] and not stt["exited"]
-            if not active_today:
-                self.session.on_overnight_first_trade(symbol)
+        # (隔日賣不再由成交觸發 — 2026-08-16 改純 book 驅動,見 _monitor_on_book
+        #  → session.update_overnight_book;今日活躍閘門在 session 端)
 
     # ─── 隔日賣標的檔案 (跨日持久化;固定檔名,非日期戳) ───────
 

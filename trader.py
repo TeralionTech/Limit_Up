@@ -113,11 +113,12 @@ class Trader:
 
     def on_book(self, symbol: str, bids: list, asks: list):
         h = self.holdings.get(symbol)
-        # 隔日賣標的: 只要在清單裡就更新委買一/委賣一價 (供 tab 顯示 + 算賣價);
-        # 即使它同時是今日標的 (被今日淘汰後仍要能賣昨天的量)。
+        # 隔日賣標的: 只要在清單裡就轉送 book (顯示+算賣價),賣出規則在 session 端
+        # (純盤面無狀態: 委買一跌下今日漲停 → 賣;市價列在/買牆在 = 鎖著 → 抱)。
+        # 即使它同時是今日標的 (今日出場後仍要能賣昨天的量)。
         if self.session is not None and self.session.has_overnight(symbol):
             self.session.update_overnight_book(
-                symbol, _first_priced(bids), _first_priced(asks))
+                symbol, *_overnight_book_fields(bids, asks))
         if h is None:
             return
 
@@ -240,13 +241,8 @@ class Trader:
         if _pick(trade_data, "isTrial"):
             return
         h = self.holdings.get(symbol)
-        # 隔日賣觸發: 收到成交 → 委買一價賣出。今日標的**活躍中** (WAITING/TRACKING) 時不觸發
-        # (尊重「只賣非今日搶單」原則);h 為 None 或今日已淘汰/撤單 → 由隔日賣接手賣昨天的量。
-        if self.session is not None and self.session.has_overnight(symbol):
-            if h is None or h.status in (Holding.DISCARDED_FIRST, Holding.PULLED):
-                price = float(_pick(trade_data, "price") or 0)
-                if price > 0:
-                    self.session.on_overnight_first_trade(symbol)
+        # (隔日賣不再由成交觸發 — 2026-08-16 改純 book 驅動,規則在
+        #  session.update_overnight_book;今日活躍閘門也在 session 端)
         if h is None:
             return
 
@@ -412,3 +408,15 @@ def _first_priced_level(levels: list) -> tuple:
         if p > 0:
             return p, int(_pick(lv, "size") or 0)
     return 0.0, 0
+
+
+def _overnight_book_fields(bids: list, asks: list) -> tuple:
+    """隔日賣標的的 book 欄位: (bid1, ask1, mkt_bid_size, limit_bid1_price)。
+
+    市價彙總列判斷與 on_book 內當日邏輯同款 (price<=0 的第一列 = 盤中市價單彙總);
+    trader.on_book 與 runner._monitor_on_book 兩個呼叫端共用,避免各算走樣。"""
+    raw_bid1_price = float(_pick(bids[0], "price") or 0) if bids else 0.0
+    raw_bid1_size = int(_pick(bids[0], "size") or 0) if bids else 0
+    mkt_bid_size = raw_bid1_size if (bids and raw_bid1_price <= 0) else 0
+    limit_bid1_price = _first_priced(bids)
+    return limit_bid1_price, _first_priced(asks), mkt_bid_size, limit_bid1_price
