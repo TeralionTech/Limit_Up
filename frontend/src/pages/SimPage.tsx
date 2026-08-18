@@ -100,7 +100,7 @@ export default function SimPage() {
           <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <StatCard label="Watchlist" value={sum.watchlist_total ?? 0} />
             <StatCard label="追蹤" value={sum.n_tracking ?? 0} color="green" />
-            <StatCard label="撤單" value={sum.n_pulled ?? 0} color="red" />
+            <StatCard label="出場" value={sum.n_pulled ?? 0} color="red" />
             <StatCard label="第一盤淘汰" value={sum.n_first_failed ?? 0} color="orange" />
           </section>
 
@@ -272,7 +272,7 @@ function TrackingTr({ row, onAbandon }: { row: TrackingRow; onAbandon: () => voi
           </span>
         ) : row.status === 'pulled' ? (
           <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded" title={row.pulled_reason}>
-            撤單 — {pullLabel(row.pulled_reason)}
+            出場 — {pullLabel(row.pulled_reason)}
           </span>
         ) : (
           <span className="bg-green-100 text-green-700 px-2 py-0.5 rounded">追蹤</span>
@@ -312,9 +312,10 @@ function failLabel(reason: string): string {
 }
 
 
+// 出場原因 (2026-08-19: 只剩支撐隊伍消失;量減半撤單已移除)
 function pullLabel(reason: string): string {
-  if (reason.startsWith('qty_drop_half')) return '委買量 tick 間減半'
-  if (reason.startsWith('price_below_limit')) return '委買一跌下漲停'
+  if (reason === 'mkt_queue_gone') return '市價買隊伍消失'
+  if (reason === 'limit_up_bid_gone') return '漲停價委買消失'
   return reason
 }
 

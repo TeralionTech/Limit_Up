@@ -28,7 +28,7 @@ _HARD_MIN_INTERVAL = 0.02      # order_min_interval (追單失敗退避) 的下�
 # 隔日賣 5 次上限見 _overnight_sell_worker, fd451ce):
 DEFAULT_SELL_MAX_TRIES = 8     # 出場賣: 指數退避 0.2→…→5s;用盡記 CRITICAL + sell_failed 旗標
 
-# 出場 worker 讀到 0 張時「等成交回報」的窗口 — 量減半/出場觸發的同一瞬間可能
+# 出場 worker 讀到 0 張時「等成交回報」的窗口 — 支撐消失觸發出場的同一瞬間可能
 # 剛好成交 (回報比行情 tick 慢 ~百 ms 級);等到就照樣賣掉,沒等到 → exited 回退,
 # 晚到的部位由下一個出場訊號接手 (2026-08-12 使用者確認的競態處理)
 _EXIT_FILL_WAIT_SEC = 3.0
@@ -659,7 +659,7 @@ class TradingSession:
                          name=f"cancel-{symbol}", daemon=True).start()
 
     def cancel_symbol_orders(self, symbol: str, reason: str):
-        """撤該檔 pending 委託 (unmark/首盤淘汰/qty_drop_half 用)。不賣持倉。
+        """撤該檔 pending 委託 (unmark/首盤淘汰/出場 worker 用)。不賣持倉。
         閘門 = _can_manage (非 is_live) — 關 kill switch 後撤單仍要能動。
         ⚠ 同步阻塞 (REST 往返) — 行情 thread 上請用 cancel_symbol_orders_async。"""
         with self._lock:
@@ -781,7 +781,7 @@ class TradingSession:
         with self._lock:
             lots = st.filled_lots
         if lots == 0:
-            # 競態: 觸發出場的同一瞬間可能剛好成交 (量減半常常正是自己的單被吃掉),
+            # 競態: 觸發出場的同一瞬間可能剛好成交 (隊伍消失常常正是自己的單被吃掉),
             # 成交回報比行情 tick 慢 → 等回報最多 _EXIT_FILL_WAIT_SEC 秒,
             # 搶到的部位照樣賣掉 (撤單此時會被券商拒「已成交」— 無妨,部位為準)
             import time as _t
@@ -1372,12 +1372,6 @@ class TradingSession:
             if st is None or st.exited:
                 return False
             return st.filled_lots > 0 or st.order_status == "pending"
-
-    def has_pending(self, symbol: str) -> bool:
-        """該檔有排隊中委託 — trader「排隊中量減半→撤單」判斷用。"""
-        with self._lock:
-            st = self.trades.get(symbol)
-            return st is not None and st.order_status == "pending"
 
     def get_filled_lots(self, symbol: str) -> int:
         """該檔已成交張數 (trader 淘汰時判斷要不要先市價賣掉部位)。"""

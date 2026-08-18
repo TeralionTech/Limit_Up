@@ -129,7 +129,7 @@ export interface TraderSummary {
   trader_active: boolean
   watchlist_total?: number
   n_tracking?: number
-  n_pulled?: number
+  n_pulled?: number        // 已出場 (支撐隊伍消失) 檔數
   n_first_failed?: number
   min_lots?: number
   trading?: TradingStatus | null
@@ -174,8 +174,8 @@ export interface TrackingRow {
   bid1_size: number
   ask1_price: number
   ask1_size: number
-  status: 'tracking' | 'pulled' | 'abandoned'
-  pulled_reason: string
+  status: 'tracking' | 'pulled' | 'abandoned'   // pulled = 出場 (支撐隊伍消失)
+  pulled_reason: string    // mkt_queue_gone / limit_up_bid_gone / manual_abandon
   warning?: string
   last_trade_price: number
   last_book_ts: string

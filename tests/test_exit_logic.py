@@ -1,10 +1,11 @@
-"""撤單/出場邏輯正確性驗證 (2026-08-04 建立;2026-08-12 出場規則改版) — 六組路徑:
+"""撤單/出場邏輯正確性驗證 (2026-08-04 建立;2026-08-12 出場規則改版;
+2026-08-19 量減半撤單移除,出場只看支撐消失) — 六組路徑:
 
-A. 支撐隊伍消失 → 出場 (trader.on_book 端到端;取代舊「委賣出現」訊號)
-   一般股 = 市價買隊伍曾出現後歸零;處置股 = 漲停價買單消失
+A. 支撐隊伍消失 → 出場 (trader.on_book 端到端;唯一出場訊號)
+   一般股 = 市價買隊伍曾出現後歸零;處置股 (名單) = 漲停價買單消失
 B. _exit_worker 內部流程 (撤剩餘→賣持倉、失敗旗標、跌停價限價賣)
 C. 賣出成交記帳
-D. 撤單路徑 (量減半→撤、13:23 全撤、撤失敗兜底)
+D. 撤單路徑 (排隊中支撐消失→撤預掛、13:23 全撤、撤失敗兜底)
 E. close_all 緊急全平 (含未 armed 回歸;查無跌停價 → 市價賣兜底)
 F. 隔日賣出場 (超賣保護、skip;跌停價限價賣,查無 → 委買一價公式兜底)
 
@@ -211,23 +212,43 @@ class TestSellFillAccounting:
 # ═══ D. 撤單路徑 ═══════════════════════════════════════════════════
 
 class TestCancelPaths:
-    def test_qty_drop_pull_cancels_pending(self):
-        # 端到端: TRACKING + 市價列減半 → _pull → async 撤單到 broker
+    def test_queue_halved_no_longer_cancels(self):
+        # 2026-08-19 回歸保護: 市價列腰斬 (1561 → 700) 不再撤單也不出場
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 121.5})
-        s.trades["2330"].first_trade_fired = True     # 擋掉市價追,單測撤單路徑
+        s.trades["2330"].first_trade_fired = True
         t = Trader(watchlist=["2330"], limit_ups={"2330": 121.5},
                    cfg=_cfg(), session=s)
         t.on_book("2330", [{"price": 0.0, "size": 1561}, {"price": 121.5, "size": 800}], [])
-        for _ in range(3):
-            t.on_trade("2330", {"price": 121.5, "size": 50})
+        t.on_trade("2330", {"price": 121.5, "size": 50})
         t.on_book("2330", [{"price": 0.0, "size": 700}, {"price": 121.5, "size": 800}], [])
-        h = t.holdings["2330"]
-        assert h.status == Holding.PULLED
-        assert _wait(lambda: s.broker.cancelled), "撤單 2 秒內沒到 broker"
-        assert s.trades["2330"].order_status == "cancelled"
-        assert s.trades["2330"].stopped_reason.startswith("qty_drop_half")
-        assert s.budget_used == 0                     # 未成交保留全釋放
+        time.sleep(0.3)
+        assert t.holdings["2330"].status == Holding.TRACKING
+        assert s.broker.cancelled == [] and _sells(s.broker) == []
+        assert s.trades["2330"].order_status == "pending"
+
+    def test_queued_preorder_support_gone_cancels_pending(self, monkeypatch):
+        # WAITING (全鎖死無成交,預掛排隊中) + 市價隊伍歸零 → 走 exit_position:
+        # 撤 pending、設 stopped_reason、沒部位不賣;之後首筆成交不再市價追
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.2)
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 121.5})
+        t = Trader(watchlist=["2330"], limit_ups={"2330": 121.5},
+                   cfg=_cfg(), session=s)
+        t.on_book("2330", [{"price": 0.0, "size": 1561}, {"price": 121.5, "size": 800}], [])
+        t.on_book("2330", [{"price": 121.5, "size": 800}], [])         # 隊伍歸零 (無成交)
+        assert _wait(lambda: s.broker.cancelled), "撤預掛單 2 秒內沒到 broker"
+        assert _wait(lambda: s.trades["2330"].order_status == "cancelled")
+        assert s.trades["2330"].stopped_reason == "mkt_queue_gone"
+        assert _wait(lambda: s.trades["2330"].exited is False, timeout=2)   # 沒部位 → 回退
+        assert _sells(s.broker) == []
+        assert s.budget_used == 0
+        assert t.holdings["2330"].status == Holding.WAITING              # 狀態不動 (未通過第一盤)
+        # 之後首筆成交到 → stopped_reason 擋市價追,不會再買
+        t.on_trade("2330", {"price": 121.5, "size": 50})
+        time.sleep(0.3)
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
 
     def test_cancel_all_pending_only_touches_pending(self):
         s = make_session(total=10_000_000)
@@ -250,7 +271,7 @@ class TestCancelPaths:
         def _fail(order_no, symbol, reason=""):
             raise RuntimeError("timeout")
         s.broker.cancel = _fail
-        s.cancel_symbol_orders("2330", "qty_drop_half")
+        s.cancel_symbol_orders("2330", "mkt_queue_gone")
         assert s.trades["2330"].order_status == "pending"    # 沒撤成,狀態保留
         s.broker.cancel = orig
         s.cancel_all_pending("cancel_pending_time")           # 兜底
@@ -290,9 +311,9 @@ class TestCloseAll:
 # ═══ F. 隔日賣出場 ═════════════════════════════════════════════════
 
 class TestPullFillRace:
-    """量減半×剛好成交的競態 (2026-08-12 使用者確認):
-    pull 不再只撤單 — 改走 exit_position (撤+賣);出場 worker 讀到 0 張時
-    等成交回報 (_EXIT_FILL_WAIT_SEC),搶到的部位照樣跌停價賣掉。"""
+    """支撐消失×剛好成交的競態 (2026-08-12 使用者確認):
+    出場走 exit_position (撤+賣);出場 worker 讀到 0 張時等成交回報
+    (_EXIT_FILL_WAIT_SEC),搶到的部位照樣跌停價賣掉。"""
 
     def test_exit_worker_waits_for_late_fill_then_sells(self, monkeypatch):
         import threading
@@ -302,7 +323,7 @@ class TestPullFillRace:
         pre_no = s.trades["2330"].order_no
         # 0.3 秒後成交回報才到 (模擬「撤單瞬間其實已成交」)
         threading.Timer(0.3, lambda: s._on_fill(_fill(pre_no, "2330", 2, LIMIT))).start()
-        s._exit_worker("2330", "qty_drop_half")        # 同步呼叫 — 內含等待窗口
+        s._exit_worker("2330", "mkt_queue_gone")       # 同步呼叫 — 內含等待窗口
         assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed   # 搶到的 2 張賣掉了
         assert s.trades["2330"].exited is True
         kinds = [c[0] for c in s.broker.calls]
@@ -313,7 +334,7 @@ class TestPullFillRace:
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
         s = _session_with_position(lots=0)
         pre_no = s.trades["2330"].order_no
-        s._exit_worker("2330", "qty_drop_half")
+        s._exit_worker("2330", "mkt_queue_gone")
         st = s.trades["2330"]
         assert _sells(s.broker) == []                  # 沒部位 → 不賣
         assert st.exited is False                      # 回退 — 晚到的成交仍有出場保護
@@ -322,21 +343,21 @@ class TestPullFillRace:
         s._exit_worker("2330", "mkt_queue_gone")
         assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
 
-    def test_pull_now_exits_position_end_to_end(self, monkeypatch):
+    def test_support_gone_exits_position_end_to_end(self, monkeypatch):
         import threading
         import trading_session as ts
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.5)
         s = _session_with_position(lots=0)
-        s.trades["2330"].first_trade_fired = True      # 擋市價追,單測 pull 路徑
+        s.trades["2330"].first_trade_fired = True      # 擋市價追,單測出場路徑
         pre_no = s.trades["2330"].order_no
         t = Trader(watchlist=["2330"], limit_ups={"2330": LIMIT}, cfg=_cfg(), session=s)
         t.on_book("2330", [{"price": 0.0, "size": 1561}, {"price": LIMIT, "size": 500}], [])
-        for _ in range(3):
-            t.on_trade("2330", {"price": LIMIT, "size": 50})
-        # 量減半 tick → pull → 背景 exit worker (撤 + 等回報 + 賣)
+        t.on_trade("2330", {"price": LIMIT, "size": 50})
+        # 市價隊伍歸零 tick → 出場 → 背景 exit worker (撤 + 等回報 + 賣)
         threading.Timer(0.3, lambda: s._on_fill(_fill(pre_no, "2330", 2, LIMIT))).start()
-        t.on_book("2330", [{"price": 0.0, "size": 700}, {"price": LIMIT, "size": 500}], [])
+        t.on_book("2330", [{"price": LIMIT, "size": 500}], [])
         assert t.holdings["2330"].status == Holding.PULLED
+        assert t.holdings["2330"].pulled_reason == "mkt_queue_gone"
         assert _wait(lambda: _sells(s.broker), timeout=4), "pull 後搶到的部位沒被賣掉"
         assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
 

@@ -352,7 +352,7 @@ class TestAsyncCancel:
         import time as _t
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        s.cancel_symbol_orders_async("2330", "qty_drop_half_queued")
+        s.cancel_symbol_orders_async("2330", "unmarked")
         deadline = _t.monotonic() + 2.0
         while _t.monotonic() < deadline and not s.broker.cancelled:
             _t.sleep(0.01)

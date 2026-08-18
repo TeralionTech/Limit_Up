@@ -3,8 +3,9 @@ TradingSession(FakeBroker) 走完整天:
 
 案例 1: 8:30 篩選 → 08:59:58 預掛 → 9:00 試撮忽略/首筆成交 → 市價追先出手再撤預掛
         → 成交 → 盤中市價隊伍歸零 → 跌停價賣出 → 部位歸零
-案例 2: 量減半觸發撤單的瞬間「其實已成交、回報晚 0.3 秒才到」→ 等待窗口接住 → 照樣賣掉
-案例 3: 量減半觸發撤單、真的沒成交 → 只撤不賣、exited 回退、預算全釋放
+案例 2: 市價隊伍歸零觸發出場的瞬間「其實已成交、回報晚 0.3 秒才到」→ 等待窗口接住 → 照樣賣掉
+案例 3: 市價隊伍歸零觸發出場、真的沒成交 → 只撤不賣、exited 回退、預算全釋放
+案例 4: 隔日賣標的今日又鎖漲停 → 抱著;委買一跌下漲停 → 跌停價賣 → 收盤不帶明天
 """
 import threading
 import time
@@ -123,9 +124,9 @@ class TestFullLifecycle:
         assert s.trades[A].filled_lots == 0
         assert s.budget_used == 200_000
 
-    def test_race_fill_during_pull(self, monkeypatch):
-        """使用者情境: 量減半觸發撤單,但減半正是自己的單被吃掉 — 回報晚 0.3 秒才到。
-        exit worker 的等待窗口要接住,照樣跌停價賣掉退追蹤。"""
+    def test_race_fill_during_exit(self, monkeypatch):
+        """使用者情境: 市價隊伍歸零觸發出場,但歸零正是自己的單被吃掉 — 回報晚 0.3 秒才到。
+        exit worker 的等待窗口要接住,照樣跌停價賣掉。"""
         import trading_session as ts
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.5)
         s = make_session()
@@ -137,16 +138,15 @@ class TestFullLifecycle:
 
         t = Trader(watchlist=[A], limit_ups=LIMIT_UPS, cfg=_trader_cfg(),
                    state=state, session=s)
-        # 首筆 books (市價隊伍 800) + 3 筆成交 → TRACKING、暖機完成
+        # 首筆 books (市價隊伍 800) + 首筆成交 → TRACKING
         t.on_book(A, [{"price": 0.0, "size": 800}, {"price": 100.0, "size": 500}], [])
-        for _ in range(3):
-            t.on_trade(A, {"price": 100.0, "size": 50000})
+        t.on_trade(A, {"price": 100.0, "size": 50000})
         assert t.holdings[A].status == Holding.TRACKING
 
-        # 成交回報 0.3 秒後才到 (模擬「撤單瞬間其實已成交」)
+        # 成交回報 0.3 秒後才到 (模擬「出場瞬間其實已成交」)
         threading.Timer(0.3, lambda: s._on_fill(_fill(pre_no, A, 2, 100.0))).start()
-        # 量減半 tick (800 → 300) → pull → exit worker: 撤單 + 等回報 + 賣
-        t.on_book(A, [{"price": 0.0, "size": 300}, {"price": 100.0, "size": 500}], [])
+        # 市價隊伍歸零 tick → 出場 → exit worker: 撤單 + 等回報 + 賣
+        t.on_book(A, [{"price": 100.0, "size": 500}], [])
         assert t.holdings[A].status == Holding.PULLED
         assert _wait(lambda: ("limit_sell", A, DOWN_A, 2) in s.broker.placed), \
             "搶到的 2 張部位沒有被賣掉 (競態沒接住)"
@@ -154,8 +154,8 @@ class TestFullLifecycle:
         kinds = [c[0] for c in s.broker.calls]
         assert kinds.index("cancel") < kinds.index("limit_sell")   # 先撤 (被拒也無妨) 後賣
 
-    def test_pull_no_fill_cancel_only(self, monkeypatch):
-        """量減半但真的沒成交 → 只撤單不賣、exited 回退 (晚到部位仍有保護)、預算全釋放。"""
+    def test_exit_no_fill_cancel_only(self, monkeypatch):
+        """市價隊伍歸零但真的沒成交 → 只撤單不賣、exited 回退 (晚到部位仍有保護)、預算全釋放。"""
         import trading_session as ts
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
         s = make_session()
@@ -167,9 +167,8 @@ class TestFullLifecycle:
         t = Trader(watchlist=[A], limit_ups=LIMIT_UPS, cfg=_trader_cfg(),
                    state=state, session=s)
         t.on_book(A, [{"price": 0.0, "size": 800}, {"price": 100.0, "size": 500}], [])
-        for _ in range(3):
-            t.on_trade(A, {"price": 100.0, "size": 50000})
-        t.on_book(A, [{"price": 0.0, "size": 300}, {"price": 100.0, "size": 500}], [])
+        t.on_trade(A, {"price": 100.0, "size": 50000})
+        t.on_book(A, [{"price": 100.0, "size": 500}], [])          # 市價隊伍歸零
         assert _wait(lambda: s.broker.cancelled), "撤單沒到 broker"
         assert _wait(lambda: s.trades[A].exited is False, timeout=2), "exited 沒回退"
         assert _sells(s.broker) == []                        # 沒部位 → 不賣

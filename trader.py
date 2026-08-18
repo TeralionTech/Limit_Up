@@ -10,15 +10,15 @@
 
   盤中追蹤 (block 2) — 通過第一盤的標的:
     - 顯示 委買一價 / 委買一量
-    - 狀態 "追蹤" → "撤單" 條件 (單一):
-        委買一量在兩個 tick 之間減少 1/2 以上 (第 3 筆成交後才開始判)
-      (原「委買一價格不是漲停價」條件已移除 — 盤中市價單佔五檔第一列且 price=0 會誤判)
-      [real] 撤單同步撤掉該檔 pending 委託
-    - [real] 支撐隊伍消失 → 立刻出場 (2026-08-12: 一般股=市價買隊伍歸零、
-      處置股=漲停價買單消失;撤委託 + **跌停價限價賣**全部已成交)
+    - 出場 (唯一動作,2026-08-19 定案;「委買量 tick 間減半 → 撤單」已移除 —
+      單子一定會被成交,不用管撤單):
+        支撐隊伍消失 → 立刻出場 — 一般股 = 市價買隊伍曾出現後歸零;
+        處置股 (名單分流,禁市價單) = 漲停價買單消失
+        [real] 撤委託 + **跌停價限價賣**全部已成交;狀態標 "出場" (pulled) 供前端顯示
+      (「委買一跌下漲停」條件早已移除 — 盤中市價單佔五檔第一列且 price=0 會誤判)
     - 警示 (不動作): 委買一量每 BID_DECLINE_SAMPLE_SEC 取樣,
       連續 BID_DECLINE_MINUTES 分鐘遞減 → warning 顯示於前端
-    - 撤單後**持續收資料** (不退訂，狀態停在撤單)
+    - 出場後**持續收資料** (不退訂)
 
 session=None (模擬模式) = 純監控,零下單 — 行為與加入交易功能前完全相同。
 """
@@ -53,11 +53,9 @@ class Holding:
         self.first_trade: dict = {}      # {price, qty, lots, ts}
         self.first_fail_reason = ""      # 非空 = 第一盤淘汰原因
         # 盤中追蹤
-        self.pulled_reason = ""
+        self.pulled_reason = ""          # 出場原因 (mkt_queue_gone / limit_up_bid_gone / manual_abandon)
         self.support_seen = False        # 支撐隊伍出現過 (出場訊號「沒有了」的轉移語意)
-        self.trade_count = 0             # 累計成交筆數 (統計/顯示;已不作量減半暖機閘門)
-        self.book_tick_count = 0         # 累計 books tick 數 (統計;已不作暖機閘門)
-        self.prev_bid1_size: Optional[int] = None   # 上一 tick 委買量基準 (一般股=市價列;處置股=限價列)
+        self.trade_count = 0             # 累計成交筆數 (統計)
         # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
         self.warning = ""
         self._sample_ts = 0.0            # 上次取樣時間 (epoch)
@@ -134,7 +132,7 @@ class Trader:
         limit_bid1_price, limit_bid1_size = _first_priced_level(bids)
         # 市價彙總列只會佔第一列 (price=0)
         mkt_bid_size = raw_bid1_size if (bids and raw_bid1_price <= 0) else 0
-        # 注意: 一般股若全程沒有市價排隊,基準恆為 0 → 量減半規則不啟動 (無此保護)
+        # 注意: 一般股若全程沒有市價排隊,基準恆為 0 → 支撐消失規則不 arm (無此保護,定案接受)
         is_disp = bool(self.dispositions.get(symbol))
         bid_basis = limit_bid1_size if is_disp else mkt_bid_size
         # 委賣「任一檔」有量 (市價賣單 price=0 也算真賣單)
@@ -163,12 +161,17 @@ class Trader:
             support_now = mkt_bid_size > 0
         if support_now:
             h.support_seen = True
-        elif (h.support_seen and self.session is not None
-              and self.session.has_exposure(symbol)):
-            self.session.exit_position(
-                symbol, "limit_up_bid_gone" if is_disp else "mkt_queue_gone")
+        elif h.support_seen:
+            reason = "limit_up_bid_gone" if is_disp else "mkt_queue_gone"
+            if h.status == Holding.TRACKING:
+                # 標「出場」狀態 (sim/real 都顯示;冪等 — 之後每 tick 重複進來只是重設同值)
+                h.status = Holding.PULLED
+                h.pulled_reason = reason
+                logger.warning(f"[trader] {symbol} 出場訊號 — {reason}")
+            if self.session is not None and self.session.has_exposure(symbol):
+                self.session.exit_position(symbol, reason)
 
-        # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與量減半規則同) ===
+        # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與支撐規則同) ===
         self._update_decline_warning(h, bid_basis)
 
         # === 第一盤: 開盤第一筆 books ===
@@ -184,38 +187,10 @@ class Trader:
                 self._fail_first(h, f"first_books_ask_appeared ({raw_ask1_price} × {raw_ask1_size})")
                 return
             self._maybe_enter_tracking(h)
-            h.prev_bid1_size = bid_basis
             return
 
-        h.book_tick_count += 1
-
-        # === 盤中追蹤: 撤單條件 (只剩量減半) ===
-        # 註: 原「委買一跌下漲停」條件已移除 — 盤中市價單會佔五檔第一列且 price=0
-        # (例 0.00 × 1561, 漲停價買單在第二列), 拿 bids[0] 價格比會誤判跌下漲停。
-        # 防汙染 (2026-08-18 拿掉「第 3 筆成交後才判」暖機): 基準恆為**同性質**的量
-        # (一般股=市價列, 處置股=限價列),且 prev=0 不比 — 集合競價快照 (無市價列, 基準 0)
-        # → 首筆市價列出現時天然不比,原 7/15 那種「盤前累積量 vs 盤中即時量」硬比
-        # 誤撤已不可能發生;暖機只剩延遲反應副作用 (4304 實例: 572→84 真腰斬因只 1 筆
-        # 成交而放過),故首筆成交後即判。
-        qty_halved = bool(h.prev_bid1_size) and bid_basis < h.prev_bid1_size * 0.5
-        if h.status == Holding.TRACKING:
-            # 委買量基準 (一般股=市價列;處置股=限價列) 在兩 tick 之間減少 1/2 以上
-            if qty_halved:
-                self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid_basis})")
-        elif (h.status == Holding.WAITING and qty_halved
-              and self.session is not None and self.session.has_pending(symbol)):
-            # [real] 全鎖死無成交股 (WAITING, 沒有首筆成交) 排隊中的預掛單也要受
-            # 「量減半→撤單」保護 (規格 #3 主場景)。同樣不暖機 (prev=0 不比已足夠)。
-            # 只撤委託、Holding 狀態不動 (監控續跑)。
-            logger.warning(f"[trader] {symbol} 排隊中量減半 "
-                           f"({h.prev_bid1_size} → {bid_basis}) → 撤預掛單")
-            try:
-                # async — 這裡在行情 thread 上,同步撤單會卡同 socket 其他股票的 tick
-                self.session.cancel_symbol_orders_async(symbol, "qty_drop_half_queued")
-            except Exception as e:
-                logger.error(f"[trader] {symbol} 撤排隊委託失敗: {e}")
-
-        h.prev_bid1_size = bid_basis
+        # (原「委買量 tick 間減半 → 撤單/出場」規則已於 2026-08-19 移除:
+        #  出場只看上面的支撐隊伍消失;單子一定會被成交,不需撤單保護)
 
     def _update_decline_warning(self, h: Holding, bid1_size: int):
         """每 BID_DECLINE_SAMPLE_SEC 取樣一次委買一量;
@@ -324,19 +299,6 @@ class Trader:
                 logger.warning(f"[trader] 退訂 {h.symbol} 失敗: {e}")
         logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}"
                        f"{' (持倉→市價出場,不退訂)' if has_position else ''}")
-
-    def _pull(self, h: Holding, reason: str):
-        """盤中撤單 — 標狀態 + [real] 撤 pending **並賣出已成交部位** (2026-08-12 定案:
-        量減半常常正是自己的單被吃掉 — 撤單被券商拒「已成交」時部位要照樣出掉)。
-        exit_position 背景 thread 內含「等成交回報」競態窗口。持續收資料 (不退訂)。"""
-        h.status = Holding.PULLED
-        h.pulled_reason = reason
-        if self.session is not None:
-            try:
-                self.session.exit_position(h.symbol, reason)
-            except Exception as e:
-                logger.error(f"[trader] {h.symbol} 撤單/出場失敗: {e}")
-        logger.warning(f"[trader] {h.symbol} 撤單 — {reason}")
 
     # ─── summary (API / 前端兩區塊) ────────────────────────
 
