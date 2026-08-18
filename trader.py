@@ -55,8 +55,8 @@ class Holding:
         # 盤中追蹤
         self.pulled_reason = ""
         self.support_seen = False        # 支撐隊伍出現過 (出場訊號「沒有了」的轉移語意)
-        self.trade_count = 0             # 累計成交筆數 (委買量減半檢查暖機用: 第 3 筆成交後才判)
-        self.book_tick_count = 0         # 累計 books tick 數 (排隊中量減半檢查的暖機: >=3)
+        self.trade_count = 0             # 累計成交筆數 (統計/顯示;已不作量減半暖機閘門)
+        self.book_tick_count = 0         # 累計 books tick 數 (統計;已不作暖機閘門)
         self.prev_bid1_size: Optional[int] = None   # 上一 tick 委買量基準 (一般股=市價列;處置股=限價列)
         # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
         self.warning = ""
@@ -192,17 +192,20 @@ class Trader:
         # === 盤中追蹤: 撤單條件 (只剩量減半) ===
         # 註: 原「委買一跌下漲停」條件已移除 — 盤中市價單會佔五檔第一列且 price=0
         # (例 0.00 × 1561, 漲停價買單在第二列), 拿 bids[0] 價格比會誤判跌下漲停。
+        # 防汙染 (2026-08-18 拿掉「第 3 筆成交後才判」暖機): 基準恆為**同性質**的量
+        # (一般股=市價列, 處置股=限價列),且 prev=0 不比 — 集合競價快照 (無市價列, 基準 0)
+        # → 首筆市價列出現時天然不比,原 7/15 那種「盤前累積量 vs 盤中即時量」硬比
+        # 誤撤已不可能發生;暖機只剩延遲反應副作用 (4304 實例: 572→84 真腰斬因只 1 筆
+        # 成交而放過),故首筆成交後即判。
         qty_halved = bool(h.prev_bid1_size) and bid_basis < h.prev_bid1_size * 0.5
         if h.status == Holding.TRACKING:
             # 委買量基準 (一般股=市價列;處置股=限價列) 在兩 tick 之間減少 1/2 以上
-            #   暖機: 第 3 筆成交後才判 — 避免開盤瞬間拿「盤前累積量」當基準造成誤撤。
-            #   (prev_bid1_size 每 tick 都更新，到第 3 筆成交時基準已是盤後即時量)
-            if h.trade_count >= 3 and qty_halved:
+            if qty_halved:
                 self._pull(h, f"qty_drop_half ({h.prev_bid1_size} → {bid_basis})")
-        elif (h.status == Holding.WAITING and qty_halved and h.book_tick_count >= 3
+        elif (h.status == Holding.WAITING and qty_halved
               and self.session is not None and self.session.has_pending(symbol)):
             # [real] 全鎖死無成交股 (WAITING, 沒有首筆成交) 排隊中的預掛單也要受
-            # 「量減半→撤單」保護 (規格 #3 主場景)。暖機改用 book tick 數 (≥3)。
+            # 「量減半→撤單」保護 (規格 #3 主場景)。同樣不暖機 (prev=0 不比已足夠)。
             # 只撤委託、Holding 狀態不動 (監控續跑)。
             logger.warning(f"[trader] {symbol} 排隊中量減半 "
                            f"({h.prev_bid1_size} → {bid_basis}) → 撤預掛單")
@@ -251,7 +254,7 @@ class Trader:
         if price <= 0:
             return
         h.last_trade_price = price
-        h.trade_count += 1               # 累計每一筆成交 (委買量減半檢查暖機用)
+        h.trade_count += 1               # 累計每一筆成交 (統計用)
 
         # === 第一盤: 開盤第一筆成交 ===
         if not h.first_trade_seen:

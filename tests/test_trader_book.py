@@ -23,7 +23,7 @@ LIMIT_ONLY = [{"price": 121.5, "size": 800}]                                # �
 
 
 def _enter_tracking(t, symbol="2330", first_books=MKT_QUEUED, trades=3):
-    """首筆 books + N 筆成交 → TRACKING、暖機完成。"""
+    """首筆 books + N 筆成交 → TRACKING (量減半規則首筆成交後即判,無暖機)。"""
     t.on_book(symbol, first_books, [])
     for _ in range(trades):
         t.on_trade(symbol, {"price": 121.5, "size": 50})   # 50 張 >= 門檻 10
@@ -82,14 +82,27 @@ class TestQtyRuleMarketOnly:
         t.on_book("2330", [{"price": 0.0, "size": 700}, {"price": 121.5, "size": 800}], [])
         assert h.status == Holding.PULLED                  # 700 < 1561×0.5
 
-    def test_warmup_prevents_early_pull(self):
-        # 未滿 3 筆成交 → 同樣盤面不撤 (開盤瞬間基準未穩)
+    def test_no_warmup_pulls_after_first_trade(self):
+        # 2026-08-18: 暖機拿掉 — 首筆成交後市價列腰斬就撤 (4304 實例 572→84 不能放過)
         t = _mk_trader()
-        _enter_tracking(t, trades=2)
+        _enter_tracking(t, trades=1)
         h = t.holdings["2330"]
-        t.on_book("2330", LIMIT_ONLY, [])
-        assert h.status == Holding.TRACKING
-        assert h.prev_bid1_size == 0                       # 基準已更新 (市價列消失)
+        t.on_book("2330", LIMIT_ONLY, [])                  # 市價列 1561 → 0
+        assert h.status == Holding.PULLED
+        assert h.pulled_reason.startswith("qty_drop_half")
+
+    def test_auction_snapshot_to_first_market_row_no_false_pull(self):
+        # 舊汙染場景回歸保護 (7/15 誤撤成因): 首筆 books 是集合競價快照 (無市價列,
+        # 基準 0) → 首筆市價列出現 → prev=0 不比 → 不撤;之後才是同性質比較
+        t = _mk_trader()
+        _enter_tracking(t, first_books=LIMIT_ONLY, trades=1)
+        h = t.holdings["2330"]
+        t.on_book("2330", [{"price": 0.0, "size": 15}, {"price": 121.5, "size": 800}], [])
+        assert h.status == Holding.TRACKING                # 0 → 15: 不比
+        t.on_book("2330", [{"price": 0.0, "size": 20}, {"price": 121.5, "size": 800}], [])
+        assert h.status == Holding.TRACKING                # 15 → 20: 增加
+        t.on_book("2330", [{"price": 0.0, "size": 5}, {"price": 121.5, "size": 800}], [])
+        assert h.status == Holding.PULLED                  # 20 → 5: 腰斬 → 撤
 
     def test_no_market_queue_rule_inert(self):
         # 一般股全程沒有市價排隊 → 基準恆 0 → 規則不啟動 (定案接受: 無此保護)
