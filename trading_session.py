@@ -33,10 +33,12 @@ DEFAULT_SELL_MAX_TRIES = 8     # 出場賣: 指數退避 0.2→…→5s;用盡�
 # 晚到的部位由下一個出場訊號接手 (2026-08-12 使用者確認的競態處理)
 _EXIT_FILL_WAIT_SEC = 3.0
 
-# 致命拒因關鍵字 — 拒單訊息含這些字 = 該檔今日 API 下單必不成功 (全額交割/
-# 處置股預收圈存),重試無意義 → 第一筆被拒就停止該檔
-# (2026-08-13 6225 事故「全額處置股,預收或圈存不足」: T30 名單漏抓時的第二層保險)
-_FATAL_REJECT_KEYWORDS = ("全額", "預收", "圈存")
+# 停止拒因關鍵字 — 拒單訊息含這些字 = 重試無意義,第一筆被拒就停止該檔:
+#   全額/預收/圈存: 全額交割/處置股,API 下單今日必不成功 (2026-08-13 6225 事故,
+#                   T30 名單漏抓時的第二層保險)
+#   價格穩定: 「證券委託觸及價格穩定措施上、下限價格」— 瞬間價格穩定措施冷卻期內市價單
+#             必被拒,重試只會狂送 (2026-08-21 6144 事故: 26 秒狂送 100 筆)
+_FATAL_REJECT_KEYWORDS = ("全額", "預收", "圈存", "價格穩定")
 
 
 def _is_fatal_reject(err) -> bool:
@@ -623,12 +625,13 @@ class TradingSession:
                     break
                 except Exception as e:
                     if _is_fatal_reject(e):
-                        # 致命拒因 — 第一筆被拒就停,不再狂送 (2026-08-13 6225 事故)
+                        # 停止拒因 — 第一筆被拒就停,不再狂送 (全額交割 6225 / 價格穩定 6144)。
+                        # 成因見拒單訊息 {e} (全額交割→查 T30 名單;價格穩定→冷卻期市價單必拒)。
                         with self._lock:
                             st.stopped_reason = "fatal_reject"
                         abort_reason = "fatal_reject"
-                        logger.critical(f"[session] ⚠ {symbol} 市價追致命拒因 → 立即放棄"
-                                        f"此檔 (T30 名單可能漏抓,請檢查): {e}")
+                        logger.critical(f"[session] ⚠ {symbol} 市價追遇停止拒因 → 立即放棄"
+                                        f"此檔: {e}")
                         break
                     # log 防洪: 前 5 次全印,之後每 50 次一次 (無上限重試最壞 5 log/s/檔)
                     if attempt <= 5 or attempt % 50 == 0:
@@ -689,7 +692,8 @@ class TradingSession:
             logger.critical(f"[session] ⚠ {symbol} 撤單失敗 — 委託可能仍掛在券商端: {e}")
 
     def exit_position(self, symbol: str, reason: str):
-        """出場: 撤 pending + **跌停價限價賣**出全部已成交。(背景 thread)
+        """出場: **跌停價限價賣**出全部已成交 (限價預掛 pending 先撤;市價買單 pending
+        視為已成交不撤,直接賣)。(背景 thread)
         閘門 = _can_manage (非 is_live) — 關 kill switch / WS 不健康時出場仍要能動。
         使用者「取消追蹤」(manual_abandon) 的檔 → 一切自動化停止,不出場 (自負)。"""
         with self._lock:
@@ -777,7 +781,19 @@ class TradingSession:
             if st is None or st.exited:
                 return
             st.exited = True            # 先標,防重複觸發
-        self.cancel_symbol_orders(symbol, reason)
+            mkt_pending = (st.order_kind == "market_buy"
+                           and st.order_status == "pending")
+        if mkt_pending:
+            # 2026-08-19 定案: 本地還 pending 的是**市價買單** → 市價隊伍歸零時它必已
+            # 成交 (我們就排在那個隊伍裡),只是成交回報還沒到 — 撤單只會被券商拒
+            # 「已成交」+ 多一次 REST 往返拖慢賣出 → 直接賣。stopped_reason 照撤單語意
+            # 補上 (擋後續進場)。限價預掛 (pre_limit) 不適用: 漲停一破它會變最高買價
+            # 被砸成交 (買在最高點),仍要先撤。
+            with self._lock:
+                st.stopped_reason = st.stopped_reason or reason
+            logger.info(f"[session] {symbol} 出場: 市價買單視為已成交,略過撤單直接賣 ({reason})")
+        else:
+            self.cancel_symbol_orders(symbol, reason)
         with self._lock:
             lots = st.filled_lots
         if lots == 0:

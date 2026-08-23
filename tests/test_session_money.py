@@ -394,6 +394,23 @@ class TestFatalReject:
         assert s.trades["6225"].stopped_reason == "fatal_reject"
         assert s.budget_used == 0                        # 保留全釋放
 
+    # 2026-08-21 6144 事故: 「價格穩定措施」拒單原本不在停止清單 → 26 秒狂送 100 筆
+    PRICE_STABLE_MSG = "證券委託觸及價格穩定措施上、下限價格"
+
+    def test_chase_stops_after_price_stable_reject(self):
+        s = make_session()
+        s.place_pre_orders(["6144"], {"6144": 14.65})
+        calls = {"n": 0}
+
+        def _reject(symbol, lots):
+            calls["n"] += 1
+            raise RuntimeError(self.PRICE_STABLE_MSG)
+        s.broker.place_market_buy = _reject
+        s._first_trade_worker("6144", True)
+        assert calls["n"] == 1                            # 只送 1 筆就停 (原本狂送 100 筆)
+        assert s.trades["6144"].stopped_reason == "fatal_reject"
+        assert s.budget_used == 0                         # 保留全釋放
+
     def test_non_fatal_reject_keeps_retrying(self):
         # 對照組: 非致命拒因照舊「試到成功為止」
         s = make_session()
