@@ -776,48 +776,27 @@ class TradingSession:
         return False    # 重試用盡
 
     def _exit_worker(self, symbol: str, reason: str):
+        # 出場統一流程 (2026-08-24 定案,取代 skip-cancel):
+        #   1. 標「要賣」+ 能撤的就撤 (市價/限價一律試撤;已成交 → 券商拒「已成交」,無妨)
+        #   2. 有掛過單就等成交回報落地收斂 (撤單前已成交/正在成交的都等它到)
+        #   3. **依成交回報張數賣**,filled_lots 由 _on_fill 逐單封頂 → 絕不超過下單量、不超賣
+        # 這樣「預掛部分成交 X + 市價追 shortfall 晚落地」不會只賣 X 漏掉 shortfall (2026-08-23 HIGH)。
         import time as _t
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or st.exited:
                 return
-            st.exited = True            # 先標,防重複觸發
-            mkt_pending = (st.order_kind == "market_buy"
-                           and st.order_status == "pending")
-        if mkt_pending:
-            # 本地還 pending 的是**市價買單**: mkt_queue_gone 多半是它正在成交,但成交回報
-            # 可能還沒到。不立刻撤 (省一次 REST + 撤已成交必被拒),但**必須等回報收斂再賣**——
-            # 否則「預掛部分成交 X 張 + 市價追 shortfall 晚落地」會只賣掉 X、剩 shortfall
-            # 被 exited=True 鎖住漏賣,躲過當日出場/13:23撤單/隔日賣全部防護網 (2026-08-23 審查 HIGH)。
-            # 等 order_status 轉非 pending (滿量 → done) 或 deadline;deadline 到仍 pending
-            # → 撤掉未成交殘量 (堵晚成交製造的新曝險,問題 2)。stopped_reason 照撤單語意補上。
-            with self._lock:
-                st.stopped_reason = st.stopped_reason or reason
-            logger.info(f"[session] {symbol} 出場: 市價買單 pending → 等成交收斂再賣 ({reason})")
-            deadline = _t.monotonic() + _EXIT_FILL_WAIT_SEC
-            while _t.monotonic() < deadline:
-                with self._lock:
-                    if st.order_status != "pending":
-                        break
-                _t.sleep(0.1)
-            with self._lock:
-                still_pending = (st.order_status == "pending")
-            if still_pending:
-                # 未成交殘量撤掉;已成交部分留在 filled_lots 照賣
-                self.cancel_symbol_orders(symbol, reason)
-        else:
-            self.cancel_symbol_orders(symbol, reason)
-            with self._lock:
-                lots0 = st.filled_lots
-            if lots0 == 0:
-                # 競態: 撤 pre_limit 的同一瞬間可能剛好成交 (隊伍消失常常正是自己的單被吃掉),
-                # 成交回報比行情 tick 慢 → 等回報最多 _EXIT_FILL_WAIT_SEC 秒再賣 (2026-08-05 3587)
-                deadline = _t.monotonic() + _EXIT_FILL_WAIT_SEC
-                while _t.monotonic() < deadline:
-                    _t.sleep(0.1)
-                    with self._lock:
-                        if st.filled_lots > 0:
-                            break
+            st.exited = True            # 先標「要賣」,防重複觸發
+            st.stopped_reason = st.stopped_reason or reason
+            had_pending = bool(st.order_no) and st.order_status == "pending"
+        if had_pending:
+            self.cancel_symbol_orders(symbol, reason)     # 能撤就撤 (已成交→券商拒,無妨)
+            # 撤單前已成交/正在成交的 → **固定等滿窗口讓在途成交回報全部落地**再賣。
+            # 不提早 break: overbuy 時 (預掛+市價都成交) filled 分兩批落地,任何提早收斂
+            # 判斷都可能漏掉第二批 → 又變成 exited 鎖住漏賣。回報比 tick 慢僅百 ms 級,
+            # 窗口 (_EXIT_FILL_WAIT_SEC) 綽綽有餘。只有「出場當下還有 pending 單」才等
+            # (一般出場時進場單早已 done → had_pending False → 不等,快)。
+            _t.sleep(_EXIT_FILL_WAIT_SEC)
         with self._lock:
             lots = st.filled_lots
         if lots > 0:
@@ -858,18 +837,26 @@ class TradingSession:
         if not self._broker_ready():
             raise RuntimeError("券商未連線")
         with self._lock:
-            snapshot = [(s, st.filled_lots) for s, st in self.trades.items()]
+            # 略過已在出場中的檔 (exited=True) — 否則與自動出場並行會把同一批
+            # filled_lots 賣第二次超賣 (2026-08-24 審查 LOW)
+            snapshot = [(s, st.filled_lots) for s, st in self.trades.items()
+                        if not st.exited]
         for sym, _ in snapshot:
             self.cancel_symbol_orders(sym, "close_all")
         sold = 0
         for sym, lots in snapshot:
             if lots > 0:
                 st = self.trades[sym]
+                with self._lock:
+                    if st.exited:      # 兩次 snapshot 之間被自動出場搶先 → 跳過
+                        continue
+                    st.exited = True   # 先佔位,防自動出場並行重複賣
                 # 緊急全平從 API thread 呼叫 → 限 3 次,避免卡死請求
                 if self._sell_position(sym, st, lots, "close_all", max_tries=3):
-                    with self._lock:
-                        st.exited = True
                     sold += 1
+                else:
+                    with self._lock:   # 賣不成 → 回退,交回自動出場/人工
+                        st.exited = False
         logger.warning(f"[session] 🚨 緊急全平: 賣出 {sold} 檔 (處置股用委買一價限價)")
         return sold
 
@@ -1337,7 +1324,13 @@ class TradingSession:
                 # 保留轉消耗 (預算不變式;晚到的 fill 若保留已被釋放,floor 0 保底)
                 st.budget_reserved = max(
                     0.0, st.budget_reserved - lots * st.limit_up * 1000)
-                if st.filled_lots >= st.target_lots:
+                # 達 target 才清 order_no/標 done — 但**必須是 st 現在追的那張單**成交才清
+                # (守衛同 reconcile_orders): 進場 race 可能同時有預掛 P + 市價追 M 兩張 live,
+                # st.order_no 已被 _first_trade_worker 蓋成 M;若 P 的成交補到 target 就清掉,
+                # 會把還 live 的 M 追蹤清空 → 出場 had_pending 誤判 False → M 晚成交漏賣被
+                # exited 鎖死 (2026-08-24 審查 HIGH)。P 成交時 order_no 是 M 不相符 → 不清,
+                # 續為 pending → 出場照撤 M + 等窗口 + 賣全量;13:23 cancel_all 也看得到 M。
+                if st.filled_lots >= st.target_lots and st.order_no == fill["order_no"]:
                     st.order_status = "done"
                     st.order_no = ""
             else:   # sell (出場)

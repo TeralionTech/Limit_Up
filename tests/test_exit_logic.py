@@ -129,8 +129,10 @@ class TestSupportGoneExit:
 # ═══ B. _exit_worker 內部流程 (直呼,確定性) ═══════════════════════
 
 class TestExitWorker:
-    def test_cancel_remainder_then_sell_filled(self):
+    def test_cancel_remainder_then_sell_filled(self, monkeypatch):
         # 部分成交 1/2: 先撤剩餘 (釋放預算) → 再跌停價限價賣已成交 1 張
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.2)   # 有 pending → 等窗口,縮短測試
         s = make_session(per_symbol=300_000)          # target 2 張,成交 1 → 剩餘 pending
         s.set_limit_downs({"2330": DOWN})
         s.place_pre_orders(["2330"], {"2330": LIMIT})
@@ -190,18 +192,18 @@ class TestExitWorker:
         return s
 
     def test_mkt_converged_sells_full_no_cancel(self):
-        # 快路徑: 市價單已滿量成交 (order_status=done) → 不撤、直接賣全量 (速度不變)
+        # 已滿量成交 (order_status=done, order_no 已清) → 無 pending 可撤 → 直接賣全量
         s = self._session_with_pending_market_buy(filled=2)  # 2/2 → done
         st = s.trades["2330"]
         assert st.order_status == "done"
         s._exit_worker("2330", "mkt_queue_gone")
-        assert s.broker.cancelled == []                      # 收斂 → 不撤
+        assert s.broker.cancelled == []                      # 無 pending → 沒得撤
         assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
         assert st.exited is True
 
     def test_mkt_partial_prefill_late_fill_sells_target(self, monkeypatch):
         # ⭐ 問題 1 (HIGH) 回歸: 已成交 1 張、市價追剩 1 張晚 0.3s 才落地 →
-        # 必須等收斂到 2 張再賣 2 (舊 bug 只賣 1、剩 1 被 exited 鎖住漏賣)
+        # 撤單 + 等回報收斂到 2 張再賣 2 (舊 bug 只賣 1、剩 1 被 exited 鎖住漏賣)
         import threading
         import trading_session as ts
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.5)
@@ -211,7 +213,7 @@ class TestExitWorker:
             _fill(no, "2330", 1, LIMIT, filled_no="F6"))).start()   # 補到 2/2 → done
         s._exit_worker("2330", "mkt_queue_gone")
         assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed   # 賣 2 張,非 1
-        assert s.broker.cancelled == []                             # 收斂了 → 不撤
+        assert s.broker.cancelled != []                            # 一律試撤
         assert s.trades["2330"].filled_lots == 2
         assert s.trades["2330"].exited is True
 
@@ -235,8 +237,50 @@ class TestExitWorker:
         assert ("limit_sell", "2330", DOWN, 1) in s.broker.placed
         assert s.trades["2330"].exited is True
 
-    def test_pending_pre_limit_still_cancelled_first(self):
+    def test_prefill_to_target_while_market_pending_exits_all(self, monkeypatch):
+        # ⭐ 問題 1 (HIGH) 根因回歸 (_on_fill 守衛): 預掛 P 的成交補到 target 時,市價追 M 仍 live
+        # → order_no 不可被 P 清掉 (否則 had_pending 誤判 False → M 晚成交漏賣鎖死)
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
+        s = _session_with_position(lots=0)                   # 預掛 P 2 張 pending, target 2
+        pre_no = s.trades["2330"].order_no
+        s.on_first_trade("2330", passed_first_check=True)    # 市價追 (filled 還 0 → M 送 2)
+        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy"), "市價追沒出手"
+        m_no = s.trades["2330"].order_no
+        assert m_no != pre_no
+        s.broker.cancelled.clear()                           # 清掉 chase tail 撤 P 的記錄
+        # 預掛 P 的成交這時才落地,一次補到 target 2 張
+        s._on_fill(_fill(pre_no, "2330", 2, LIMIT, filled_no="FP"))
+        assert s.trades["2330"].order_no == m_no             # 守衛: P 成交沒清掉 M 的追蹤
+        assert s.trades["2330"].order_status == "pending"
+        assert s.trades["2330"].filled_lots == 2
+        s._exit_worker("2330", "mkt_queue_gone")             # had_pending True → 撤 M + 賣全量
+        assert any(c[0] == m_no for c in s.broker.cancelled), "M 沒被撤"
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
+        assert s.trades["2330"].exited is True
+
+    def test_prefill_target_plus_market_overbuy_sells_all(self, monkeypatch):
+        # overbuy 不漏賣: 預掛 2 + 市價 M 2 都成交 (M 晚落地) → 出場等窗口 → 賣全部 4 張
+        import threading
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.0)
+        s = _session_with_position(lots=0)                   # target 2
+        pre_no = s.trades["2330"].order_no
+        s.on_first_trade("2330", passed_first_check=True)
+        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy")
+        m_no = s.trades["2330"].order_no
+        s.broker.cancelled.clear()
+        s._on_fill(_fill(pre_no, "2330", 2, LIMIT, filled_no="FP"))   # P 補到 2 (order_no 仍 M)
+        threading.Timer(0.3, lambda: s._on_fill(
+            _fill(m_no, "2330", 2, LIMIT, filled_no="FM"))).start()   # M 晚成交 2 → overbuy 4
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert ("limit_sell", "2330", DOWN, 4) in s.broker.placed     # 賣全部 4,不漏
+        assert s.trades["2330"].filled_lots == 4
+
+    def test_pending_pre_limit_still_cancelled_first(self, monkeypatch):
         # 限價預掛 pending (處置股 / 首筆成交前隊伍就歸零) → 漲停破後會被砸成交 → 仍要先撤
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.2)   # 有 pending → 等窗口,縮短測試
         s = _session_with_position(lots=1)                    # 預掛 2 張成交 1,剩 1 pending
         assert s.trades["2330"].order_kind == "pre_limit"
         s._exit_worker("2330", "mkt_queue_gone")
