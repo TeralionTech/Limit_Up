@@ -174,6 +174,77 @@ class TestExitWorker:
         assert ("limit_sell", "2330", DOWN, 1) in s.broker.placed
         assert s.trades["2330"].exited is True
 
+    # ── 市價買單 pending 的出場 (2026-08-19 skip-cancel;2026-08-23 審查修正: 等收斂再賣) ──
+    def _session_with_pending_market_buy(self, filled=0):
+        """預掛 2 張 → 首筆成交 → 市價追 (真路徑): 預掛被撤、市價買 pending;filled 張已回報。
+        target=2 (per_symbol 300k ÷ 121.5k)。filled<2 → order_status 維持 pending。"""
+        s = _session_with_position(lots=0)
+        s.on_first_trade("2330", passed_first_check=True)
+        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy"), "市價追沒出手"
+        assert _wait(lambda: s.broker.cancelled), "預掛沒被撤"
+        st = s.trades["2330"]
+        assert st.order_status == "pending"
+        if filled:
+            s._on_fill(_fill(st.order_no, "2330", filled, LIMIT, filled_no="F5"))
+        s.broker.cancelled.clear()      # 只看出場路徑的撤單
+        return s
+
+    def test_mkt_converged_sells_full_no_cancel(self):
+        # 快路徑: 市價單已滿量成交 (order_status=done) → 不撤、直接賣全量 (速度不變)
+        s = self._session_with_pending_market_buy(filled=2)  # 2/2 → done
+        st = s.trades["2330"]
+        assert st.order_status == "done"
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert s.broker.cancelled == []                      # 收斂 → 不撤
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed
+        assert st.exited is True
+
+    def test_mkt_partial_prefill_late_fill_sells_target(self, monkeypatch):
+        # ⭐ 問題 1 (HIGH) 回歸: 已成交 1 張、市價追剩 1 張晚 0.3s 才落地 →
+        # 必須等收斂到 2 張再賣 2 (舊 bug 只賣 1、剩 1 被 exited 鎖住漏賣)
+        import threading
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.5)
+        s = self._session_with_pending_market_buy(filled=1)  # 1/2 → pending
+        no = s.trades["2330"].order_no
+        threading.Timer(0.3, lambda: s._on_fill(
+            _fill(no, "2330", 1, LIMIT, filled_no="F6"))).start()   # 補到 2/2 → done
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert ("limit_sell", "2330", DOWN, 2) in s.broker.placed   # 賣 2 張,非 1
+        assert s.broker.cancelled == []                             # 收斂了 → 不撤
+        assert s.trades["2330"].filled_lots == 2
+        assert s.trades["2330"].exited is True
+
+    def test_mkt_never_fills_cancels_and_rolls_back(self, monkeypatch):
+        # ⭐ 問題 2 (MED) 回歸: 市價單完全沒成交 → deadline 撤掉那張 live 單 → exited 回退
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
+        s = self._session_with_pending_market_buy(filled=0)
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert _wait(lambda: s.broker.cancelled), "未成交的市價單沒被撤"
+        assert _sells(s.broker) == []                        # 無部位 → 不賣
+        assert s.trades["2330"].exited is False              # 回退 (晚到成交仍有出場保護)
+
+    def test_mkt_stall_partial_cancels_remainder_sells_partial(self, monkeypatch):
+        # 市價單只部分成交 1/2 後卡住不動 → deadline 撤未成交殘量 → 賣已成交的 1 張
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
+        s = self._session_with_pending_market_buy(filled=1)  # 1/2 → pending,無後續
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert _wait(lambda: s.broker.cancelled), "殘量沒被撤"
+        assert ("limit_sell", "2330", DOWN, 1) in s.broker.placed
+        assert s.trades["2330"].exited is True
+
+    def test_pending_pre_limit_still_cancelled_first(self):
+        # 限價預掛 pending (處置股 / 首筆成交前隊伍就歸零) → 漲停破後會被砸成交 → 仍要先撤
+        s = _session_with_position(lots=1)                    # 預掛 2 張成交 1,剩 1 pending
+        assert s.trades["2330"].order_kind == "pre_limit"
+        s._exit_worker("2330", "mkt_queue_gone")
+        assert len(s.broker.cancelled) == 1
+        kinds = [c[0] for c in s.broker.calls]
+        assert kinds.index("cancel") < kinds.index("limit_sell")
+        assert ("limit_sell", "2330", DOWN, 1) in s.broker.placed
+
     def test_disposition_sells_at_limit_down_too(self):
         # 處置股: 跌停價**限價**賣完全合法 (處置股只是不能市價) → 與一般股同路徑
         s = _session_with_position(lots=2, disposition=True)

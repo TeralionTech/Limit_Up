@@ -776,6 +776,7 @@ class TradingSession:
         return False    # 重試用盡
 
     def _exit_worker(self, symbol: str, reason: str):
+        import time as _t
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or st.exited:
@@ -784,30 +785,41 @@ class TradingSession:
             mkt_pending = (st.order_kind == "market_buy"
                            and st.order_status == "pending")
         if mkt_pending:
-            # 2026-08-19 定案: 本地還 pending 的是**市價買單** → 市價隊伍歸零時它必已
-            # 成交 (我們就排在那個隊伍裡),只是成交回報還沒到 — 撤單只會被券商拒
-            # 「已成交」+ 多一次 REST 往返拖慢賣出 → 直接賣。stopped_reason 照撤單語意
-            # 補上 (擋後續進場)。限價預掛 (pre_limit) 不適用: 漲停一破它會變最高買價
-            # 被砸成交 (買在最高點),仍要先撤。
+            # 本地還 pending 的是**市價買單**: mkt_queue_gone 多半是它正在成交,但成交回報
+            # 可能還沒到。不立刻撤 (省一次 REST + 撤已成交必被拒),但**必須等回報收斂再賣**——
+            # 否則「預掛部分成交 X 張 + 市價追 shortfall 晚落地」會只賣掉 X、剩 shortfall
+            # 被 exited=True 鎖住漏賣,躲過當日出場/13:23撤單/隔日賣全部防護網 (2026-08-23 審查 HIGH)。
+            # 等 order_status 轉非 pending (滿量 → done) 或 deadline;deadline 到仍 pending
+            # → 撤掉未成交殘量 (堵晚成交製造的新曝險,問題 2)。stopped_reason 照撤單語意補上。
             with self._lock:
                 st.stopped_reason = st.stopped_reason or reason
-            logger.info(f"[session] {symbol} 出場: 市價買單視為已成交,略過撤單直接賣 ({reason})")
-        else:
-            self.cancel_symbol_orders(symbol, reason)
-        with self._lock:
-            lots = st.filled_lots
-        if lots == 0:
-            # 競態: 觸發出場的同一瞬間可能剛好成交 (隊伍消失常常正是自己的單被吃掉),
-            # 成交回報比行情 tick 慢 → 等回報最多 _EXIT_FILL_WAIT_SEC 秒,
-            # 搶到的部位照樣賣掉 (撤單此時會被券商拒「已成交」— 無妨,部位為準)
-            import time as _t
+            logger.info(f"[session] {symbol} 出場: 市價買單 pending → 等成交收斂再賣 ({reason})")
             deadline = _t.monotonic() + _EXIT_FILL_WAIT_SEC
             while _t.monotonic() < deadline:
-                _t.sleep(0.1)
                 with self._lock:
-                    lots = st.filled_lots
-                if lots > 0:
-                    break
+                    if st.order_status != "pending":
+                        break
+                _t.sleep(0.1)
+            with self._lock:
+                still_pending = (st.order_status == "pending")
+            if still_pending:
+                # 未成交殘量撤掉;已成交部分留在 filled_lots 照賣
+                self.cancel_symbol_orders(symbol, reason)
+        else:
+            self.cancel_symbol_orders(symbol, reason)
+            with self._lock:
+                lots0 = st.filled_lots
+            if lots0 == 0:
+                # 競態: 撤 pre_limit 的同一瞬間可能剛好成交 (隊伍消失常常正是自己的單被吃掉),
+                # 成交回報比行情 tick 慢 → 等回報最多 _EXIT_FILL_WAIT_SEC 秒再賣 (2026-08-05 3587)
+                deadline = _t.monotonic() + _EXIT_FILL_WAIT_SEC
+                while _t.monotonic() < deadline:
+                    _t.sleep(0.1)
+                    with self._lock:
+                        if st.filled_lots > 0:
+                            break
+        with self._lock:
+            lots = st.filled_lots
         if lots > 0:
             if not self._sell_position(symbol, st, lots, reason):
                 with self._lock:
