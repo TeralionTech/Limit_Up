@@ -1,27 +1,40 @@
 import { useEffect, useState } from 'react'
-import { api, FilterProgress, Watchlist } from '../api'
+import { api, FilterProgress, Watchlist, T30Info } from '../api'
 
 export default function FilterPage() {
   const [prog, setProg] = useState<FilterProgress | null>(null)
   const [watch, setWatch] = useState<Watchlist | null>(null)
+  const [t30, setT30] = useState<T30Info | null>(null)
+  const [msg, setMsg] = useState('')
+
+  async function reload() {
+    try {
+      const [p, w, t] = await Promise.all([
+        api.filterProgress(), api.watchlist(), api.t30().catch(() => null),
+      ])
+      setProg(p); setWatch(w); if (t) setT30(t)
+    } catch {
+      // 忽略單次 error
+    }
+  }
 
   useEffect(() => {
-    let cancelled = false
-    const tick = async () => {
-      try {
-        const [p, w] = await Promise.all([api.filterProgress(), api.watchlist()])
-        if (!cancelled) {
-          setProg(p)
-          setWatch(w)
-        }
-      } catch {
-        // 忽略單次 error
-      }
-    }
-    tick()
-    const id = window.setInterval(tick, 2000)
-    return () => { cancelled = true; window.clearInterval(id) }
+    reload()
+    const id = window.setInterval(reload, 2000)
+    return () => window.clearInterval(id)
   }, [])
+
+  async function removeSymbol(sym: string) {
+    if (!window.confirm(`盤前手動剔除 ${sym}？移除後永久淘汰、08:59:58 預掛也不會下這檔。`)) return
+    try {
+      await api.filterRemove(sym)
+      setMsg(`✓ 已剔除 ${sym} (不會下單)`)
+      await reload()
+    } catch (e: any) {
+      setMsg(`✗ ${e.message}`)
+    }
+    window.setTimeout(() => setMsg(''), 4000)
+  }
 
   return (
     <div className="space-y-4">
@@ -31,12 +44,15 @@ export default function FilterPage() {
         {prog ? <ProgressBlock prog={prog} /> : <div className="text-gray-400 text-sm">載入中...</div>}
       </section>
 
+      {msg && <div className="text-sm bg-white rounded-lg shadow px-4 py-2">{msg}</div>}
+
       {/* 區塊 2: 標記清單 + 丟棄清單 */}
       <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="bg-white rounded-lg shadow p-4">
-          <h2 className="font-semibold mb-3 text-green-700">
+          <h2 className="font-semibold mb-1 text-green-700">
             ✓ 目前標記清單 ({watch?.marked.length ?? 0})
           </h2>
+          <p className="text-xs text-gray-400 mb-3">點標的上的 ✗ 可盤前手動剔除 (不想搶的檔) — 剔除後不會預掛/下單</p>
           {!watch || watch.marked.length === 0 ? (
             <div className="text-gray-400 text-sm py-6 text-center">尚無標記</div>
           ) : (() => {
@@ -57,10 +73,7 @@ export default function FilterPage() {
                   ) : (
                     <div className="flex flex-wrap gap-2">
                       {fromStart.map(sym => (
-                        <span key={sym}
-                              className="inline-block bg-red-50 border border-red-400 text-red-800 px-3 py-1 rounded text-sm font-mono font-semibold">
-                          🔒 {sym}
-                        </span>
+                        <MarkChip key={sym} sym={sym} lock onRemove={() => removeSymbol(sym)} />
                       ))}
                     </div>
                   )}
@@ -75,10 +88,7 @@ export default function FilterPage() {
                   ) : (
                     <div className="flex flex-wrap gap-2">
                       {rest.map(sym => (
-                        <span key={sym}
-                              className="inline-block bg-green-50 border border-green-300 text-green-800 px-3 py-1 rounded text-sm font-mono">
-                          {sym}
-                        </span>
+                        <MarkChip key={sym} sym={sym} onRemove={() => removeSymbol(sym)} />
                       ))}
                     </div>
                   )}
@@ -121,6 +131,9 @@ export default function FilterPage() {
         </div>
       </section>
 
+      {/* T30 禁單清單 (全額交割 / 需預收) */}
+      <T30Section t30={t30} />
+
       {/* 統計小卡 */}
       {prog && (
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -139,6 +152,83 @@ export default function FilterPage() {
         </section>
       )}
     </div>
+  )
+}
+
+
+function MarkChip({ sym, lock, onRemove }: { sym: string; lock?: boolean; onRemove: () => void }) {
+  const cls = lock
+    ? 'bg-red-50 border-red-400 text-red-800 font-semibold'
+    : 'bg-green-50 border-green-300 text-green-800'
+  return (
+    <span className={`inline-flex items-center gap-1.5 border px-2.5 py-1 rounded text-sm font-mono ${cls}`}>
+      {lock ? `🔒 ${sym}` : sym}
+      <button onClick={onRemove} title="盤前手動剔除 (不會下單)"
+              className="ml-0.5 text-gray-400 hover:text-red-600 font-bold leading-none">✗</button>
+    </span>
+  )
+}
+
+
+function T30Section({ t30 }: { t30: T30Info | null }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const syms = t30?.symbols ?? []
+  const hit = q.trim() ? syms.filter(s => s.includes(q.trim())) : syms
+  const files = t30?.meta?.files ?? {}
+  const missingAll = t30?.meta?.missing_all
+  const stale = Object.entries(files).filter(([, i]) => i.ok && i.stale).map(([n]) => n)
+
+  return (
+    <section className="bg-white rounded-lg shadow p-4">
+      <button onClick={() => setOpen(o => !o)} className="w-full flex items-center gap-2 text-left">
+        <span className="font-semibold text-gray-700">🚫 T30 禁單清單 ({t30?.count ?? 0})</span>
+        <span className="text-xs text-gray-400">全額交割 / 需預收款券 — 這些不會下單</span>
+        <span className="ml-auto text-gray-400">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {/* 檔案狀態警示 (永遠顯示,不需展開) */}
+      {t30 && (
+        <div className="mt-2 text-xs">
+          {missingAll ? (
+            <span className="text-red-600 font-medium">⚠ T30 檔案全缺 — 今日無禁單保護,請檢查取檔 timer</span>
+          ) : stale.length > 0 ? (
+            <span className="text-orange-600">⚠ 檔非今日 ({stale.join(', ')}) — 名單可能過時</span>
+          ) : (
+            <span className="text-gray-400">
+              檔案: {Object.entries(files).map(([n, i]) =>
+                `${n} ${i.ok ? (i.mtime_date ?? '') : '缺'}`).join(' / ') || '—'}
+            </span>
+          )}
+        </div>
+      )}
+
+      {open && (
+        <div className="mt-3">
+          <input value={q} onChange={e => setQ(e.target.value)}
+                 placeholder="搜尋代號 (例 6225)"
+                 className="border rounded px-2 py-1 text-sm font-mono w-48 mb-3" />
+          {hit.length === 0 ? (
+            <div className="text-gray-400 text-sm py-3">{q.trim() ? `無符合 "${q.trim()}"` : '清單為空'}</div>
+          ) : (
+            <div className="flex flex-wrap gap-2 max-h-72 overflow-y-auto">
+              {hit.map(s => (
+                <span key={s} className="inline-block bg-gray-100 border border-gray-300 text-gray-700 px-2 py-0.5 rounded text-sm font-mono">
+                  {s}
+                </span>
+              ))}
+            </div>
+          )}
+          {q.trim() && (
+            <div className="mt-2 text-xs text-gray-500">
+              {hit.includes(q.trim())
+                ? <span className="text-red-600">● {q.trim()} 在禁單中 (不會下單)</span>
+                : <span className="text-green-700">○ {q.trim()} 不在禁單中</span>}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -190,6 +280,7 @@ function reasonLabel(reason: string): string {
     bid_below_limit: '委買一跌下漲停',
     bid_dropped_half: '買一量減半 (final check)',
     first_check_failed: '第一盤檢查淘汰',
+    manual_remove: '手動剔除',
   }
   return m[reason] || reason
 }

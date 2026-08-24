@@ -95,6 +95,11 @@ class State:
             "drop_ratio": round(current_bid1_size / max(max_bid_size, 1), 3),
         })
 
+    def unmark_manual(self, symbol: str) -> bool:
+        """使用者盤前手動剔除 (①頁移除鈕) → 永久淘汰,不會再標記,
+        08:59:58 預掛也不會下這檔。回 True=有移除、False=不在標記清單。"""
+        return self._unmark(symbol, "manual_remove", {})
+
     def _unmark(self, symbol: str, reason: str, extra: dict) -> bool:
         with self._lock:
             if symbol not in self.marked:

@@ -17,6 +17,11 @@ export const api = {
   stopNow: () => req<{ ok: boolean }>('/api/stop', { method: 'POST' }),
   filterProgress: () => req<FilterProgress>('/api/filter/progress'),
   watchlist: () => req<Watchlist>('/api/filter/watchlist'),
+  filterRemove: (symbol: string) =>
+    req<{ ok: boolean; removed: boolean }>('/api/filter/remove', {
+      method: 'POST', body: JSON.stringify({ symbol }),
+    }),
+  t30: () => req<T30Info>('/api/t30'),
   tick: (symbol: string) => req<TickSnapshot>(`/api/tick/${symbol}`),
   traderSummary: () => req<TraderSummary>('/api/trader/summary'),
   getTraderParams: () => req<{ first_trade_min_lots: number }>('/api/trader/params'),
@@ -108,6 +113,16 @@ export interface Watchlist {
   marked: string[]
   first_tick_marked?: string[]   // marked 中「開盤即鎖」(首筆真實報價就漲停) 子集
   discarded: Array<{ symbol: string; reason: string; ts: string }>
+}
+
+// T30 禁單名單 (全額交割 / 需預收) — 盤前檢視
+export interface T30Info {
+  count: number
+  symbols: string[]
+  meta: {
+    missing_all?: boolean
+    files?: Record<string, { exists: boolean; ok: boolean; mtime_date: string | null; stale: boolean }>
+  }
 }
 
 export interface TickSnapshot {

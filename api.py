@@ -75,6 +75,36 @@ def get_watchlist():
     }
 
 
+class FilterRemoveReq(BaseModel):
+    symbol: str
+
+
+@router.post("/filter/remove")
+def filter_remove(req: FilterRemoveReq):
+    """盤前 (篩選階段) 手動剔除一檔 — 從標記清單移除 + 永久淘汰,08:59:58 預掛不會下。
+    使用者自行判斷 (例: 不想搶某檔)。已淘汰/未標記 → 回 400。"""
+    r = Runner.get()
+    if not r.state:
+        raise HTTPException(400, "篩選尚未啟動")
+    removed = r.state.unmark_manual(str(req.symbol or "").strip())
+    if not removed:
+        raise HTTPException(400, f"{req.symbol} 不在標記清單中 (可能已淘汰或尚未標記)")
+    return {"ok": True, "removed": removed}
+
+
+@router.get("/t30")
+def get_t30():
+    """T30 禁單名單 (全額交割 / 需預收款券) — 數量 + 檔案 meta + 排序清單。
+    盤前檢視今天系統解析到哪些股票不能下單。"""
+    r = Runner.get()
+    syms = sorted(r.session.untradable) if r.session else []
+    return {
+        "count": len(syms),
+        "symbols": syms,
+        "meta": getattr(r, "_t30_meta", None) or {},
+    }
+
+
 # ─── 分頁 2: 股票資料頁 ─────────────────────────────────────
 
 

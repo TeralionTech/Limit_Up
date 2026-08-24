@@ -61,6 +61,7 @@ class Runner:
         self.limit_ups: Dict[str, float] = {}
         self.limit_downs: Dict[str, float] = {}   # symbol → 跌停價 (出場限價賣用,2026-08-12)
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
+        self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
         self.state = None                # state.State
         self.subscriber = None
         self.trader = None
@@ -569,6 +570,7 @@ class Runner:
         import t30 as _t30
         t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
         untradable, t30_meta = _t30.load_untradable(t30_dir)
+        self._t30_meta = t30_meta        # /api/t30 顯示用 (檔案 ok/stale/missing)
         if t30_meta["missing_all"]:
             logger.critical(f"[runner] ⚠⚠ T30 檔案全缺 ({t30_dir}) — 今日**無全額交割名單保護**,"
                             f"全額交割股可能觸發狂送單!請檢查 hit-limit-up-t30.timer")

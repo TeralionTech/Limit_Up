@@ -30,6 +30,20 @@ class TestMarkUnmark:
         assert s.unmark_ask_appeared("9999", 10.0, 1) is False
         assert not s.is_discarded("9999")
 
+    def test_unmark_manual_removes_and_permanent(self):
+        # 盤前手動剔除 (①頁移除鈕): 從標記移除 + 永久淘汰,不能 re-mark
+        s = State()
+        s.mark("2330", 100.0, 50, 100.0)
+        assert s.unmark_manual("2330") is True
+        assert not s.is_marked("2330")
+        assert s.is_discarded("2330")
+        assert s.mark("2330", 100.0, 50, 100.0) is False     # 剔除後不會再標記 (預掛也不會下)
+
+    def test_unmark_manual_not_marked_noop(self):
+        s = State()
+        assert s.unmark_manual("9999") is False              # 不在標記清單 → False (API 回 400)
+        assert not s.is_discarded("9999")
+
 
 class TestBidDrop:
     def test_final_check_ratio(self):
