@@ -153,3 +153,48 @@ class TestSymbolBudgetOverride:
         s.set_symbol_budgets({"1101": 10_000})
         s.place_pre_orders(["1101"], {"1101": LIMIT})
         assert s.trades["1101"].target_lots == 0
+
+
+class TestRiskControlSizing:
+    """風控①禁現沖減半 + ②20%委託量上限 (2026-08-24;疊在 _calc_lots 之後)。"""
+
+    def test_day_trade_ban_halves(self):
+        # 全域 10萬=2張;禁現沖 → 減半 = 1 張
+        s = make_session(per_symbol=100_000)
+        s.set_day_tradable({"1101": False})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 1
+        assert s.trades["1101"].chase_lots == 1        # 盲送每筆張數同 target
+
+    def test_day_tradable_true_no_halve(self):
+        s = make_session(per_symbol=100_000)
+        s.set_day_tradable({"1101": True})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 2
+
+    def test_20pct_cap(self):
+        # 全域 100萬=22張,但漲停價委託量 50 張 → 上限 20% = 10 張
+        s = make_session(per_symbol=1_000_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT}, limit_up_bid_vols={"1101": 50})
+        assert s.trades["1101"].target_lots == 10     # min(22, floor(50*0.2)=10)
+
+    def test_20pct_not_applied_when_snapshot_zero(self):
+        # 沒抓到快照 (0) → 不套 20% (靠其他上限)
+        s = make_session(per_symbol=100_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT}, limit_up_bid_vols={"1101": 0})
+        assert s.trades["1101"].target_lots == 2
+
+    def test_combined_ban_then_20pct(self):
+        # 疊加順序: base 22張 → 禁現沖//2 = 11 → 20%(委託量30→6) → min = 6
+        s = make_session(per_symbol=1_000_000)
+        s.set_day_tradable({"1101": False})
+        s.place_pre_orders(["1101"], {"1101": LIMIT}, limit_up_bid_vols={"1101": 30})
+        assert s.trades["1101"].target_lots == 6      # min(22//2=11, 30*0.2=6)
+
+    def test_override_then_risk_controls(self):
+        # 個股金額覆寫 (base) 也吃風控: 覆寫 100萬=22張 → 禁現沖//2 = 11
+        s = make_session(per_symbol=100_000)
+        s.set_symbol_budgets({"1101": 1_000_000})
+        s.set_day_tradable({"1101": False})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 11

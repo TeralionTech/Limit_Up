@@ -61,6 +61,7 @@ class Runner:
         self.limit_ups: Dict[str, float] = {}
         self.limit_downs: Dict[str, float] = {}   # symbol → 跌停價 (出場限價賣用,2026-08-12)
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
+        self.day_tradable: Dict[str, bool] = {}   # symbol → canDayTrade (禁現沖減半用,風控①)
         self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
         self.state = None                # state.State
         self.subscriber = None
@@ -224,6 +225,7 @@ class Runner:
             raise RuntimeError("limit_ups 全 fail")
         # 把處置股名單交給交易會話 (下單機制: 處置股不撤預掛/不下市價買、出場改委買一價賣)
         self.session.set_dispositions(self.dispositions)
+        self.session.set_day_tradable(self.day_tradable)   # 禁現沖減半 (風控①)
 
         # T30 禁單名單 (全額交割/每筆需 100% 預收) — API 下單必被拒,預掛/市價追
         # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 08:05 負責
@@ -273,6 +275,7 @@ class Runner:
         # 跌停價/處置股/隔日賣漲停價交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)
         self.session.set_limit_downs(self.limit_downs)
         self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
+        self.session.set_day_tradable(self.day_tradable)   # 補查後含隔日賣標的的禁現沖資訊
         self.session.set_overnight_limit_ups(_overnight_ups)
         sub_universe = [s for s in self.universe if s in self.limit_ups]
         for s in overnight_syms:
@@ -678,8 +681,18 @@ class Runner:
                 self.subscriber.set_handlers(on_trade=self._monitor_on_trade)
             except Exception as e:
                 logger.warning(f"[runner] 預掛時掛 on_trade 失敗: {e}")
+            # 風控②母數: 08:59:58 當下「漲停價那一檔」的委託量快照 (張) → 20% 上限
+            bid_vols = {}
+            for _s in marked:
+                _up = float(self.limit_ups.get(_s) or 0)
+                _snap = self.subscriber.get_latest_snapshot(_s) if self.subscriber else None
+                for _lv in ((_snap or {}).get("books") or {}).get("bids", []):
+                    if _up and abs(float(_pick(_lv, "price") or 0) - _up) < 0.001:
+                        bid_vols[_s] = int(_pick(_lv, "size") or 0)
+                        break
             try:
-                self.session.place_pre_orders(marked, self.limit_ups, stop_event)
+                self.session.place_pre_orders(marked, self.limit_ups, stop_event,
+                                              limit_up_bid_vols=bid_vols)
             except Exception as e:
                 logger.exception(f"[runner] 預掛例外: {e}")
             # 封口 sweep: 下單期間被 tick 淘汰的檔,其撤單當時可能 no-op (單還沒掛)
@@ -883,6 +896,8 @@ class Runner:
             up = resp.get("limitUpPrice") or resp.get("limit_up")
             if up:
                 self.dispositions[sym] = bool(resp.get("isDisposition"))
+                # canDayTrade=False = 禁現沖 → 下單減半 (風控①,官方 key 是 canDayTrade)
+                self.day_tradable[sym] = bool(resp.get("canDayTrade"))
                 down = resp.get("limitDownPrice")
                 if down:
                     self.limit_downs[sym] = float(down)

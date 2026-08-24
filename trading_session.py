@@ -91,6 +91,9 @@ class SymbolTrade:
         self.first_trade_fired = False  # 首筆成交已處理 — 早期觸發/trader/重複 tick 冪等用
         self.is_disposition = False    # 處置股: 不撤預掛/不下市價買、出場改委買一價限價賣
         self.last_bid1_price = 0.0     # 最近委買一價 (處置股出場限價賣用)
+        self.day_tradable = True       # 可現股當沖 (canDayTrade);False=禁現沖 → 部位減半
+        self.limit_up_bid_vol = 0      # 08:59:58 漲停價委託量快照 (張) — 20% 上限母數
+        self.chase_lots = 0            # 市價盲送每筆張數 (= sized target;9:00 盲送用)
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +136,8 @@ class TradingSession:
         self.order_log: Dict[str, dict] = {}
         # 處置股名單 (runner 從 ticker.isDisposition 填) — 影響下單機制
         self.dispositions: Dict[str, bool] = {}
+        # 可現股當沖名單 (runner 從 ticker.canDayTrade 填) — False=禁現沖 → 下單減半
+        self.day_tradable: Dict[str, bool] = {}
         # 跌停價名單 (runner 從 ticker.limitDownPrice 填) — 所有出場含隔日賣
         # 都掛「跌停價限價賣」(2026-08-12 定案: 成交優先權等同市價,但集合競價
         # 時段合法、處置股合法、永不被「不可市價」拒單)
@@ -189,6 +194,7 @@ class TradingSession:
             self.budget_used = 0.0
             self.armed = False
             self.dispositions = {}
+            self.day_tradable = {}   # 每日重抓 (canDayTrade)
             self.limit_downs = {}    # 每日價格不同,新日清空由 runner 重填
             self.untradable = set()  # T30 名單每日重載
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
@@ -203,6 +209,14 @@ class TradingSession:
             self.dispositions = dict(dispositions or {})
         n = sum(1 for v in self.dispositions.values() if v)
         logger.info(f"[session] 處置股名單: {n} 檔")
+
+    def set_day_tradable(self, day_tradable: Dict[str, bool]):
+        """runner 抓完 ticker 後把可現股當沖名單交進來 (canDayTrade)。
+        False = 禁現沖 → 下單張數減半 (風控①,2026-08-24)。"""
+        with self._lock:
+            self.day_tradable = dict(day_tradable or {})
+        n = sum(1 for v in self.day_tradable.values() if v is False)
+        logger.info(f"[session] 禁現沖名單: {n} 檔 (canDayTrade=False → 部位減半)")
 
     def set_limit_downs(self, limit_downs: Dict[str, float]):
         """runner 抓完 ticker 後把跌停價名單交進來 (出場跌停限價賣用)。"""
@@ -469,10 +483,25 @@ class TradingSession:
         st.budget_reserved = 0.0
         self.budget_used = max(0.0, self.budget_used - amt)
 
+    def _sized_lots(self, st: "SymbolTrade") -> int:
+        """最終下單張數 (caller 持鎖) — 依序疊加 (2026-08-24 風控①②):
+          base = _calc_lots (個股金額覆寫 or 全域 budget/fixed_lots;已含總預算硬上限)
+          → 禁現沖 (day_tradable=False) 減半
+          → 不超過漲停價委託量 20% (limit_up_bid_vol>0 才套)
+        預掛 (target_lots) 與市價盲送 (chase_lots) 共用此值。"""
+        lots = self._calc_lots(st.limit_up, st.symbol)
+        if st.day_tradable is False:              # 禁現沖 → 部位減半
+            lots = lots // 2
+        if st.limit_up_bid_vol > 0:               # 20% 委託量上限 (預掛+盲送都套)
+            lots = min(lots, int(st.limit_up_bid_vol * 0.2))
+        return max(0, lots)
+
     # ─── 08:59:58 預掛限價單 ───────────────────────────────
 
-    def place_pre_orders(self, symbols: list, limit_ups: dict, stop_event=None):
+    def place_pre_orders(self, symbols: list, limit_ups: dict, stop_event=None,
+                         limit_up_bid_vols: dict = None):
         """08:59:58 對 marked 清單逐檔掛漲停價限價買單 (集合競價排隊)。
+        limit_up_bid_vols: {sym: 漲停價委託量(張)} 快照 — 20% 上限母數 (風控②)。
 
         **不重試** — 精準時點一次丟出 (使用者定案 2026-07-16)。失敗只記 log +
         釋放預算、**不設 stopped_reason** — 9:00 首筆成交時市價追會救回這檔。
@@ -499,6 +528,8 @@ class TradingSession:
                 st = self.trades.get(sym) or SymbolTrade(sym, limit_up)
                 self.trades[sym] = st
                 st.is_disposition = self.dispositions.get(sym, False)
+                st.day_tradable = self.day_tradable.get(sym, True)   # 風控①: 禁現沖減半
+                st.limit_up_bid_vol = int((limit_up_bid_vols or {}).get(sym, 0))  # 風控②母數
                 # T30 禁單: 全額交割/每筆需 100% 預收 — API 下單必被拒,整檔跳過
                 # (stopped_reason 同時擋掉 9:00 的市價追,狂送單根絕)
                 if sym in self.untradable:
@@ -512,12 +543,13 @@ class TradingSession:
                     st.stopped_reason = "price_above_max"
                     logger.info(f"[session] {sym} 漲停價 {limit_up} > {self.max_stock_price} → 跳過")
                     continue
-                lots = self._calc_lots(limit_up, sym)        # sym 有專屬金額則依專屬金額
+                lots = self._sized_lots(st)                  # 覆寫/全域 → 禁現沖//2 → 20%上限
                 if lots <= 0:
                     st.stopped_reason = "budget_exhausted"
-                    logger.info(f"[session] {sym} 預算不足 → 跳過")
+                    logger.info(f"[session] {sym} 張數算出 0 (預算/禁現沖/20%上限) → 跳過")
                     continue
                 st.target_lots = lots
+                st.chase_lots = lots                         # 市價盲送每筆張數 (階段三用)
                 self._reserve_budget(st, lots)               # 下單即保留
             self._rate.acquire()                             # 爆發式 45/s 窗口
             try:
