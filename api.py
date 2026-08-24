@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import pnl
+import symbol_budget
 from runner import Runner
 
 router = APIRouter(prefix="/api", tags=["hit-limit-up"])
@@ -89,6 +90,47 @@ def filter_remove(req: FilterRemoveReq):
     removed = r.state.unmark_manual(str(req.symbol or "").strip())
     if not removed:
         raise HTTPException(400, f"{req.symbol} 不在標記清單中 (可能已淘汰或尚未標記)")
+    return {"ok": True, "removed": removed}
+
+
+# ─── 個股金額覆寫 (特定股票用專屬下單金額,取代全域每檔金額) ──────────
+
+
+@router.get("/symbol-budget")
+def symbol_budget_list():
+    """全部個股金額覆寫 (排序)。"""
+    data = symbol_budget.load()
+    return {"budgets": [{"symbol": s, "amount": a} for s, a in sorted(data.items())]}
+
+
+class SymbolBudgetReq(BaseModel):
+    symbol: str
+    amount: float
+
+
+@router.post("/symbol-budget")
+def symbol_budget_upsert(req: SymbolBudgetReq):
+    """新增或覆寫某檔專屬下單金額 (元);同步進 session,篩選清單含此檔即依此金額下。"""
+    try:
+        symbol_budget.upsert(req.symbol, req.amount)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    Runner.get().session.set_symbol_budgets(symbol_budget.load())
+    return {"ok": True}
+
+
+class SymbolBudgetDelReq(BaseModel):
+    symbol: str
+
+
+@router.post("/symbol-budget/delete")
+def symbol_budget_delete(req: SymbolBudgetDelReq):
+    """刪除某檔專屬金額 (之後該檔改回全域參數規則)。"""
+    try:
+        removed = symbol_budget.remove(req.symbol)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    Runner.get().session.set_symbol_budgets(symbol_budget.load())
     return {"ok": True, "removed": removed}
 
 

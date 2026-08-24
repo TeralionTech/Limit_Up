@@ -64,6 +64,14 @@ export const api = {
     req<{ ok: boolean }>('/api/trader/abandon', {
       method: 'POST', body: JSON.stringify({ symbol }),
     }),
+  // ─── 個股金額覆寫 ───
+  symbolBudgetList: () => req<{ budgets: SymbolBudget[] }>('/api/symbol-budget'),
+  symbolBudgetUpsert: (p: { symbol: string; amount: number }) =>
+    req<{ ok: boolean }>('/api/symbol-budget', { method: 'POST', body: JSON.stringify(p) }),
+  symbolBudgetDelete: (symbol: string) =>
+    req<{ ok: boolean; removed: boolean }>('/api/symbol-budget/delete', {
+      method: 'POST', body: JSON.stringify({ symbol }),
+    }),
   // ─── 帳務台帳 (每日手動損益) ───
   pnlList: () => req<{ records: PnlRecord[]; total: number }>('/api/pnl'),
   pnlUpsert: (p: { date: string; pnl: number; note?: string }) =>
@@ -113,6 +121,12 @@ export interface Watchlist {
   marked: string[]
   first_tick_marked?: string[]   // marked 中「開盤即鎖」(首筆真實報價就漲停) 子集
   discarded: Array<{ symbol: string; reason: string; ts: string }>
+}
+
+// 個股金額覆寫 (特定股票用專屬下單金額)
+export interface SymbolBudget {
+  symbol: string
+  amount: number   // 元
 }
 
 // T30 禁單名單 (全額交割 / 需預收) — 盤前檢視

@@ -146,6 +146,13 @@ class TradingSession:
         # 隔日賣標的「今日漲停價」(鎖漲停續抱判斷用) — ⚠ 獨立於 runner.limit_ups,
         # 絕不可混入 (filter closure 捕獲該 dict,混入會把昨日持倉當新標的預掛加碼)
         self.overnight_limit_ups: Dict[str, float] = {}
+        # 個股金額覆寫 (symbol → 專屬下單金額,元) — 跨日保留的使用者設定,
+        # 篩選清單含此檔時依專屬金額下 (_calc_lots),其餘用全域參數。開機從檔載入。
+        try:
+            import symbol_budget as _sb
+            self.symbol_budgets: Dict[str, float] = _sb.load()
+        except Exception:
+            self.symbol_budgets = {}
         # 策略參數 (runner 啟動時從 cfg configure;預設值供測試/未 configure 時用)
         self.max_stock_price: float = 500.0        # 只做漲停價 <= 此價 (0=不限)
         self.order_min_interval: float = 0.2       # 市價追單最小送單間隔
@@ -208,6 +215,12 @@ class TradingSession:
         with self._lock:
             self.overnight_limit_ups = dict(ups or {})
         logger.info(f"[session] 隔日賣漲停價名單: {len(self.overnight_limit_ups)} 檔")
+
+    def set_symbol_budgets(self, budgets: Dict[str, float]):
+        """個股金額覆寫更新 (API 增刪後同步記憶體;下單依此判專屬金額)。"""
+        with self._lock:
+            self.symbol_budgets = {str(k): float(v) for k, v in (budgets or {}).items()}
+        logger.info(f"[session] 個股金額覆寫: {len(self.symbol_budgets)} 檔")
 
     def set_untradable(self, symbols: set):
         """runner 從 T30 檔載入禁單名單 (全額交割 / 每筆需 100% 預收)。"""
@@ -415,8 +428,10 @@ class TradingSession:
 
     # ─── 預算/張數 ─────────────────────────────────────────
 
-    def _calc_lots(self, limit_up: float) -> int:
+    def _calc_lots(self, limit_up: float, symbol: str = None) -> int:
         """算該檔下單張數。caller 持鎖。總預算餘額永遠是硬上限。
+        - **個股金額覆寫**: 該檔有專屬金額 (symbol_budgets) → 一律用該金額算 (依金額),
+          無視全域 budget/fixed_lots 模式;仍受總預算餘額上限 (2026-08-24)。
         - budget 模式: floor(min(每檔上限, 總預算餘額) / (漲停價×1000))
         - fixed_lots 模式: min(fixed_lots, 總預算餘額能買的張數)"""
         cost_per_lot = limit_up * 1000
@@ -424,6 +439,10 @@ class TradingSession:
             return 0
         remaining = self.total_budget - self.budget_used
         budget_cap = int(remaining // cost_per_lot)     # 總預算餘額能買幾張 (硬上限)
+        override = self.symbol_budgets.get(symbol) if symbol else None
+        if override and override > 0:
+            # 專屬金額: 依金額下 (min(專屬金額, 總預算餘額) / 每張成本)
+            return max(0, int(min(float(override), remaining) // cost_per_lot))
         if self.sizing_mode == "fixed_lots":
             return max(0, min(self.fixed_lots, budget_cap))
         # budget 模式 (預設): 再受每檔上限約束
@@ -490,7 +509,7 @@ class TradingSession:
                     st.stopped_reason = "price_above_max"
                     logger.info(f"[session] {sym} 漲停價 {limit_up} > {self.max_stock_price} → 跳過")
                     continue
-                lots = self._calc_lots(limit_up)
+                lots = self._calc_lots(limit_up, sym)        # sym 有專屬金額則依專屬金額
                 if lots <= 0:
                     st.stopped_reason = "budget_exhausted"
                     logger.info(f"[session] {sym} 預算不足 → 跳過")

@@ -5,8 +5,9 @@ import QuotePage from './pages/QuotePage'
 import SimPage from './pages/SimPage'
 import OvernightPage from './pages/OvernightPage'
 import PnlPage from './pages/PnlPage'
+import SymbolBudgetPage from './pages/SymbolBudgetPage'
 
-type Tab = 'filter' | 'quote' | 'sim' | 'overnight' | 'pnl'
+type Tab = 'filter' | 'quote' | 'sim' | 'overnight' | 'pnl' | 'symbudget'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('filter')
@@ -75,6 +76,7 @@ export default function App() {
           <TabBtn active={tab === 'sim'} onClick={() => setTab('sim')}>③ 模擬/真實執行</TabBtn>
           <TabBtn active={tab === 'overnight'} onClick={() => setTab('overnight')}>④ 隔日賣標的</TabBtn>
           <TabBtn active={tab === 'pnl'} onClick={() => setTab('pnl')}>⑤ 帳務</TabBtn>
+          <TabBtn active={tab === 'symbudget'} onClick={() => setTab('symbudget')}>⑥ 個股金額</TabBtn>
         </div>
       </header>
 
@@ -84,6 +86,7 @@ export default function App() {
         {tab === 'sim' && <SimPage />}
         {tab === 'overnight' && <OvernightPage />}
         {tab === 'pnl' && <PnlPage />}
+        {tab === 'symbudget' && <SymbolBudgetPage />}
       </main>
     </div>
   )

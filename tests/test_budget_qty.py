@@ -105,3 +105,36 @@ class TestBudget100kTwoLots:
         assert len(s.broker.cancelled) == 1
         assert s.trades["1101"].order_status == "cancelled"
         assert s.budget_used == 0
+
+
+class TestSymbolBudgetOverride:
+    """個股金額覆寫 (2026-08-24): 有專屬金額的檔依專屬金額下,其餘用全域。"""
+
+    def test_override_sizes_by_own_amount(self):
+        # 全域每檔 10 萬 (=2 張),但 1101 專屬 20 萬 → 依 20萬 = 4 張
+        s = make_session(per_symbol=100_000)
+        s.set_symbol_budgets({"1101": 200_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 4        # 20萬 ÷ 4.5萬 = 4
+        assert s.broker.placed == [("limit_buy", "1101", LIMIT, 4)]
+
+    def test_non_override_symbol_uses_global(self):
+        # 有覆寫的是 9999,清單裡的 1101 沒覆寫 → 用全域 10萬 = 2 張
+        s = make_session(per_symbol=100_000)
+        s.set_symbol_budgets({"9999": 200_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 2
+
+    def test_override_beats_fixed_lots_mode(self):
+        # 全域是 fixed_lots=1,但 1101 有專屬金額 20萬 → 仍依金額 = 4 張 (覆寫無視全域模式)
+        s = make_session(sizing_mode="fixed_lots", fixed_lots=1)
+        s.set_symbol_budgets({"1101": 200_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 4
+
+    def test_override_still_capped_by_total_budget(self):
+        # 專屬金額 500萬 但總預算只剩夠買 3 張 → 受總預算硬上限
+        s = make_session(total=3 * COST_PER_LOT, per_symbol=100_000)
+        s.set_symbol_budgets({"1101": 5_000_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 3
