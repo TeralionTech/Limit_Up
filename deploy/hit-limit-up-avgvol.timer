@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly avg-volume compute (daily 18:00 Asia/Taipei; 盤後算,盤前 runner 直接讀檔)
+
+[Timer]
+# 每天 18:00 (盤後、結算後)。月均量變動慢,天天跑確保盤前有近期資料。
+# ⚠ 若與主服務 (hit-limit-up) 的富邦登入衝突,改時段或確認登入可並存。
+OnCalendar=*-*-* 18:00:00 Asia/Taipei
+Persistent=false
+
+[Install]
+WantedBy=timers.target

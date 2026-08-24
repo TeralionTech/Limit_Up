@@ -214,6 +214,7 @@ class Runner:
         self.universe = get_universe(self.sdk, self.cfg.universe)
         if not self.universe:
             raise RuntimeError("universe 空")
+        self._filter_low_volume()        # 月均量 < 門檻 盤前剔除 (縮母體省下游 REST)
 
         # Phase 3: Limit ups (慢 — 12-15 分鐘) — 有當日 cache 就秒讀
         self.phase = Phase.FETCH_LIMIT_UPS
@@ -562,6 +563,30 @@ class Runner:
         removed = self.session.remove_overnight(symbol)
         self._write_overnight_file()
         return removed
+
+    def _filter_low_volume(self):
+        """月均量 < cfg.avg_volume_min_lots(張) 的股票盤前剔除 (縮母體省下游 REST)。
+        資料來自 scripts/compute_avg_volume.py 夜間產的 input/avg_volume.json。
+        fail-open (2026-08-24 定案): 檔缺/某檔無資料 → 不剔除,照常交易。門檻 0 → 停用。"""
+        if self.cfg.avg_volume_min_lots <= 0:
+            return
+        import avg_volume as _av
+        path = os.environ.get("AVG_VOLUME_FILE",
+                              str(Path(__file__).parent / "input" / "avg_volume.json"))
+        data, meta = _av.load(path)
+        if not meta["exists"]:
+            logger.critical(f"[runner] ⚠ 月均量檔缺 ({path}) — 不做低量篩選 (fail-open),"
+                            f"全母體照跑。請檢查 avg_volume timer")
+            return
+        if meta["stale"]:
+            logger.critical(f"[runner] ⚠ 月均量檔非近期 (mtime {meta['mtime_date']}) — 照用,"
+                            f"請檢查 avg_volume timer")
+        kept, dropped = _av.filter_universe(self.universe, data,
+                                            self.cfg.avg_volume_min_lots)
+        logger.info(f"[runner] 月均量篩選: {len(self.universe)} → {len(kept)} 檔 "
+                    f"(剔除 {len(dropped)} 檔日均量 < {self.cfg.avg_volume_min_lots} 張;"
+                    f"檔內 {meta['count']} 檔有量資料)")
+        self.universe = kept
 
     def _load_t30_untradable(self):
         """載入 T30 禁單名單 → session (漲停價抓完後單次載入 — 正常流程此時已晚於

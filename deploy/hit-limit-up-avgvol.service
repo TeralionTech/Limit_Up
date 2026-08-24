@@ -1,0 +1,14 @@
+[Unit]
+Description=Compute avg daily volume (nightly) -> input/avg_volume.json for pre-market low-volume filter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hit_limit_up/repo
+# 登入富邦 + 逐檔抓歷史 K 線 (~1900 檔, 55/min ≈ 35 分鐘) — TimeoutStartSec 給 50 分
+ExecStart=/opt/hit_limit_up/venv/bin/python scripts/compute_avg_volume.py
+TimeoutStartSec=3000
+Environment=PYTHONUNBUFFERED=1
+# 產出 input/avg_volume.json;runner 盤前讀來剔除日均量 < AVG_VOLUME_MIN_LOTS(預設500) 張的股票

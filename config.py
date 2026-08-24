@@ -60,6 +60,7 @@ class Config:
     pfx_password_3: str = ""
     socket_count_2: int = 0    # 副帳號各自的 socket 數 (0/未設 → 同 SOCKET_COUNT)
     socket_count_3: int = 0
+    avg_volume_min_lots: float = 500   # 月均量 < 此(張) 盤前剔除 (離線腳本產檔;0=不篩)
 
 
 def load_config() -> Config:
@@ -132,4 +133,5 @@ def load_config() -> Config:
         bid_decline_minutes=int(os.environ.get("BID_DECLINE_MINUTES", "5")),
         bid_decline_sample_sec=int(os.environ.get("BID_DECLINE_SAMPLE_SEC", "60")),
         skip_trader=os.environ.get("SKIP_TRADER", "true").lower() in ("1", "true", "yes"),
+        avg_volume_min_lots=float(os.environ.get("AVG_VOLUME_MIN_LOTS", "500")),
     )
