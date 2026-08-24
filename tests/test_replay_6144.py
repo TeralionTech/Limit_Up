@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from test_session_money import make_session
+from test_session_money import make_session, _fire_chase
 
 FIXTURE = Path(__file__).parent / "fixtures" / "incident_2026-08-21_6144_orders.csv"
 SYMBOL = "6144"
@@ -59,10 +59,10 @@ class TestReplay6144:
             raise RuntimeError(msg)     # 重放當天『價格穩定措施』拒單
         s.broker.place_market_buy = _replay_reject
 
-        # 首筆成交進場 (fill 尚未入帳 → shortfall>0,重現事故條件)
-        s._first_trade_worker(SYMBOL, True)
+        # 9:00 市價盲送 (重現當天送市價單被「價格穩定措施」拒)
+        _fire_chase(s, SYMBOL)
 
         assert sends["n"] == 1, (
             f"修正後應只送 1 筆即停 (當天舊碼送了 {hist_mkt} 筆), 實得 {sends['n']}")
         assert s.trades[SYMBOL].stopped_reason == "fatal_reject"
-        assert s.budget_used == 0        # 保留全釋放
+        assert s.trades[SYMBOL].order_kind == "pre_limit"   # 致命拒單 (價格穩定) → 市價放棄、預掛 P 續守

@@ -12,9 +12,10 @@ F. 隔日賣出場 (超賣保護、skip;跌停價限價賣,查無 → 委買一�
 thread 類路徑用輪詢 (≤2s) 等背景結果;確定性案例直呼 worker。
 """
 import time
+from datetime import time as _dt_time
 from types import SimpleNamespace
 
-from test_session_money import FakeBroker, make_session, _fill
+from test_session_money import FakeBroker, make_session, _fill, _fire_chase
 from trader import Trader, Holding
 
 
@@ -179,13 +180,12 @@ class TestExitWorker:
     # ── 市價買單 pending 的出場 (2026-08-19 skip-cancel;2026-08-23 審查修正: 等收斂再賣) ──
     def _session_with_pending_market_buy(self, filled=0):
         """預掛 2 張 → 首筆成交 → 市價追 (真路徑): 預掛被撤、市價買 pending;filled 張已回報。
-        target=2 (per_symbol 300k ÷ 121.5k)。filled<2 → order_status 維持 pending。"""
+        target=2 (per_symbol 300k ÷ 121.5k)。fire 送 shortfall、委託成功即撤預掛 P;
+        filled<2 → 市價單維持 pending。broker.cancelled 隨後清,只留出場路徑的撤單。"""
         s = _session_with_position(lots=0)
-        s.on_first_trade("2330", passed_first_check=True)
-        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy"), "市價追沒出手"
-        assert _wait(lambda: s.broker.cancelled), "預掛沒被撤"
+        _fire_chase(s, "2330")                    # 市價盲送 → market_buy pending (委託成功已撤預掛 P)
         st = s.trades["2330"]
-        assert st.order_status == "pending"
+        assert st.order_kind == "market_buy" and st.order_status == "pending"
         if filled:
             s._on_fill(_fill(st.order_no, "2330", filled, LIMIT, filled_no="F5"))
         s.broker.cancelled.clear()      # 只看出場路徑的撤單
@@ -244,11 +244,10 @@ class TestExitWorker:
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.3)
         s = _session_with_position(lots=0)                   # 預掛 P 2 張 pending, target 2
         pre_no = s.trades["2330"].order_no
-        s.on_first_trade("2330", passed_first_check=True)    # 市價追 (filled 還 0 → M 送 2)
-        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy"), "市價追沒出手"
+        _fire_chase(s, "2330")                               # 市價盲送 (filled 還 0 → M 送 2)
         m_no = s.trades["2330"].order_no
-        assert m_no != pre_no
-        s.broker.cancelled.clear()                           # 清掉 chase tail 撤 P 的記錄
+        assert m_no != pre_no and s.trades["2330"].order_kind == "market_buy"
+        s.broker.cancelled.clear()                           # 新模型不撤預掛;隔離出場路徑撤單
         # 預掛 P 的成交這時才落地,一次補到 target 2 張
         s._on_fill(_fill(pre_no, "2330", 2, LIMIT, filled_no="FP"))
         assert s.trades["2330"].order_no == m_no             # 守衛: P 成交沒清掉 M 的追蹤
@@ -266,9 +265,9 @@ class TestExitWorker:
         monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 1.0)
         s = _session_with_position(lots=0)                   # target 2
         pre_no = s.trades["2330"].order_no
-        s.on_first_trade("2330", passed_first_check=True)
-        assert _wait(lambda: s.trades["2330"].order_kind == "market_buy")
+        _fire_chase(s, "2330")
         m_no = s.trades["2330"].order_no
+        assert s.trades["2330"].order_kind == "market_buy"
         s.broker.cancelled.clear()
         s._on_fill(_fill(pre_no, "2330", 2, LIMIT, filled_no="FP"))   # P 補到 2 (order_no 仍 M)
         threading.Timer(0.3, lambda: s._on_fill(
@@ -493,7 +492,7 @@ class TestAbandon:
             # 這裡要測的是「非致命持續失敗的狂送」被手動取消追蹤煞停
             raise RuntimeError("委託失敗 (連線逾時)")
         s.broker.place_market_buy = _always_fail
-        s.on_first_trade("9103", True)                 # 背景 thread 開始狂送
+        s.start_market_chase(["9103"], _dt_time(0, 0, 0), _dt_time(23, 59, 59))  # 背景 thread 盲送
         assert _wait(lambda: calls["n"] >= 3), "狂送沒發生 (測試前置失敗)"
         assert s.abandon_symbol("9103") is True
         assert _wait(lambda: s.budget_used == 0)       # 追單迴圈中止 → 預算全釋放

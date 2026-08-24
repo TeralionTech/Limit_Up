@@ -699,6 +699,14 @@ class Runner:
             # → 這裡補撤 (沒單的檔 cancel 自然 no-op)。sweep 之後才淘汰的,
             # 由淘汰自身的撤單路徑處理 (st 已存在) — 兩側無縫覆蓋。
             self._sweep_unmarked_pre_orders(marked)
+            # 9:00:00 起市價盲送搶進 (時間驅動,不等首筆成交 tick;首筆委託成功即停)
+            try:
+                cutoff = self._parse_time_hhmm(self.cfg.market_chase_cutoff) or dtime(9, 5)
+                self.session.start_market_chase(marked, self._trade_start_time, cutoff)
+                logger.info(f"[runner] 市價盲送已排程 — {len(marked)} 檔,"
+                            f"{self._trade_start_time}~{cutoff}")
+            except Exception as e:
+                logger.exception(f"[runner] 啟動市價盲送失敗: {e}")
 
         t = threading.Thread(target=_timer, name="pre-order-timer", daemon=True)
         t.start()

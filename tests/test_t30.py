@@ -4,7 +4,7 @@
     SETTYPE (byte 41) != '0'  → 排除 (全額交割)
     MARK-W  (byte 42) == '2'  → 排除 (每筆需 100% 預收)
 """
-from test_session_money import make_session, _fill
+from test_session_money import make_session, _fire_chase, _fill
 import t30
 
 
@@ -80,7 +80,7 @@ class TestUntradableOrderGate:
         s = make_session()
         s.set_untradable({"9103"})
         s.place_pre_orders(["9103"], {"9103": 50.0})
-        s._first_trade_worker("9103", True)
+        _fire_chase(s, "9103")
         assert s.broker.placed == []                         # 零委託
         assert s.broker.calls == []
 

@@ -1,7 +1,7 @@
 """全生命週期整合測試 (2026-08-13 總驗收) — 真的 State + filter handler + Trader +
 TradingSession(FakeBroker) 走完整天:
 
-案例 1: 8:30 篩選 → 08:59:58 預掛 → 9:00 試撮忽略/首筆成交 → 市價追先出手再撤預掛
+案例 1: 8:30 篩選 → 08:59:58 預掛 → 9:00 試撮忽略/首筆成交 → 市價盲送 (送 shortfall、委託成功撤預掛 P)
         → 成交 → 盤中市價隊伍歸零 → 跌停價賣出 → 部位歸零
 案例 2: 市價隊伍歸零觸發出場的瞬間「其實已成交、回報晚 0.3 秒才到」→ 等待窗口接住 → 照樣賣掉
 案例 3: 市價隊伍歸零觸發出場、真的沒成交 → 只撤不賣、exited 回退、預算全釋放
@@ -11,7 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 
-from test_session_money import make_session, _fill
+from test_session_money import make_session, _fill, _fire_chase
 from filter import make_on_book_handler
 from state import State
 from trader import Trader, Holding
@@ -97,13 +97,17 @@ class TestFullLifecycle:
         t.on_trade(A, {"price": 100.0, "size": 94000, "isTrial": True})
         assert t.holdings[A].first_trade_seen is False
         assert s.trades[A].first_trade_fired is False
-        # 真首筆成交 94 張 ≥ 門檻 10 → 市價追 (背景 thread)
+        # 真首筆成交 94 張 ≥ 門檻 10 → on_first_trade 設旗標 (不再觸發市價追)
         t.on_trade(A, {"price": 100.0, "size": 94000})
-        assert _wait(lambda: s.trades[A].order_kind == "market_buy"), "市價追沒出手"
-        assert _wait(lambda: s.broker.cancelled), "預掛沒被撤"
+        assert s.trades[A].first_trade_fired is True
+        # 9:00 市價盲送 (時間驅動,取代首筆成交觸發) — 送 shortfall=2 (filled=0),委託成功後撤預掛 P
+        pre_no_A = s.trades[A].pre_order_no
+        _fire_chase(s, A)
+        assert ("market_buy", A, None, 2) in s.broker.placed
         kinds = [c[0] for c in s.broker.calls]
-        # 順序: 預掛 → 市價買**先出手** → 才撤預掛 (市價優先定案)
-        assert kinds.index("limit_buy") < kinds.index("market_buy") < kinds.index("cancel")
+        assert kinds.index("limit_buy") < kinds.index("market_buy")   # 預掛先、盲送後
+        assert kinds.index("market_buy") < kinds.index("cancel")      # 送 M 後才撤預掛 P
+        assert [c[0] for c in s.broker.cancelled] == [pre_no_A]       # 委託成功 → 撤預掛剩餘
         chase_no = s.trades[A].order_no
 
         # ── 市價單成交 2 張 ──

@@ -79,7 +79,8 @@ class SymbolTrade:
         self.symbol = symbol
         self.limit_up = limit_up
         self.target_lots = 0
-        self.order_no: str = ""        # 當前有效委託 (一次一張單)
+        self.order_no: str = ""        # 當前有效委託 (預掛→市價盲送成功後被蓋成市價單)
+        self.pre_order_no: str = ""    # 08:59:58 預掛單 P (市價盲送蓋掉 order_no 後,靠此追蹤撤 P)
         self.order_kind: str = ""      # "pre_limit" / "market_buy" / "market_sell"
         self.order_status: str = ""    # "" / pending / cancelled / rejected / done
         self.filled_lots = 0
@@ -93,7 +94,8 @@ class SymbolTrade:
         self.last_bid1_price = 0.0     # 最近委買一價 (處置股出場限價賣用)
         self.day_tradable = True       # 可現股當沖 (canDayTrade);False=禁現沖 → 部位減半
         self.limit_up_bid_vol = 0      # 08:59:58 漲停價委託量快照 (張) — 20% 上限母數
-        self.chase_lots = 0            # 市價盲送每筆張數 (= sized target;9:00 盲送用)
+        self.chase_lots = 0            # = sized target (與 target_lots 同值;風控後上限)。
+        #   實際盲送每筆送 shortfall=target−已成交,非直接用此值 (2026-08-25 修正後保留作上限紀錄)
 
     def to_dict(self) -> dict:
         return {
@@ -173,6 +175,7 @@ class TradingSession:
         self._trade_date: str = ""
         # 今日已預掛過的日期 — place_pre_orders 冪等保護 (防重複 timer 雙倍下單)
         self._pre_orders_date: str = ""
+        self._chase_started_date: str = ""   # 市價盲送冪等 (防 timer 重觸發開兩次 thread)
 
     def roll_day(self, date_str: str):
         """每日重置 (runner 每天 8:00 開跑時呼叫)。
@@ -200,6 +203,7 @@ class TradingSession:
             self.overnight = {}      # 隔日賣清單由 runner 讀檔重建 (roll_day 後才 load)
             self.overnight_limit_ups = {}   # 每日漲停價不同,runner 補查重填
             self._pre_orders_date = ""   # 新交易日 → 允許今日預掛
+            self._chase_started_date = ""
         logger.warning(f"[session] roll_day({date_str}) — 新交易日: 清 {had} 檔前日 state,"
                        f"armed=False (要交易請重新 arm)")
 
@@ -549,13 +553,14 @@ class TradingSession:
                     logger.info(f"[session] {sym} 張數算出 0 (預算/禁現沖/20%上限) → 跳過")
                     continue
                 st.target_lots = lots
-                st.chase_lots = lots                         # 市價盲送每筆張數 (階段三用)
+                st.chase_lots = lots                         # = target_lots (盲送上限;實送 shortfall)
                 self._reserve_budget(st, lots)               # 下單即保留
             self._rate.acquire()                             # 爆發式 45/s 窗口
             try:
                 order_no = self.broker.place_limit_buy(sym, limit_up, lots)
                 with self._lock:
                     st.order_no = order_no
+                    st.pre_order_no = order_no    # 追蹤 P (市價盲送蓋 order_no 後靠此撤孤兒單)
                     st.order_kind = "pre_limit"
                     st.order_status = "pending"
                 self._log_order(order_no, sym, "buy", "pre_limit", lots, limit_up)
@@ -576,138 +581,117 @@ class TradingSession:
     # ─── 9:00 後事件 (trader 呼叫) ─────────────────────────
 
     def on_first_trade(self, symbol: str, passed_first_check: bool):
-        """首筆成交資訊到達 → **市價單優先**搶進 (背景 thread,不 block subscriber callback)。
+        """首筆真成交 (isTrial 已濾) → **第一盤 gating** (2026-08-24 重寫)。
 
-        冪等: 08:59:58 起的早期 handler 每個 trade tick 都會呼叫,trader 接手後
-        也會再觸發 — 這裡便宜預過濾 (st 不在 / 已處理過 → 不開 thread),
-        權威去重旗標在 worker 內鎖內 check-and-set。"""
+        市價搶單已改 **9:00 時間驅動盲送** (start_market_chase),不再由此觸發。
+        這裡只做第一盤淘汰: 首筆成交量太小 (passed=False) → 停該檔 + 撤預掛,
+        盲送迴圈會因 stopped_reason 自動中止。passed=True → 只記冪等旗標,盲送自己跑。"""
         if not self.is_live():
             return
+        cancel_no = ""
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or st.first_trade_fired:
                 return
-        threading.Thread(target=self._first_trade_worker,
-                         args=(symbol, passed_first_check),
-                         name=f"first-trade-{symbol}", daemon=True).start()
+            st.first_trade_fired = True
+            if not passed_first_check:
+                st.stopped_reason = st.stopped_reason or "first_check_failed"
+                cancel_no = st.order_no if st.order_status == "pending" else ""
+        if cancel_no:
+            # 撤當前 pending 委託 (async,不卡行情 thread)。stopped_reason 已擋盲送續送。
+            self.cancel_symbol_orders_async(symbol, "first_check_failed")
 
-    def _first_trade_worker(self, symbol: str, passed: bool):
-        """**市價單優先** (使用者定案 2026-08-03,速度至上):
+    def start_market_chase(self, symbols: list, start_time, cutoff_time):
+        """9:00:00 起對每檔**盲送**市價單搶進 (2026-08-24 定案,取代首筆成交觸發):
+          - start_time (09:00:00) 起,每檔一 daemon thread 精準等到時點才開始
+          - 9:00 算 shortfall = target − 已成交 (預掛在集合競價可能已成交部分);shortfall≤0 → 不搶
+          - 每 0.1s 送一筆市價 **shortfall** 張 (非整包 target);**首筆委託成功即停**
+          - 委託成功 → **撤掉還沒成交的預掛 P** (復原舊 first_trade_worker 的 first_trade_unfilled 撤單)
+            + 預算轉移 (釋放預掛保留、改保留市價 shortfall,等額 → budget_used 不變)
+          - 停止: 委託成功 / 價格穩定或致命拒單 / cutoff (09:05) / kill switch / 該檔淘汰或出場 / 13:23
+          - 處置股禁市價 → 不盲送 (只留 08:59:58 漲停價預掛限價單)
+          - 致命拒單 (價格穩定 6144 / 全額交割 6225) → 放棄市價,**預掛 P 續守、預算不動**
+        超買防線: 送 shortfall + 委託成功即撤 P → 正常情形部位 = target,不 2×。殘餘 race
+        (P 撤單與成交在券商端賽跑、都成交) 才可能短暫超買,由出場全量賣掉;budget_used 為近似
+        (超買 race 時略低估,已接受)。孤兒 P 若出場前未撤,出場/13:23 再兜底撤 (見 _cancel_orphan_pre)。"""
+        with self._lock:
+            if self._trade_date and self._chase_started_date == self._trade_date:
+                logger.warning("[session] 今日已啟動市價盲送 — 跳過重複 (冪等保護)")
+                return
+            self._chase_started_date = self._trade_date
+        for sym in symbols:
+            threading.Thread(target=self._market_chase_worker,
+                             args=(sym, start_time, cutoff_time),
+                             name=f"chase-{sym}", daemon=True).start()
 
-        首筆成交 tick → **立刻**下市價單追差額 — 差額只看記憶體 filled_lots,
-        **不先撤預掛、不向券商查權威成交量** (舊 2026-07-22「查無→保守不追」定案廢除)。
-        市價單出手後才回頭撤預掛剩餘。單筆下單往返 ~60ms (orders CSV latency_ms),
-        故 tick → 市價單送出 ≈ 一次往返內。
-
-        超買風險 (使用者接受「多下到沒關係」): 預掛+市價都成交時最多持有 2×target;
-        出場賣 filled_lots 全量,兩單成交都會累進,超買部位一樣被完整賣掉。
-        預算為近似值: 差額轉移保留,兩單都成交時實際花費可超過保留額。"""
+    def _market_chase_worker(self, symbol: str, start_time, cutoff_time):
+        # 精準等到 start_time (09:00:00) — 骨架仿 pre_order timer 細等待
+        while True:
+            now = datetime.now()
+            target = now.replace(hour=start_time.hour, minute=start_time.minute,
+                                 second=start_time.second, microsecond=0)
+            remaining = (target - now).total_seconds()
+            if remaining <= 0:
+                break
+            time.sleep(0.01 if remaining < 1 else remaining - 0.5)
+        # 9:00 到 → 算差額一次: shortfall = target − 已成交 (預掛在集合競價可能已成交部分/全部)。
+        # 差額 ≤ 0 → 預掛已把我們買到 target,不搶 (預掛就是最終部位,不撤)。
         with self._lock:
             st = self.trades.get(symbol)
-            if st is None or st.exited:
-                return
-            if st.first_trade_fired:
-                return              # 權威去重 (早期觸發/trader/重複 tick 只處理一次)
-            st.first_trade_fired = True
-            # 處置股: 保留 08:59:58 的漲停價預掛限價單 — 不撤、不下市價追
-            # (處置股不能下市價單)。留著等分盤集合競價成交。
-            if st.is_disposition:
-                logger.warning(f"[session] {symbol} 處置股 — 保留預掛限價單,不撤不追市價")
-                return
-            pre_order_no = st.order_no if st.order_status == "pending" else ""
-
-        # 沒通過第一盤檢查 → 撤預掛 + 停止,不下市價單
-        if not passed:
-            with self._lock:
-                st.stopped_reason = st.stopped_reason or "first_check_failed"
-            if pre_order_no:
-                self._rate.acquire()
-                try:
-                    self.broker.cancel(pre_order_no, symbol, reason="first_check_failed")
-                    with self._lock:
-                        st.order_status = "cancelled"
-                        st.order_no = ""
-                        self._release_budget(st)
-                    # 同步委託總表 (漏這行前端會永遠顯示排隊中 — 2026-07-22 實測 bug)
-                    self._mark_order(pre_order_no, "cancelled")
-                except Exception as e:
-                    logger.error(f"[session] {symbol} 撤預掛單失敗: {e}")
-            return
-
-        # 通過 → 差額只看記憶體 (fill 回報通常還沒到 → shortfall ≈ target),先搶單
-        with self._lock:
-            if st.stopped_reason:
+            if st is None or st.stopped_reason or st.exited or st.is_disposition:
                 return
             shortfall = st.target_lots - st.filled_lots
-            if shortfall > 0:
-                # 預算轉移: 預掛剩餘保留 → 市價追保留 (不等撤單完成,速度優先)
-                self._release_budget(st)
-                self._reserve_budget(st, shortfall)
-
-        # 市價追: **重試到成功為止** (使用者定案 2026-07-27)。送單全程過爆發式風控
-        # (45/s 滑動窗口,多標的共用,不超富邦上限);失敗後單檔退避 order_min_interval
-        # (0.2s),避免單一失敗標的獨佔共用額度。
-        # 中止只在: kill switch 關 / 該檔淘汰或出場 / 13:23 (CANCEL_PENDING_TIME) 到。
-        if shortfall > 0:
-            attempt = 0
-            abort_reason = ""
-            chased_ok = False
-            while True:
-                if not self.is_live():
-                    abort_reason = "kill_switch_off"
-                    break
-                with self._lock:
-                    if st.stopped_reason or st.exited:
-                        abort_reason = st.stopped_reason or "exited"
-                        break
-                if (self.cancel_pending_time is not None
-                        and datetime.now().time() >= self.cancel_pending_time):
-                    abort_reason = "cancel_pending_time"
-                    break
-                self._rate.acquire()      # 爆發式 45/s 窗口 (多標的共用)
-                attempt += 1
-                try:
-                    new_no = self.broker.place_market_buy(symbol, shortfall)
-                    with self._lock:
-                        st.order_no = new_no
-                        st.order_kind = "market_buy"
-                        st.order_status = "pending"
-                    self._log_order(new_no, symbol, "buy", "market_buy", shortfall, 0)
-                    logger.warning(f"[session] {symbol} 市價追 {shortfall} 張 → 委託成功 "
-                                   f"(第 {attempt} 次)")
-                    chased_ok = True
-                    break
-                except Exception as e:
-                    if _is_fatal_reject(e):
-                        # 停止拒因 — 第一筆被拒就停,不再狂送 (全額交割 6225 / 價格穩定 6144)。
-                        # 成因見拒單訊息 {e} (全額交割→查 T30 名單;價格穩定→冷卻期市價單必拒)。
-                        with self._lock:
-                            st.stopped_reason = "fatal_reject"
-                        abort_reason = "fatal_reject"
-                        logger.critical(f"[session] ⚠ {symbol} 市價追遇停止拒因 → 立即放棄"
-                                        f"此檔: {e}")
-                        break
-                    # log 防洪: 前 5 次全印,之後每 50 次一次 (無上限重試最壞 5 log/s/檔)
-                    if attempt <= 5 or attempt % 50 == 0:
-                        logger.error(f"[session] {symbol} 市價追失敗 (第 {attempt} 次,"
-                                     f"續試至成功): {e}")
-                    time.sleep(self.order_min_interval)   # 單檔退避 (不佔共用額度)
-            if not chased_ok:
-                # 中止 → 釋放保留的預算
-                with self._lock:
-                    self._release_budget(st)
-                logger.warning(f"[session] {symbol} 市價追中止 ({abort_reason}, 共試 {attempt} 次)")
-
-        # 市價單已出手 (成功或中止) → 才回頭撤預掛剩餘。預算已轉移,這裡**不再動預算**、
-        # 不動 st.order_no/order_status (已屬市價單);撤失敗由 13:23 cancel_all 兜底。
-        if pre_order_no:
-            self._rate.acquire()
+        if shortfall <= 0:
+            return
+        # 盲送迴圈: 只送 shortfall (不送整包 target → 免 2× 超買);首筆委託成功即停
+        while True:
+            if not self.is_live():
+                return
+            with self._lock:
+                st = self.trades.get(symbol)
+                if st is None or st.stopped_reason or st.exited:
+                    return
+                if st.is_disposition:      # 處置股禁市價 → 只留預掛,不盲送
+                    return
+            if datetime.now().time() >= cutoff_time:      # 09:05 時間兜底
+                logger.warning(f"[session] {symbol} 市價盲送到 {cutoff_time} 仍未成功 → 停 (靠預掛守)")
+                return
+            if (self.cancel_pending_time is not None
+                    and datetime.now().time() >= self.cancel_pending_time):
+                return
+            self._rate.acquire()          # 爆發式 45/s 窗口 (多標的共用)
             try:
-                self.broker.cancel(pre_order_no, symbol, reason="first_trade_unfilled")
-                self._mark_order(pre_order_no, "cancelled")
-                logger.info(f"[session] {symbol} 預掛剩餘已撤 (市價單已先出手)")
+                no = self.broker.place_market_buy(symbol, shortfall)
+                self._log_order(no, symbol, "buy", "market_buy", shortfall, 0)
+                # 委託成功 → 同一鎖內:蓋 order_no=M + 預算轉移 (釋放預掛剩餘保留、改保留市價 shortfall,
+                # 兩者等額 → budget_used 不變、不變式守住)。再重查有無在放鎖窗口被淘汰/出場。
+                with self._lock:
+                    st.order_no = no
+                    st.order_kind = "market_buy"
+                    st.order_status = "pending"
+                    self._release_budget(st)              # 釋放預掛 P 剩餘保留
+                    self._reserve_budget(st, shortfall)   # 改保留市價 M
+                    aborted = bool(st.stopped_reason) or st.exited
+                if aborted:
+                    # 放鎖到送單間被淘汰/出場 → M 無人管 → 撤 M;預掛 P 一併撤 (2026-08-25 MED)
+                    logger.warning(f"[session] {symbol} 市價盲送送出後發現已停 → 撤 M={no}+預掛 P")
+                    self.cancel_symbol_orders_async(symbol, "chase_aborted")
+                    self._cancel_orphan_pre(symbol, "chase_aborted")
+                    return
+                # ⭐ 委託成功即停 + **撤掉還沒成交的預掛 P** (使用者定案 / 復原舊 first_trade_worker
+                # 的 first_trade_unfilled 撤單)。不撤 → P 也成交 = 2×target 超買 (HIGH-1/HIGH-2 根因)。
+                logger.warning(f"[session] {symbol} 市價盲送 {shortfall} 張 → 委託成功 → 停;撤預掛剩餘 P")
+                self._cancel_orphan_pre(symbol, "chase_sent_cancel_pre")
+                return
             except Exception as e:
-                logger.error(f"[session] {symbol} 撤預掛剩餘失敗 (13:23 cancel_all 兜底): {e}")
+                if _is_fatal_reject(e):
+                    # 停止拒因 (全額交割 6225 / 價格穩定 6144) — 立即放棄此檔,不再送。
+                    # 預掛 P **不撤**、預算不動 — 市價被拒但漲停價限價單仍是有效排隊單,續守。
+                    with self._lock:
+                        st.stopped_reason = "fatal_reject"
+                    logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 (預掛 P 續守): {e}")
+                    return
+                time.sleep(0.1)           # 暫時性拒單 → 0.1s 後重試 (每筆 0.1s 節奏)
 
     def cancel_symbol_orders_async(self, symbol: str, reason: str):
         """撤單非同步版 — **行情 callback thread 專用** (撤單 REST 往返 ~60ms,
@@ -843,8 +827,12 @@ class TradingSession:
             st.exited = True            # 先標「要賣」,防重複觸發
             st.stopped_reason = st.stopped_reason or reason
             had_pending = bool(st.order_no) and st.order_status == "pending"
-        if had_pending:
-            self.cancel_symbol_orders(symbol, reason)     # 能撤就撤 (已成交→券商拒,無妨)
+        # 出場也撤孤兒預掛單 P (2026-08-25 HIGH-1): 賣出時不該讓 P 繼續買進;
+        # 有撤到 live P → 也要等窗口 (P 可能正在成交,回報晚到,不等會漏賣變隱形部位)
+        had_orphan = self._cancel_orphan_pre(symbol, reason)
+        if had_pending or had_orphan:
+            if had_pending:
+                self.cancel_symbol_orders(symbol, reason)     # 能撤就撤 (已成交→券商拒,無妨)
             # 撤單前已成交/正在成交的 → **固定等滿窗口讓在途成交回報全部落地**再賣。
             # 不提早 break: overbuy 時 (預掛+市價都成交) filled 分兩批落地,任何提早收斂
             # 判斷都可能漏掉第二批 → 又變成 exited 鎖住漏賣。回報比 tick 慢僅百 ms 級,
@@ -869,12 +857,44 @@ class TradingSession:
                 if st.stopped_reason != "manual_abandon":
                     st.exited = False
 
+    def _has_orphan_pre(self, st: "SymbolTrade") -> bool:
+        """該檔有「被市價盲送蓋掉、仍 pending 的孤兒預掛單 P」(caller 持鎖)。"""
+        p = st.pre_order_no
+        if not p or p == st.order_no:
+            return False
+        row = self.order_log.get(p)
+        return row is not None and row["status"] == "pending"
+
+    def _cancel_orphan_pre(self, symbol: str, reason: str) -> bool:
+        """撤掉孤兒預掛單 P (2026-08-25 審查 HIGH-1): 市價盲送成功後 st.order_no 從 P 蓋成 M,
+        P 只剩在 order_log → 出場/13:23 一併撤,免留到收盤或出場後晚成交變隱形部位。
+        回 True = 有撤到 live 的 P (出場端據此判斷要不要等成交回報窗口接 P 的在途成交)。
+        預算不動 (超買帳務本為近似,見 _sized/_on_fill 註)。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is None or not self._has_orphan_pre(st):
+                return False
+            p = st.pre_order_no
+        if not self._can_manage():
+            return False
+        self._rate.acquire()
+        try:
+            self.broker.cancel(p, symbol, reason=reason)
+            self._mark_order(p, "cancelled")
+            logger.info(f"[session] {symbol} 撤孤兒預掛單 P={p} ({reason})")
+            return True
+        except Exception as e:
+            logger.error(f"[session] {symbol} 撤孤兒預掛單失敗: {e}")
+            return True    # 撤失敗 = P 可能已成交/仍 live → 仍要等窗口接晚成交
+
     def cancel_all_pending(self, reason: str):
         """撤所有 pending,不賣持倉 (留倉)。13:23 (CANCEL_PENDING_TIME) 主跑,13:24 收盤保險再跑。
-        閘門 = _can_manage (非 is_live) — 關 kill switch 也必須能撤 13:23 的單。"""
+        閘門 = _can_manage (非 is_live) — 關 kill switch 也必須能撤 13:23 的單。
+        含孤兒預掛單 P (市價盲送蓋掉 order_no 後 P 只在 order_log,2026-08-25 HIGH-1)。"""
         with self._lock:
             syms = [s for s, st in self.trades.items()
-                    if st.order_no and st.order_status == "pending"]
+                    if (st.order_no and st.order_status == "pending")
+                    or self._has_orphan_pre(st)]
         if not syms:
             return
         if not self._can_manage():
@@ -883,7 +903,8 @@ class TradingSession:
                                 f"{len(syms)} 檔未成交委託可能仍掛在券商端,需人工處理")
             return
         for sym in syms:
-            self.cancel_symbol_orders(sym, reason)
+            self.cancel_symbol_orders(sym, reason)   # 撤 st.order_no (M 或 P)
+            self._cancel_orphan_pre(sym, reason)     # 撤被蓋掉的孤兒 P
         logger.warning(f"[session] 收盤撤單完成 ({len(syms)} 檔) — 持倉保留")
 
     def close_all(self):
@@ -1380,7 +1401,7 @@ class TradingSession:
                     0.0, st.budget_reserved - lots * st.limit_up * 1000)
                 # 達 target 才清 order_no/標 done — 但**必須是 st 現在追的那張單**成交才清
                 # (守衛同 reconcile_orders): 進場 race 可能同時有預掛 P + 市價追 M 兩張 live,
-                # st.order_no 已被 _first_trade_worker 蓋成 M;若 P 的成交補到 target 就清掉,
+                # st.order_no 已被市價盲送 (_market_chase_worker) 蓋成 M;若 P 的成交補到 target 就清掉,
                 # 會把還 live 的 M 追蹤清空 → 出場 had_pending 誤判 False → M 晚成交漏賣被
                 # exited 鎖死 (2026-08-24 審查 HIGH)。P 成交時 order_no 是 M 不相符 → 不清,
                 # 續為 pending → 出場照撤 M + 等窗口 + 賣全量;13:23 cancel_all 也看得到 M。

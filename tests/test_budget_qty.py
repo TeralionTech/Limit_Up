@@ -8,7 +8,7 @@
 import time
 from types import SimpleNamespace
 
-from test_session_money import make_session, _fill
+from test_session_money import make_session, _fill, _fire_chase
 from trader import Trader
 
 LIMIT = 45.0
@@ -81,11 +81,11 @@ class TestBudget100kTwoLots:
         assert s.trades["1101"].exited is True
 
     def test_overbuy_2x_exit_sells_all_4(self):
-        # 超買情境 (定案「多下到沒關係」): 預掛 2 張 + 市價追 2 張**都**成交
-        # → 部位 4 張 → 出場必須賣 4 張全量,不是 target 的 2 張
+        # 超買殘餘 race: 委託成功後撤預掛 P,但 P 撤單與成交在券商端賽跑 — 撤輸 →
+        # 預掛 2 張 + 市價 2 張**都**成交 → 部位 4 張 → 出場必須賣 4 張全量 (非 target 2)
         s = _mk()
         pre_no = s.trades["1101"].order_no
-        s._first_trade_worker("1101", True)          # 市價優先: 追 2 張、再撤預掛
+        _fire_chase(s, "1101")                       # 市價盲送 shortfall=2 (filled=0) + 撤預掛 P
         chase_no = s.trades["1101"].order_no
         assert ("market_buy", "1101", None, 2) in s.broker.placed    # 差額 = 2 張
         # 撤單與成交在券商端賽跑 — 結果兩張單都成交
@@ -95,7 +95,7 @@ class TestBudget100kTwoLots:
         assert st.filled_lots == 4
         s._exit_worker("1101", "mkt_queue_gone")
         assert ("limit_sell", "1101", DOWN, 4) in s.broker.placed
-        # 附註: 超買時 budget_used 低估實際花費 (保留只做過一份) — 已接受的近似
+        # 附註: 超買 race 時 budget_used 低估實際花費 (保留轉移只做過一份) — 已接受的近似
         assert s.budget_used == 2 * COST_PER_LOT
 
     def test_1323_cancel_all_cancels_whole_order(self):
