@@ -1,0 +1,75 @@
+# GitLab CI/CD — hit_limit_up
+#
+# CI (自動): 每次 push / Merge Request 跑 pytest + 前端 tsc/build。
+# CD (手動): main 分支上出現一個「▶ deploy」手動按鈕 — **刻意不自動部署**,
+#            因為這是真金交易系統,不能在盤中被 merge 觸發自動重啟。
+#
+# 需要的前置 (在 GitLab 設定):
+#   1. 專案要有可用的 Runner (Settings → CI/CD → Runners;docker executor)。
+#   2. deploy 用的 CI/CD 變數 (Settings → CI/CD → Variables,設 Protected + Masked):
+#        VPS_SSH_KEY  = 能登入 root@45.76.222.150 的私鑰 (File 型別最方便)
+#      且 VPS 的 git remote 要能取到本 GitLab 的 main (見 deploy 註解)。
+
+stages: [test, build, deploy]
+
+# ── CI: 後端測試 ────────────────────────────────────────────
+test:
+  stage: test
+  image: python:3.12-slim
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  before_script:
+    - pip install -r requirements.txt -r requirements-dev.txt
+  script:
+    - python -m pytest tests -q
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ── CI: 前端型別檢查 + build ─────────────────────────────────
+frontend-build:
+  stage: build
+  image: node:20-slim
+  cache:
+    key: npm-$CI_COMMIT_REF_SLUG
+    paths: [frontend/node_modules]
+  before_script:
+    - cd frontend && npm ci
+  script:
+    - npx tsc --noEmit
+    - npm run build
+  artifacts:
+    paths: [frontend/dist]
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# ── CD: 手動部署到 VPS (只在 main;按鈕觸發,非自動) ──────────
+# 部署 = VPS 拉最新 main + 重啟 + 傳前端 dist。真金系統務必人工挑非交易時段按。
+deploy:
+  stage: deploy
+  image: alpine:latest
+  needs: [test, frontend-build]        # 測試+build 綠才可部署;帶 build 的 dist artifact
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$VPS_SSH_KEY" ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+    - ssh-keyscan -H 45.76.222.150 >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    # 後端: VPS 端拉碼 + 重啟 (VPS 的 origin 要能取到最新 main)
+    - ssh -i ~/.ssh/id_deploy root@45.76.222.150
+        "cd /opt/hit_limit_up/repo && git fetch origin main && git reset --hard origin/main && systemctl restart hit-limit-up"
+    # 前端: 傳 frontend-build 產出的 dist
+    - ssh -i ~/.ssh/id_deploy root@45.76.222.150 "rm -rf /opt/hit_limit_up/repo/frontend/dist"
+    - scp -i ~/.ssh/id_deploy -r frontend/dist root@45.76.222.150:/opt/hit_limit_up/repo/frontend/
+    - ssh -i ~/.ssh/id_deploy root@45.76.222.150
+        "cd /opt/hit_limit_up/repo && git log --oneline -1 && systemctl is-active hit-limit-up"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual        # ← main 上顯示手動按鈕,不會自動跑
+  environment:
+    name: production
