@@ -138,3 +138,18 @@ class TestSymbolBudgetOverride:
         s.set_symbol_budgets({"1101": 5_000_000})
         s.place_pre_orders(["1101"], {"1101": LIMIT})
         assert s.trades["1101"].target_lots == 3
+
+    def test_override_below_one_lot_still_buys_one(self):
+        # 2026-08-24: 專屬金額不足一張 (1萬 < 4.5萬/張) → 最少買 1 張 (使用者明確指定要買)
+        s = make_session(per_symbol=100_000)
+        s.set_symbol_budgets({"1101": 10_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 1
+        assert s.broker.placed == [("limit_buy", "1101", LIMIT, 1)]
+
+    def test_override_min_one_still_needs_total_budget(self):
+        # 「最少一張」仍受總預算: 連 1 張都買不起 → 0 (跳過)
+        s = make_session(total=10_000, per_symbol=100_000)   # 總預算 < 一張 4.5萬
+        s.set_symbol_budgets({"1101": 10_000})
+        s.place_pre_orders(["1101"], {"1101": LIMIT})
+        assert s.trades["1101"].target_lots == 0

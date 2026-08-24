@@ -441,8 +441,11 @@ class TradingSession:
         budget_cap = int(remaining // cost_per_lot)     # 總預算餘額能買幾張 (硬上限)
         override = self.symbol_budgets.get(symbol) if symbol else None
         if override and override > 0:
-            # 專屬金額: 依金額下 (min(專屬金額, 總預算餘額) / 每張成本)
-            return max(0, int(min(float(override), remaining) // cost_per_lot))
+            # 專屬金額: 依金額下 (min(專屬金額, 總預算餘額) / 每張成本)。
+            # **最少一張** (2026-08-24): 使用者明確指定此檔就是要買,金額不足一張也下 1 張
+            # (仍受總預算硬上限 budget_cap — 總預算連 1 張都買不起才回 0)。
+            lots = int(min(float(override), remaining) // cost_per_lot)
+            return max(0, min(max(lots, 1), budget_cap))
         if self.sizing_mode == "fixed_lots":
             return max(0, min(self.fixed_lots, budget_cap))
         # budget 模式 (預設): 再受每檔上限約束
