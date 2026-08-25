@@ -3,6 +3,8 @@
 FakeBroker 滿足 _broker_ready (connected/healthy) — 不需要富邦 SDK。
 預算不變式: budget_used == Σ(買進已成交×漲停×1000) + Σ(st.budget_reserved)。
 """
+import time
+
 import pytest
 
 from trading_session import TradingSession
@@ -336,6 +338,38 @@ class TestMarketBlindChase:
         _fire_chase(s, "6144")
         assert calls["n"] == 1
         assert s.trades["6144"].stopped_reason == "fatal_reject"
+
+    def test_first_trade_arrived_stops_and_cancels_pre(self):
+        # 停止條件 (B) 2026-08-25: 非致命拒單 + 第一盤成交已來 → 停送 + 撤預掛 P + 釋放預算
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2,保留 200k
+        pre_no = s.trades["2330"].pre_order_no
+        s.trades["2330"].first_trade_fired = True           # 第一盤成交已來
+        def reject(symbol, lots):
+            raise RuntimeError("busy")                      # 非致命
+        s.broker.place_market_buy = reject
+        s.broker.cancelled.clear()
+        _fire_chase(s, "2330")
+        deadline = time.monotonic() + 2                     # 撤 P 走 async thread → 等它落地
+        while time.monotonic() < deadline and not s.broker.cancelled:
+            time.sleep(0.01)
+        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 撤預掛 P
+        assert s.trades["2330"].order_status == "cancelled"
+        assert s.budget_used == 0                               # P 保留預算釋放
+
+    def test_fatal_reject_keeps_pre_even_if_first_trade_arrived(self):
+        # 致命拒單安全防線優先於 (B): 即使第一盤成交已來,價格穩定拒單仍保留預掛 P
+        s = make_session()
+        s.place_pre_orders(["6144"], {"6144": 100.0})
+        s.trades["6144"].first_trade_fired = True
+        def reject(symbol, lots):
+            raise RuntimeError("證券委託觸及價格穩定措施上、下限價格")
+        s.broker.place_market_buy = reject
+        s.broker.cancelled.clear()
+        _fire_chase(s, "6144")
+        assert s.trades["6144"].stopped_reason == "fatal_reject"
+        assert s.trades["6144"].order_kind == "pre_limit"       # P 續守,未撤
+        assert s.broker.cancelled == []
 
 
 class TestFirstTradeGating:

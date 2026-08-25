@@ -705,9 +705,19 @@ class TradingSession:
                 if _is_fatal_reject(e):
                     # 停止拒因 (全額交割 6225 / 價格穩定 6144) — 立即放棄此檔,不再送。
                     # 預掛 P **不撤**、預算不動 — 市價被拒但漲停價限價單仍是有效排隊單,續守。
+                    # (即使第一盤成交已來也保留 P:致命拒單安全防線優先,使用者定案 2026-08-25。)
                     with self._lock:
                         st.stopped_reason = "fatal_reject"
                     logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 (預掛 P 續守): {e}")
+                    return
+                # 停止條件 (B) 使用者定案: 「第一盤成交資訊來」時,這筆(剛送出被暫時拒的)即最後一筆
+                # → 收手停送。此時尚無委託成功 → order_no 仍是 P、未做預算轉移,故用 cancel_symbol_orders
+                # (會釋放 P 保留預算) 撤掉;成交都來了還沒成交的漲停限價單,續掛難成,撤掉乾淨。
+                with self._lock:
+                    first_came = bool(st.first_trade_fired)
+                if first_came:
+                    logger.warning(f"[session] {symbol} 第一盤成交已來、市價仍未成功委託 → 停送;撤預掛 P")
+                    self.cancel_symbol_orders_async(symbol, "chase_stop_first_trade")
                     return
                 time.sleep(0.1)           # 暫時性拒單 → 0.1s 後重試 (每筆 0.1s 節奏)
 
