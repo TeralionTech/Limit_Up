@@ -181,3 +181,33 @@ return max(0, lots)
 2. 離線腳本手動跑一次產 `input/avg_volume.json` 驗內容 + 筆數。
 3. commit → push origin + gitlab;部署 = 拉碼 + scp dist + restart + 佈署 avgvol timer。
 4. 上線首日 log:月均量剔除數、禁現沖減半、20% cap、盲送「首筆委託成功即停」的送單筆數。
+
+---
+
+## ✅ 已上線 (2026-08-25 收尾) — 本計畫全數完成
+
+| 項目 | commit | 主要落點 |
+|---|---|---|
+| 階段一 月均量>500 盤前篩選 (離線腳本+夜間 timer) | `0efa46e` (+`da67c01`/`dc462c5`) | `avg_volume.py` / `scripts/compute_avg_volume.py` / `runner._filter_low_volume` |
+| GitLab CI/CD + 計畫文件 | `4fcb6f2` | `.gitlab-ci.yml` |
+| 階段二 風控① 禁現沖減半 + ② 不超過漲停價委託量 20% | `9243bac` | `trading_session._sized_lots` / `runner._query_limit_up` |
+| 階段三 9:00 市價盲送 (時間驅動,取代 tick 觸發) | `6477860` | `trading_session.start_market_chase` / `_market_chase_worker` |
+| 第四道風控:總曝險硬上限 (實際買進>total_budget 即煞車) | `23d088c` | `trading_session._buy_cost_actual` / `_budget_breached` |
+
+### 與原計畫的差異 (誠實紀錄)
+- **階段三初版回歸**:初版盲送誤把舊 `_first_trade_worker` 的三項正確行為丟掉(送整包 target
+  不扣已買、不撤預掛 P、不做預算轉移)→ 造成孤兒 P + 2×target 超買 & `budget_used` 低估。
+  **已復原**:送 `shortfall = target − 已成交`、委託成功即撤預掛 P(致命拒單則保留 P 續守)、
+  預算轉移(釋放預掛保留、改保留市價,等額 → `budget_used` 不變)。第 1 節第 3/4 點原文
+  「固定送 chase_lots / 保留不撤 / 接受 2×」為我方誤植,已於當節更正。
+- **總曝險硬上限(第四道)為原計畫外追加**:`_buy_cost_actual` 單向累計實際買進、超 `total_budget`
+  → `_budget_breached` latch + 撤所有 pending 買單止血(已成交靠出場賣、當日不再買、只擋買不擋賣)。
+  盲送送出後鎖內重查 breach、`reconcile_orders` 補收也餵硬上限、出場靠 `last_buy_cancel_ts`
+  判斷要不要等成交回報窗口。經 5-agent 對抗審查(5 confirmed → 3 修:#1/#4 送出後重查、
+  #2/#5 補收餵硬上限、#3 recently_cancelled 等窗口)後上線。
+- **Issue #1(第一次處置分單)** 仍照決策 (c) 留後,本批不做。
+
+### 測試 / 部署現況
+- `python -m pytest tests -q` → **243 passed**(新增 `TestAggregateHardCap` / `TestMarketBlindChase`
+  / `TestRiskControlSizing` + replay / lifecycle 斷言更新)。
+- 已 push `origin`(GitHub)+ `gitlab`;VPS 部署指令見第 7 節,CI/CD 之後再開。
