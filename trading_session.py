@@ -87,6 +87,8 @@ class SymbolTrade:
         self.avg_price = 0.0
         self.stopped_reason: str = ""  # 非空 = 此檔不再進場
         self.exited = False            # 已出場 (委賣出現)
+        self.last_buy_cancel_ts = 0.0  # 最近撤掉 live 買單的時刻 (time.time()) — 出場據此判斷
+        #   要不要等成交回報窗口: 別處先撤了 (如硬上限 breach) → 撤單的在途成交仍可能晚到 (審查 #3)
         self.budget_reserved = 0.0     # 該檔目前保留中的預算 (下單保留,成交轉消耗,撤/拒釋放)
         self.sell_failed = False       # 出場賣單重試用盡仍沒送出 → 需人工 (前端顯示)
         self.first_trade_fired = False  # 首筆成交已處理 — 早期觸發/trader/重複 tick 冪等用
@@ -129,7 +131,11 @@ class TradingSession:
         self.fixed_lots: int = 0
         self.total_budget: float = 0.0
         self.per_symbol_budget: float = 0.0
-        self.budget_used: float = 0.0     # 下單時保留,撤單釋放未成交部分
+        self.budget_used: float = 0.0     # 下單時保留,撤單釋放未成交部分 (sizing 用;超買 race 會低估)
+        # 總曝險硬上限 (2026-08-25): 實際買進成交累計現金 (每筆 fill 都加、不 floor → 含超買 race)。
+        # 超過 total_budget → _budget_breached 單向煞車:停所有市價盲送 + 撤所有 pending 買單。
+        self._buy_cost_actual: float = 0.0
+        self._budget_breached: bool = False
         # per-symbol state
         self.trades: Dict[str, SymbolTrade] = {}
         self._processed_fills: set = set()   # 去重 key
@@ -195,6 +201,8 @@ class TradingSession:
             self.order_log.clear()
             self._processed_fills.clear()
             self.budget_used = 0.0
+            self._buy_cost_actual = 0.0       # 每日重置實際買進累計
+            self._budget_breached = False     # 每日重置硬上限煞車
             self.armed = False
             self.dispositions = {}
             self.day_tradable = {}   # 每日重抓 (canDayTrade)
@@ -638,7 +646,8 @@ class TradingSession:
         # 差額 ≤ 0 → 預掛已把我們買到 target,不搶 (預掛就是最終部位,不撤)。
         with self._lock:
             st = self.trades.get(symbol)
-            if st is None or st.stopped_reason or st.exited or st.is_disposition:
+            if (st is None or st.stopped_reason or st.exited or st.is_disposition
+                    or self._budget_breached):
                 return
             shortfall = st.target_lots - st.filled_lots
         if shortfall <= 0:
@@ -649,10 +658,16 @@ class TradingSession:
                 return
             with self._lock:
                 st = self.trades.get(symbol)
-                if st is None or st.stopped_reason or st.exited:
+                if st is None or st.stopped_reason or st.exited or self._budget_breached:
                     return
                 if st.is_disposition:      # 處置股禁市價 → 只留預掛,不盲送
                     return
+                # 總曝險硬上限 send-time 投影: 已實際買進 + 本筆最壞 (漲停價估) 若超總預算 → 不送
+                projected_over = (self.total_budget > 0 and self._buy_cost_actual
+                                  + shortfall * st.limit_up * 1000 > self.total_budget)
+            if projected_over:
+                logger.warning(f"[session] {symbol} 盲送前投影超總預算 → 不送 (總曝險硬上限;靠預掛/出場守)")
+                return
             if datetime.now().time() >= cutoff_time:      # 09:05 時間兜底
                 logger.warning(f"[session] {symbol} 市價盲送到 {cutoff_time} 仍未成功 → 停 (靠預掛守)")
                 return
@@ -671,9 +686,12 @@ class TradingSession:
                     st.order_status = "pending"
                     self._release_budget(st)              # 釋放預掛 P 剩餘保留
                     self._reserve_budget(st, shortfall)   # 改保留市價 M
-                    aborted = bool(st.stopped_reason) or st.exited
+                    # aborted 含 _budget_breached: send 是在放鎖後做的 (_rate.acquire 會阻塞 ~1s),
+                    # 這期間別檔成交可能觸發硬上限 latch。此處鎖內重查 → 送出後才 breach 的 M 立刻撤,
+                    # 免逃過 breach 的一次性 cancel_all_pending (它 snapshot 時 M 還沒寫進 order_no)。
+                    aborted = bool(st.stopped_reason) or st.exited or self._budget_breached
                 if aborted:
-                    # 放鎖到送單間被淘汰/出場 → M 無人管 → 撤 M;預掛 P 一併撤 (2026-08-25 MED)
+                    # 放鎖到送單間被淘汰/出場/硬上限 → M 無人管 → 撤 M;預掛 P 一併撤 (2026-08-25 審查)
                     logger.warning(f"[session] {symbol} 市價盲送送出後發現已停 → 撤 M={no}+預掛 P")
                     self.cancel_symbol_orders_async(symbol, "chase_aborted")
                     self._cancel_orphan_pre(symbol, "chase_aborted")
@@ -723,6 +741,7 @@ class TradingSession:
                 st.order_status = "cancelled"
                 st.order_no = ""
                 st.stopped_reason = st.stopped_reason or reason
+                st.last_buy_cancel_ts = time.time()   # 撤了 live 買單 → 出場要等在途成交 (審查 #3)
                 self._release_budget(st)
             self._mark_order(order_no, "cancelled")
             logger.warning(f"[session] {symbol} 撤單 ({reason})")
@@ -827,10 +846,13 @@ class TradingSession:
             st.exited = True            # 先標「要賣」,防重複觸發
             st.stopped_reason = st.stopped_reason or reason
             had_pending = bool(st.order_no) and st.order_status == "pending"
+            # 別處剛撤過 live 買單 (如硬上限 breach 的 cancel_all_pending) → 撤單的在途成交仍可能
+            # 晚到;此時 order_no 已被清、had_pending/had_orphan 皆 False,不等窗口會漏賣 (審查 #3)。
+            recently_cancelled = (time.time() - st.last_buy_cancel_ts) < _EXIT_FILL_WAIT_SEC
         # 出場也撤孤兒預掛單 P (2026-08-25 HIGH-1): 賣出時不該讓 P 繼續買進;
         # 有撤到 live P → 也要等窗口 (P 可能正在成交,回報晚到,不等會漏賣變隱形部位)
         had_orphan = self._cancel_orphan_pre(symbol, reason)
-        if had_pending or had_orphan:
+        if had_pending or had_orphan or recently_cancelled:
             if had_pending:
                 self.cancel_symbol_orders(symbol, reason)     # 能撤就撤 (已成交→券商拒,無妨)
             # 撤單前已成交/正在成交的 → **固定等滿窗口讓在途成交回報全部落地**再賣。
@@ -881,6 +903,10 @@ class TradingSession:
         try:
             self.broker.cancel(p, symbol, reason=reason)
             self._mark_order(p, "cancelled")
+            with self._lock:
+                st2 = self.trades.get(symbol)
+                if st2 is not None:
+                    st2.last_buy_cancel_ts = time.time()   # 撤了 live P → 出場要等在途成交 (審查 #3)
             logger.info(f"[session] {symbol} 撤孤兒預掛單 P={p} ({reason})")
             return True
         except Exception as e:
@@ -1285,6 +1311,7 @@ class TradingSession:
             logger.error(f"[session] 補收查詢失敗: {e}")
             return
         recovered = 0
+        breach_now = False
         with self._lock:
             for order_no, row in self.order_log.items():
                 auth = auth_map.get(order_no)
@@ -1305,6 +1332,13 @@ class TradingSession:
                         st.avg_price = (prev_cost + st.limit_up * delta) / st.filled_lots
                         st.budget_reserved = max(
                             0.0, st.budget_reserved - delta * st.limit_up * 1000)
+                        # 硬上限: 補收的買進也要進實際買進累計 + 重查 breach — 否則斷線期間
+                        # (正是 reconcile 存在的 3587 情境) 狂買回報遺失 → 硬上限被繞過 (審查 #2/#5)。
+                        self._buy_cost_actual += delta * st.limit_up * 1000
+                        if (not self._budget_breached and self.total_budget > 0
+                                and self._buy_cost_actual > self.total_budget):
+                            self._budget_breached = True
+                            breach_now = True
                         if st.order_no == order_no and st.filled_lots >= st.target_lots:
                             st.order_status = "done"
                             st.order_no = ""
@@ -1317,6 +1351,13 @@ class TradingSession:
             logger.critical(f"[session] 補收對帳完成 — 共補 {recovered} 張")
         else:
             logger.warning("[session] 補收對帳完成 — 無差異")
+        # 補收後實際買進累計若已超總預算 → 觸發硬上限煞車 (撤所有 pending 買單)
+        if breach_now:
+            logger.critical(
+                f"[session] ⚠⚠ 補收對帳後發現總曝險超上限 — 實際買進 {self._buy_cost_actual:,.0f} "
+                f"> 總預算 {self.total_budget:,.0f} → 停所有市價盲送 + 撤所有 pending 買單")
+            threading.Thread(target=self.cancel_all_pending, args=("budget_breached",),
+                             name="budget-breach-cancel", daemon=True).start()
 
     # ─── broker 回報 ───────────────────────────────────────
 
@@ -1366,6 +1407,7 @@ class TradingSession:
             logger.info(f"[session] 非策略單成交,忽略 (僅落檔): {fill['symbol']} "
                         f"order={fill['order_no']} {fill['lots']} 張")
             return
+        breach_now = False
         with self._lock:
             # 委託總表同步 (前端顯示)
             row = self.order_log.get(fill["order_no"])
@@ -1399,6 +1441,13 @@ class TradingSession:
                 # 保留轉消耗 (預算不變式;晚到的 fill 若保留已被釋放,floor 0 保底)
                 st.budget_reserved = max(
                     0.0, st.budget_reserved - lots * st.limit_up * 1000)
+                # 總曝險硬上限: 實際買進現金累計 (每筆都加、不 floor → 超買 race 也真實反映)。
+                # 超過 total_budget → 一次性 breach:出鎖後停盲送 + 撤所有 pending 買單。
+                self._buy_cost_actual += lots * fill["price"] * 1000
+                if (not self._budget_breached and self.total_budget > 0
+                        and self._buy_cost_actual > self.total_budget):
+                    self._budget_breached = True
+                    breach_now = True
                 # 達 target 才清 order_no/標 done — 但**必須是 st 現在追的那張單**成交才清
                 # (守衛同 reconcile_orders): 進場 race 可能同時有預掛 P + 市價追 M 兩張 live,
                 # st.order_no 已被市價盲送 (_market_chase_worker) 蓋成 M;若 P 的成交補到 target 就清掉,
@@ -1410,6 +1459,14 @@ class TradingSession:
                     st.order_no = ""
             else:   # sell (出場)
                 st.filled_lots = max(0, st.filled_lots - lots)
+        # ── 硬上限觸發 (鎖外): 撤所有 pending 買單止血;已成交部位不動,靠出場全量賣。 ──
+        if breach_now:
+            logger.critical(
+                f"[session] ⚠⚠ 總曝險硬上限觸發 — 實際買進 {self._buy_cost_actual:,.0f} "
+                f"> 總預算 {self.total_budget:,.0f} → 停所有市價盲送 + 撤所有 pending 買單 "
+                f"(已成交部位不動,由出場賣出;當日不再買進)")
+            threading.Thread(target=self.cancel_all_pending, args=("budget_breached",),
+                             name="budget-breach-cancel", daemon=True).start()
 
     def _on_order(self, rpt: dict):
         """委託回報 — 交易所拒單時標 rejected (place_order 同步成功但交易所退)。"""
@@ -1498,6 +1555,8 @@ class TradingSession:
                     "per_symbol_budget": self.per_symbol_budget,
                 },
                 "budget_used": round(self.budget_used, 0),
+                "buy_cost_actual": round(self._buy_cost_actual, 0),   # 實際買進累計 (硬上限用)
+                "budget_breached": self._budget_breached,             # 總曝險硬上限已觸發
                 "n_symbols": len(self.trades),
                 "n_positions": sum(1 for s in self.trades.values() if s.filled_lots > 0),
             }

@@ -56,6 +56,14 @@ class FakeBroker:
     def get_inventories(self):
         return []
 
+    def get_filled_map(self):
+        # 斷線補收用: {order_no: 券商權威成交張數}。測試可設 broker.filled_map。
+        return dict(getattr(self, "filled_map", {}))
+
+    def status(self):
+        return {"connected": self.connected, "healthy": self.healthy,
+                "account_masked": "****", "is_test": True, "error": ""}
+
 
 def make_session(total=1_000_000, per_symbol=200_000,
                  sizing_mode="budget", fixed_lots=0):

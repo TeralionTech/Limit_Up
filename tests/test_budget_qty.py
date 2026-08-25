@@ -198,3 +198,123 @@ class TestRiskControlSizing:
         s.set_day_tradable({"1101": False})
         s.place_pre_orders(["1101"], {"1101": LIMIT})
         assert s.trades["1101"].target_lots == 11
+
+
+def _wait(cond, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class TestAggregateHardCap:
+    """總曝險硬上限 (2026-08-25): 實際買進累計現金 > total_budget → 單向煞車
+    (停所有市價盲送 + 撤所有 pending 買單);已成交部位不動,靠出場全量賣。sells/exits 不受影響。"""
+
+    def test_buy_cost_actual_accumulates_every_fill_incl_overbuy(self):
+        # 每筆買進 fill 都累加 (不 floor) → 超買 race 也真實反映;未超總預算 → 不 breach
+        s = _mk()                                        # total=1M, per_symbol=100k → 2 張
+        pre_no = s.trades["1101"].order_no
+        _fire_chase(s, "1101")
+        chase_no = s.trades["1101"].order_no
+        s._on_fill(_fill(pre_no, "1101", 2, LIMIT))                       # 90k
+        s._on_fill(_fill(chase_no, "1101", 2, LIMIT, filled_no="F2"))     # +90k = 180k (超買)
+        assert s._buy_cost_actual == 4 * COST_PER_LOT                     # 180k 真實反映
+        assert s._budget_breached is False                               # 180k < 1M
+
+    def test_fill_over_budget_sets_breach_and_cancels_other_pending(self):
+        s = make_session(total=170_000, per_symbol=90_000)   # 總預算僅夠 ~3.7 張
+        s.set_limit_downs({"1101": DOWN, "2330": DOWN})
+        s.place_pre_orders(["1101", "2330"], {"1101": LIMIT, "2330": LIMIT})
+        assert s.trades["1101"].target_lots == 2             # 90k//45k
+        assert s.trades["2330"].target_lots == 1             # 剩 80k → 1 張
+        n2330 = s.trades["2330"].order_no
+        pre1101 = s.trades["1101"].order_no
+        _fire_chase(s, "1101")                               # 送 M、撤 P(1101)
+        chase1101 = s.trades["1101"].order_no
+        s.broker.cancelled.clear()                           # 只看 breach 觸發的撤單
+        # 超買 race: 1101 的 P + M 都成交 → 4 張 = 180k > 170k → breach
+        s._on_fill(_fill(pre1101, "1101", 2, LIMIT))                     # 90k
+        s._on_fill(_fill(chase1101, "1101", 2, LIMIT, filled_no="F2"))   # 180k → breach
+        assert s._budget_breached is True
+        assert s.status()["budget_breached"] is True
+        # breach → 撤所有 pending 買單 (2330 那張) — async,等落地
+        assert _wait(lambda: s.trades["2330"].order_status == "cancelled"), "2330 pending 沒被撤"
+        assert any(c[0] == n2330 for c in s.broker.cancelled)
+
+    def test_breach_flag_blocks_new_chase(self):
+        s = make_session(total=90_000, per_symbol=90_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT})        # 2 張
+        s._budget_breached = True                            # 模擬已煞車
+        _fire_chase(s, "1101")
+        assert [c for c in s.broker.placed if c[0] == "market_buy"] == []   # 不送市價
+
+    def test_send_time_projection_blocks_over_budget_chase(self):
+        # 已實際買進逼近上限 → 下一檔盲送投影 (已買+本筆) 超上限 → 不送
+        s = make_session(total=90_000, per_symbol=90_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT})        # 2 張
+        s._buy_cost_actual = 90_000                          # 模擬他檔已花滿
+        _fire_chase(s, "1101")                               # 投影 90k+90k > 90k → 不送
+        assert [c for c in s.broker.placed if c[0] == "market_buy"] == []
+
+    def test_breach_does_not_block_exit_sell(self):
+        # 煞車只擋買,不擋賣 — 已成交部位出場照賣
+        s = _mk()
+        s._on_fill(_fill(s.trades["1101"].order_no, "1101", 2, LIMIT))
+        s._budget_breached = True
+        s._exit_worker("1101", "mkt_queue_gone")
+        assert ("limit_sell", "1101", DOWN, 2) in s.broker.placed
+
+    # ── 硬上限審查修正回歸 (2026-08-25 workflow review) ──
+    def test_breach_during_send_cancels_that_market_order(self):
+        # 審查 #1/#4 (HIGH): 盲送在放鎖後才 send;若 send 期間別檔成交觸發 breach,
+        # 送出後鎖內重查 _budget_breached → 立刻撤這筆 M (否則逃過一次性 cancel_all_pending)
+        s = make_session(total=90_000, per_symbol=90_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT})       # target 2
+        orig = s.broker.place_market_buy
+        sent = {}
+
+        def _send_then_breach(symbol, lots):
+            no = orig(symbol, lots)
+            s._budget_breached = True                        # 模擬 send 阻塞期間別檔成交 latch breach
+            return no
+        s.broker.place_market_buy = _send_then_breach
+        s.broker.cancelled.clear()
+        _fire_chase(s, "1101")
+        # 找到剛送出的 market_buy order_no (FakeBroker 依序 O{n})
+        assert ("market_buy", "1101", None, 2) in s.broker.placed   # M 確實送出
+        assert _wait(lambda: len(s.broker.cancelled) >= 1), "送出後 breach 的 M 沒被撤"
+
+    def test_reconcile_recovered_buy_feeds_hardcap(self):
+        # 審查 #2/#5 (HIGH): 斷線補收的買進也要進 _buy_cost_actual + 重查 breach,
+        # 否則斷線期間狂買 (回報遺失) → 硬上限被繞過
+        s = make_session(total=100_000, per_symbol=100_000)
+        s.place_pre_orders(["1101"], {"1101": LIMIT})       # 2 張
+        order_no = s.trades["1101"].order_no
+        s._buy_cost_actual = 60_000                          # 別檔已花 (模擬)
+        s.broker.filled_map = {order_no: 2}                  # 券商權威: 這單成交 2 張 (回報曾遺失)
+        s.reconcile_orders()
+        assert s.trades["1101"].filled_lots == 2
+        assert s._buy_cost_actual == 60_000 + 2 * COST_PER_LOT   # 補收進累計 = 150k
+        assert s._budget_breached is True                    # 150k > 100k → breach
+
+    def test_exit_waits_window_after_external_cancel(self, monkeypatch):
+        # 審查 #3 (MED): 別處 (如 breach) 先撤了買單 → order_no 已清、非孤兒,但撤單的在途成交
+        # 仍可能晚到;出場靠 last_buy_cancel_ts 判斷仍要等窗口,否則漏賣變隱形部位
+        import trading_session as ts
+        monkeypatch.setattr(ts, "_EXIT_FILL_WAIT_SEC", 0.6)
+        s = _mk()
+        st = s.trades["1101"]
+        order_no = st.order_no
+        # 模擬外部剛撤 live 買單: order_no 清、order_log 標撤 (非孤兒)、記撤單時刻
+        s._mark_order(order_no, "cancelled")
+        st.order_no = ""
+        st.order_status = "cancelled"
+        st.last_buy_cancel_ts = time.time()
+        import threading
+        threading.Timer(0.2, lambda: s._on_fill(_fill(order_no, "1101", 2, LIMIT))).start()
+        s._exit_worker("1101", "mkt_queue_gone")             # recently_cancelled → 等窗口 → 接 2 張
+        assert ("limit_sell", "1101", DOWN, 2) in s.broker.placed
+        assert s.trades["1101"].exited is True
