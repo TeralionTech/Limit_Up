@@ -22,6 +22,8 @@ export const api = {
       method: 'POST', body: JSON.stringify({ symbol }),
     }),
   t30: () => req<T30Info>('/api/t30'),
+  avgVol: (symbol?: string) =>
+    req<AvgVolInfo>('/api/avg-volume' + (symbol ? `?symbol=${encodeURIComponent(symbol)}` : '')),
   tick: (symbol: string) => req<TickSnapshot>(`/api/tick/${symbol}`),
   traderSummary: () => req<TraderSummary>('/api/trader/summary'),
   getTraderParams: () => req<{ first_trade_min_lots: number }>('/api/trader/params'),
@@ -137,6 +139,23 @@ export interface T30Info {
     missing_all?: boolean
     files?: Record<string, { exists: boolean; ok: boolean; mtime_date: string | null; stale: boolean }>
   }
+}
+
+// 月均量篩選診斷 (風控③) — 盤前檢視月均量計算是否正確執行
+export interface AvgVolInfo {
+  exists: boolean
+  count: number                // 檔內有量資料的檔數
+  mtime_date: string | null    // 檔案產出日期
+  stale: boolean               // 檔 > 3 天
+  is_today: boolean            // 檔案是否今天產出
+  threshold: number | null     // 門檻張數 (avg_volume_min_lots)
+  ran: boolean                 // 今天盤前篩選是否實際跑過
+  reason?: string | null       // ok / disabled / file_missing
+  universe_before?: number | null
+  kept?: number | null         // 今天保留檔數
+  dropped?: number | null      // 今天剔除檔數
+  dropped_sample?: string[]    // 剔除樣本 (前 100)
+  lookup?: { symbol: string; lots: number | null } | null   // ?symbol 抽查結果
 }
 
 export interface TickSnapshot {

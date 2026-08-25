@@ -85,3 +85,43 @@ class TestFilterUniverse:
         # 完全沒資料 → 全保留 (fail-open)
         kept, dropped = avg_volume.filter_universe(["2330", "1101"], {}, 500)
         assert kept == ["2330", "1101"] and dropped == []
+
+
+class TestRunnerAvgVolCapture:
+    """runner._filter_low_volume 保存今天結果到 self._avgvol (/api/avg-volume 顯示用)。"""
+
+    @staticmethod
+    def _runner(universe, thr=500):
+        from types import SimpleNamespace
+        from runner import Runner
+        r = Runner.__new__(Runner)                 # 不跑 __init__,只測單一方法
+        r.cfg = SimpleNamespace(avg_volume_min_lots=thr)
+        r.universe = list(universe)
+        r._avgvol = {}
+        return r
+
+    def test_capture_dropped_kept(self, tmp_path, monkeypatch):
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps({"2330": 30000.0, "1101": 100.0}), encoding="utf-8")
+        monkeypatch.setenv("AVG_VOLUME_FILE", str(f))
+        r = self._runner(["2330", "1101", "9999"])
+        r._filter_low_volume()
+        av = r._avgvol
+        assert av["ran"] is True
+        assert av["universe_before"] == 3
+        assert av["kept"] == 2 and av["dropped"] == 1        # 1101 剔除;2330/9999 保留
+        assert "1101" in av["dropped_sample"]
+        assert av["meta"]["count"] == 2
+        assert r.universe == ["2330", "9999"]                 # fail-open: 9999 無資料保留
+
+    def test_capture_disabled(self):
+        r = self._runner([], thr=0)
+        r._filter_low_volume()
+        assert r._avgvol == {"ran": False, "reason": "disabled", "threshold": 0}
+
+    def test_capture_file_missing_fail_open(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AVG_VOLUME_FILE", str(tmp_path / "nope.json"))
+        r = self._runner(["2330"])
+        r._filter_low_volume()
+        assert r._avgvol["ran"] is False and r._avgvol["reason"] == "file_missing"
+        assert r.universe == ["2330"]                          # 檔缺 → 不剔 (fail-open)

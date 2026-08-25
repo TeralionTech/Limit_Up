@@ -1,7 +1,9 @@
 """API endpoints — 給前端 3 個分頁讀資料."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, time as _time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -144,6 +146,44 @@ def get_t30():
         "count": len(syms),
         "symbols": syms,
         "meta": getattr(r, "_t30_meta", None) or {},
+    }
+
+
+@router.get("/avg-volume")
+def get_avg_volume(symbol: Optional[str] = None):
+    """月均量篩選診斷 (風控③) — 檔案健康 (是否今天產出/幾檔/門檻) + 今天實際剔除/保留數
+    + 抽查個股月均量 (?symbol=2330)。盤前檢視月均量計算是否正確執行。graceful,不 raise。"""
+    import avg_volume as _av
+    r = Runner.get()
+    path = os.environ.get("AVG_VOLUME_FILE",
+                          str(Path(__file__).parent / "input" / "avg_volume.json"))
+    data, meta = _av.load(path)                        # fresh 讀檔 — 免依賴 run 是否跑過
+    is_today = bool(meta.get("mtime_date") == datetime.now().strftime("%Y-%m-%d"))
+    threshold = r.cfg.avg_volume_min_lots if r.cfg is not None else None
+    if threshold is None:
+        try:
+            threshold = float(os.environ.get("AVG_VOLUME_MIN_LOTS", "500"))
+        except ValueError:
+            threshold = None
+    av = getattr(r, "_avgvol", None) or {}            # 今天實際跑的結果 (runner 保存)
+    lookup = None
+    if symbol:
+        s = symbol.strip()
+        lookup = {"symbol": s, "lots": data.get(s)}   # lots=None → 檔內查無 (被剔或非母體)
+    return {
+        "exists": meta["exists"],
+        "count": meta["count"],
+        "mtime_date": meta.get("mtime_date"),
+        "stale": meta["stale"],
+        "is_today": is_today,
+        "threshold": threshold,
+        "ran": bool(av.get("ran")),
+        "reason": av.get("reason"),
+        "universe_before": av.get("universe_before"),
+        "kept": av.get("kept"),
+        "dropped": av.get("dropped"),
+        "dropped_sample": av.get("dropped_sample") or [],
+        "lookup": lookup,
     }
 
 

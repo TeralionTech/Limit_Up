@@ -63,6 +63,7 @@ class Runner:
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
         self.day_tradable: Dict[str, bool] = {}   # symbol → canDayTrade (禁現沖減半用,風控①)
         self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
+        self._avgvol: dict = {}          # 月均量篩選結果 (今天 ran/dropped/kept/meta) — /api/avg-volume 顯示用
         self.state = None                # state.State
         self.subscriber = None
         self.trader = None
@@ -571,23 +572,32 @@ class Runner:
         """月均量 < cfg.avg_volume_min_lots(張) 的股票盤前剔除 (縮母體省下游 REST)。
         資料來自 scripts/compute_avg_volume.py 夜間產的 input/avg_volume.json。
         fail-open (2026-08-24 定案): 檔缺/某檔無資料 → 不剔除,照常交易。門檻 0 → 停用。"""
-        if self.cfg.avg_volume_min_lots <= 0:
+        thr = self.cfg.avg_volume_min_lots
+        if thr <= 0:
+            self._avgvol = {"ran": False, "reason": "disabled", "threshold": thr}
             return
         import avg_volume as _av
         path = os.environ.get("AVG_VOLUME_FILE",
                               str(Path(__file__).parent / "input" / "avg_volume.json"))
         data, meta = _av.load(path)
         if not meta["exists"]:
+            self._avgvol = {"ran": False, "reason": "file_missing", "meta": meta, "threshold": thr}
             logger.critical(f"[runner] ⚠ 月均量檔缺 ({path}) — 不做低量篩選 (fail-open),"
                             f"全母體照跑。請檢查 avg_volume timer")
             return
         if meta["stale"]:
             logger.critical(f"[runner] ⚠ 月均量檔非近期 (mtime {meta['mtime_date']}) — 照用,"
                             f"請檢查 avg_volume timer")
-        kept, dropped = _av.filter_universe(self.universe, data,
-                                            self.cfg.avg_volume_min_lots)
-        logger.info(f"[runner] 月均量篩選: {len(self.universe)} → {len(kept)} 檔 "
-                    f"(剔除 {len(dropped)} 檔日均量 < {self.cfg.avg_volume_min_lots} 張;"
+        universe_before = len(self.universe)
+        kept, dropped = _av.filter_universe(self.universe, data, thr)
+        # /api/avg-volume 顯示用 — 記今天實際跑的結果 (dropped_sample 限 100 檔避免整包)
+        self._avgvol = {
+            "ran": True, "reason": "ok", "meta": meta, "threshold": thr,
+            "universe_before": universe_before, "kept": len(kept), "dropped": len(dropped),
+            "dropped_sample": sorted(dropped)[:100],
+        }
+        logger.info(f"[runner] 月均量篩選: {universe_before} → {len(kept)} 檔 "
+                    f"(剔除 {len(dropped)} 檔日均量 < {thr} 張;"
                     f"檔內 {meta['count']} 檔有量資料)")
         self.universe = kept
 

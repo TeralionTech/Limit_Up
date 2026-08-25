@@ -1,18 +1,20 @@
 import { useEffect, useState } from 'react'
-import { api, FilterProgress, Watchlist, T30Info } from '../api'
+import { api, FilterProgress, Watchlist, T30Info, AvgVolInfo } from '../api'
 
 export default function FilterPage() {
   const [prog, setProg] = useState<FilterProgress | null>(null)
   const [watch, setWatch] = useState<Watchlist | null>(null)
   const [t30, setT30] = useState<T30Info | null>(null)
+  const [avgVol, setAvgVol] = useState<AvgVolInfo | null>(null)
   const [msg, setMsg] = useState('')
 
   async function reload() {
     try {
-      const [p, w, t] = await Promise.all([
-        api.filterProgress(), api.watchlist(), api.t30().catch(() => null),
+      const [p, w, t, av] = await Promise.all([
+        api.filterProgress(), api.watchlist(),
+        api.t30().catch(() => null), api.avgVol().catch(() => null),
       ])
-      setProg(p); setWatch(w); if (t) setT30(t)
+      setProg(p); setWatch(w); if (t) setT30(t); if (av) setAvgVol(av)
     } catch {
       // 忽略單次 error
     }
@@ -131,6 +133,9 @@ export default function FilterPage() {
         </div>
       </section>
 
+      {/* 月均量篩選診斷 (風控③) */}
+      <AvgVolSection avgVol={avgVol} />
+
       {/* T30 禁單清單 (全額交割 / 需預收) */}
       <T30Section t30={t30} />
 
@@ -166,6 +171,118 @@ function MarkChip({ sym, lock, onRemove }: { sym: string; lock?: boolean; onRemo
       <button onClick={onRemove} title="盤前手動剔除 (不會下單)"
               className="ml-0.5 text-gray-400 hover:text-red-600 font-bold leading-none">✗</button>
     </span>
+  )
+}
+
+
+function MiniStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="border rounded-lg p-2 text-center">
+      <div className="text-xs text-gray-500">{label}</div>
+      <div className="text-xl font-bold font-mono mt-0.5">{value.toLocaleString()}</div>
+    </div>
+  )
+}
+
+function AvgVolSection({ avgVol }: { avgVol: AvgVolInfo | null }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const [look, setLook] = useState<{ symbol: string; lots: number | null } | null>(null)
+  const [looking, setLooking] = useState(false)
+  const a = avgVol
+  const thr = a?.threshold ?? null
+
+  async function doLookup() {
+    const s = q.trim()
+    if (!s) { setLook(null); return }
+    setLooking(true)
+    try {
+      const r = await api.avgVol(s)
+      setLook(r.lookup ?? { symbol: s, lots: null })
+    } catch {
+      setLook({ symbol: s, lots: null })
+    } finally {
+      setLooking(false)
+    }
+  }
+
+  return (
+    <section className="bg-white rounded-lg shadow p-4">
+      <button onClick={() => setOpen(o => !o)} className="w-full flex items-center gap-2 text-left">
+        <span className="font-semibold text-gray-700">📊 月均量篩選{thr != null ? ` (門檻 ${thr} 張)` : ''}</span>
+        <span className="text-xs text-gray-400">日均量 &lt; 門檻 盤前剔除 (風控③)</span>
+        <span className="ml-auto text-gray-400">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {/* 健康橫幅 — 永遠顯示 (回答「今天有沒有正確跑」) */}
+      {a && (
+        <div className="mt-2 text-xs">
+          {!a.exists ? (
+            <span className="text-red-600 font-medium">⚠ avg_volume.json 缺檔 — 未篩月均量 (fail-open 照常交易),請檢查 avgvol timer</span>
+          ) : a.is_today ? (
+            <span className="text-green-700">✓ 今日 {a.mtime_date} 已產出,{a.count.toLocaleString()} 檔有量資料</span>
+          ) : (
+            <span className="text-orange-600">⚠ 檔非今日 (產於 {a.mtime_date ?? '—'}) — 今天可能沒跑到,請檢查 avgvol timer</span>
+          )}
+        </div>
+      )}
+
+      {open && a && (
+        <div className="mt-3">
+          {/* 今天實際跑的結果 */}
+          {a.ran ? (
+            <div className="grid grid-cols-3 gap-3 mb-3">
+              <MiniStat label="檔內有量" value={a.count} />
+              <MiniStat label="今日剔除" value={a.dropped ?? 0} />
+              <MiniStat label="今日保留" value={a.kept ?? 0} />
+            </div>
+          ) : (
+            <div className="text-xs text-gray-400 mb-3">
+              {a.reason === 'disabled' ? '月均量篩選已停用 (門檻 0)'
+                : a.reason === 'file_missing' ? '檔缺,今日未執行篩選 (fail-open)'
+                  : '今日尚未執行篩選 (盤前 08:00 才跑)'}
+            </div>
+          )}
+
+          {/* 抽查個股月均量 */}
+          <div className="flex items-center gap-2 mb-2">
+            <input value={q} onChange={e => setQ(e.target.value)}
+                   onKeyDown={e => { if (e.key === 'Enter') doLookup() }}
+                   placeholder="抽查代號 (例 2330)"
+                   className="border rounded px-2 py-1 text-sm font-mono w-40" />
+            <button onClick={doLookup} disabled={looking}
+                    className="text-sm bg-blue-600 text-white px-3 py-1 rounded disabled:opacity-50">
+              {looking ? '查詢中' : '查月均量'}
+            </button>
+          </div>
+          {look && (
+            <div className="text-sm mb-3">
+              {look.lots != null ? (
+                <span className="font-mono">{look.symbol} = <b>{look.lots.toLocaleString()}</b> 張
+                  {thr != null && (look.lots < thr
+                    ? <span className="text-red-600"> (＜門檻,會被剔除)</span>
+                    : <span className="text-green-700"> (達門檻,保留)</span>)}
+                </span>
+              ) : (
+                <span className="text-gray-500 font-mono">{look.symbol} — 檔內查無 (非上市普通股 / 資料缺)</span>
+              )}
+            </div>
+          )}
+
+          {/* 今日剔除樣本 */}
+          {(a.dropped_sample?.length ?? 0) > 0 && (
+            <div>
+              <div className="text-xs text-gray-500 mb-1">今日剔除樣本 (前 {a.dropped_sample!.length} 檔):</div>
+              <div className="flex flex-wrap gap-2 max-h-48 overflow-y-auto">
+                {a.dropped_sample!.map(s => (
+                  <span key={s} className="inline-block bg-gray-100 border border-gray-300 text-gray-600 px-2 py-0.5 rounded text-sm font-mono">{s}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   )
 }
 
