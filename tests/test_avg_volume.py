@@ -125,3 +125,86 @@ class TestRunnerAvgVolCapture:
         r._filter_low_volume()
         assert r._avgvol["ran"] is False and r._avgvol["reason"] == "file_missing"
         assert r.universe == ["2330"]                          # 檔缺 → 不剔 (fail-open)
+
+
+_WRAPPED = {"date": "2026-08-26", "generated_at": "2026-08-26T07:31:00+08:00",
+            "avg_lots": {"2330": 25000.0, "1101": 800.5}}
+
+
+class TestLoadWrappedShape:
+    """Stage A5 包裝形 {date, generated_at, avg_lots} — 兩半分開部署,先到哪半都不能壞。"""
+
+    def test_wrapped_shape(self, tmp_path):
+        # 突變必殺: load 不解包 (包裝形判斷改永不成立) → data=={} 且 meta["date"] None
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps(_WRAPPED), encoding="utf-8")
+        data, meta = avg_volume.load(f)
+        assert data == {"2330": 25000.0, "1101": 800.5}
+        assert meta["count"] == 2
+        assert meta["date"] == "2026-08-26"       # 檔內日期,非 mtime
+
+    def test_legacy_flat_still_loads(self, tmp_path):
+        # 迴歸: 舊平面形照舊載入 (VPS 腳本先/後部署都行);檔內無日期 → meta["date"] None
+        # 突變必殺: load 把所有 dict 都當包裝形解 (拿掉 key 檢查) → data=={}
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps({"2330": 25000.0}), encoding="utf-8")
+        data, meta = avg_volume.load(f)
+        assert data == {"2330": 25000.0}
+        assert meta["date"] is None
+
+
+class TestAvgVolumeFullEndpoint:
+    """GET /api/avg-volume/full — IDC 端每日 08:05 拉全量 map。
+    route 不經 Runner,直接呼叫函式測 (免起 app)。"""
+
+    @pytest.fixture(autouse=True)
+    def _needs_fastapi(self):
+        # 只窄跳 fastapi 沒裝的環境 (CI 裝 requirements 一定跑);
+        # 不 importorskip("api") — 那會把 api.py 本身壞掉偽裝成 skip
+        pytest.importorskip("fastapi")
+
+    @staticmethod
+    def _call(monkeypatch, path, token=None, auth=None):
+        import api
+        monkeypatch.setenv("AVG_VOLUME_FILE", str(path))
+        if token is None:
+            monkeypatch.delenv("AVGVOL_TOKEN", raising=False)
+        else:
+            monkeypatch.setenv("AVGVOL_TOKEN", token)
+        return api.get_avg_volume_full(authorization=auth)
+
+    def test_wrapped_file_served(self, tmp_path, monkeypatch):
+        # 突變必殺: route 的 count 改回 0 (或 date/avg_lots 不從檔取)
+        # 也蓋「沒設 AVGVOL_TOKEN = 開放」: _call 未給 token → 不帶 header 也 200
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps(_WRAPPED), encoding="utf-8")
+        resp = self._call(monkeypatch, f)
+        assert resp["exists"] is True
+        assert resp["date"] == "2026-08-26"
+        assert resp["generated_at"] == "2026-08-26T07:31:00+08:00"
+        assert resp["count"] == 2
+        assert resp["avg_lots"] == {"2330": 25000.0, "1101": 800.5}
+
+    def test_missing_file_exists_false(self, tmp_path, monkeypatch):
+        # 突變必殺: 拿掉缺檔 early-return → 讀檔 raise (=500) 而非 {"exists": False}
+        resp = self._call(monkeypatch, tmp_path / "nope.json")
+        assert resp == {"exists": False}
+
+    def test_401_when_token_set_and_header_wrong(self, tmp_path, monkeypatch):
+        # 突變必殺: 比對弱化成「只檢查有沒有 header」→ 錯 token 也 200
+        from fastapi import HTTPException
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps(_WRAPPED), encoding="utf-8")
+        with pytest.raises(HTTPException) as ei:               # 沒帶 header
+            self._call(monkeypatch, f, token="s3cret", auth=None)
+        assert ei.value.status_code == 401
+        with pytest.raises(HTTPException) as ei:               # 帶錯 token
+            self._call(monkeypatch, f, token="s3cret", auth="Bearer wrong")
+        assert ei.value.status_code == 401
+
+    def test_200_with_correct_bearer(self, tmp_path, monkeypatch):
+        # 突變必殺: 有設 token 就一律 401 (正確 Bearer 也擋) → 這裡 raise
+        f = tmp_path / "avg_volume.json"
+        f.write_text(json.dumps(_WRAPPED), encoding="utf-8")
+        resp = self._call(monkeypatch, f, token="s3cret", auth="Bearer s3cret")
+        assert resp["exists"] is True and resp["count"] == 2

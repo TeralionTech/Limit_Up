@@ -25,6 +25,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -127,10 +128,19 @@ def main():
         return
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 包裝形 (Stage A5): 檔內帶 date/generated_at — mtime 會被重佈署 touch 洗掉,
+    # 檔內日期才是強信號 (IDC 端 08:05 拉 /api/avg-volume/full 靠它判斷是否今日資料)。
+    # timer 是交易日早上 07:00 跑 (見 deploy/hit-limit-up-avgvol.timer) → date = 台北「今天」。
+    now_tpe = datetime.now(ZoneInfo("Asia/Taipei"))
+    payload = {
+        "date": now_tpe.strftime("%Y-%m-%d"),
+        "generated_at": now_tpe.isoformat(),
+        "avg_lots": result,
+    }
     tmp = out_path.parent / (out_path.name + ".tmp")
-    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=0), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=0), encoding="utf-8")
     os.replace(tmp, out_path)
-    logger.info(f"已寫 {out_path} ({len(result)} 檔)")
+    logger.info(f"已寫 {out_path} ({len(result)} 檔, date={payload['date']})")
 
 
 if __name__ == "__main__":

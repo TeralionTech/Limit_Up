@@ -1,12 +1,13 @@
 """API endpoints — 給前端 3 個分頁讀資料."""
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, time as _time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import pnl
@@ -185,6 +186,31 @@ def get_avg_volume(symbol: Optional[str] = None):
         "dropped_sample": av.get("dropped_sample") or [],
         "lookup": lookup,
     }
+
+
+@router.get("/avg-volume/full")
+def get_avg_volume_full(authorization: Optional[str] = Header(None)):
+    """全量月均量 map (Stage A5) — 給 IDC 端每日 08:05 拉取。直接讀檔 serve。
+    缺檔回 {"exists": false} 不 500 (首次部署/timer 沒跑過屬正常);壞檔讓它 500 (要大聲,
+    「讀不了」不能偽裝成「沒有」)。
+    Auth: 環境有 AVGVOL_TOKEN 才驗 Bearer (每次 request 讀 os.environ,免重啟語意);
+    沒設 = 開放 (資料是公開行情衍生)。"""
+    token = os.environ.get("AVGVOL_TOKEN")
+    if token and authorization != f"Bearer {token}":
+        raise HTTPException(401, "unauthorized")
+    path = Path(os.environ.get("AVG_VOLUME_FILE",
+                               str(Path(__file__).parent / "input" / "avg_volume.json")))
+    if not path.is_file():
+        return {"exists": False}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    # 新包裝形 (有 avg_lots+date);過渡期舊平面形照 serve,date/generated_at 給 None
+    if isinstance(raw, dict) and "avg_lots" in raw and "date" in raw:
+        lots = raw.get("avg_lots") or {}
+        date, generated_at = raw.get("date"), raw.get("generated_at")
+    else:
+        lots, date, generated_at = (raw if isinstance(raw, dict) else {}), None, None
+    return {"exists": True, "date": date, "generated_at": generated_at,
+            "count": len(lots), "avg_lots": lots}
 
 
 # ─── 分頁 2: 股票資料頁 ─────────────────────────────────────
