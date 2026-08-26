@@ -16,3 +16,6 @@ frontend/tsconfig.tsbuildinfo
 # log
 log
 *.log
+# replay 真實資料 (tick JSONL 太大,不進 git)
+replay_data/
+*_ticks.jsonl
