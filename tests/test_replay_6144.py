@@ -6,7 +6,6 @@
 第一筆被拒就停。此測試讀真實拒單字串驅動修正後的程式碼,鎖住這個行為。
 """
 import csv
-import time
 from pathlib import Path
 
 import pytest
@@ -66,8 +65,5 @@ class TestReplay6144:
         assert sends["n"] == 1, (
             f"修正後應只送 1 筆即停 (當天舊碼送了 {hist_mkt} 筆), 實得 {sends['n']}")
         assert s.trades[SYMBOL].stopped_reason == "fatal_reject"
-        # 致命拒單 (價格穩定) → 市價放棄 + **也撤預掛 P** (2026-08-26 統一撤 P);async 撤單等落地
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and s.trades[SYMBOL].order_status != "cancelled":
-            time.sleep(0.01)
-        assert s.trades[SYMBOL].order_status == "cancelled"
+        # 致命拒單 (價格穩定) → 市價放棄、**保留預掛 P 續守** (2026-08-26: P 只在委託成功時撤)
+        assert s.trades[SYMBOL].order_kind == "pre_limit"

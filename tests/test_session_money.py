@@ -3,8 +3,6 @@
 FakeBroker 滿足 _broker_ready (connected/healthy) — 不需要富邦 SDK。
 預算不變式: budget_used == Σ(買進已成交×漲停×1000) + Σ(st.budget_reserved)。
 """
-import time
-
 import pytest
 
 from trading_session import TradingSession
@@ -359,8 +357,8 @@ class TestMarketBlindChase:
         assert s.trades["2330"].order_kind == "pre_limit"
         assert s.budget_used == 200_000                    # 預算不動
 
-    def test_fatal_reject_cancels_pre_even_if_first_trade_arrived(self):
-        # 2026-08-26 定案: 致命拒單也撤預掛 P (統一撤 P、整檔放棄);即使第一盤成交已來也一樣撤
+    def test_fatal_reject_keeps_pre_even_if_first_trade_arrived(self):
+        # 2026-08-26 定案: 致命拒單**保留預掛 P**(P 只在委託成功時撤);即使第一盤成交已來也一樣保留
         s = make_session()
         s.place_pre_orders(["6144"], {"6144": 100.0})
         pre_no = s.trades["6144"].pre_order_no
@@ -371,12 +369,11 @@ class TestMarketBlindChase:
         s.broker.cancelled.clear()
         _fire_chase(s, "6144")
         assert s.trades["6144"].stopped_reason == "fatal_reject"
-        deadline = time.monotonic() + 2                         # 撤 P 走 async → 等落地
-        while time.monotonic() < deadline and s.trades["6144"].order_status != "cancelled":
-            time.sleep(0.01)
-        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 致命拒單也撤預掛 P
-        assert s.trades["6144"].order_status == "cancelled"
-        assert s.budget_used == 0                               # P 保留預算釋放
+        assert s.broker.cancelled == []                         # 致命拒單不撤 P
+        assert s.trades["6144"].order_no == pre_no              # P 續守
+        assert s.trades["6144"].order_status == "pending"
+        assert s.trades["6144"].order_kind == "pre_limit"
+        assert s.budget_used == 100_000 * 2                     # 預算不動 (2 張 × 100k)
 
 
 class TestFirstTradeGating:
@@ -455,11 +452,10 @@ class TestFatalReject:
         _fire_chase(s, "6225")
         assert calls["n"] == 1                           # 只送 1 筆就停 (原本會無限狂送)
         assert s.trades["6225"].stopped_reason == "fatal_reject"
-        # 致命拒單 → 市價放棄 + **也撤預掛 P** (2026-08-26 統一撤 P);async 撤單等落地
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and s.trades["6225"].order_status != "cancelled":
-            time.sleep(0.01)
-        assert s.trades["6225"].order_status == "cancelled"
+        # 致命拒單 → 市價放棄、**保留預掛 P 續守** (2026-08-26: P 只在委託成功時撤)
+        assert s.broker.cancelled == []
+        assert s.trades["6225"].order_kind == "pre_limit"
+        assert s.trades["6225"].order_status == "pending"
 
     # 2026-08-21 6144 事故: 「價格穩定措施」拒單原本不在停止清單 → 26 秒狂送 100 筆
     PRICE_STABLE_MSG = "證券委託觸及價格穩定措施上、下限價格"

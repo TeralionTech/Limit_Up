@@ -618,7 +618,7 @@ class TradingSession:
             + 預算轉移 (釋放預掛保留、改保留市價 shortfall,等額 → budget_used 不變)
           - 停止: 委託成功 / 價格穩定或致命拒單 / cutoff (09:03) / kill switch / 該檔淘汰或出場 / 13:23
           - 處置股禁市價 → 不盲送 (只留 08:59:58 漲停價預掛限價單)
-          - 致命拒單 (價格穩定 6144 / 全額交割 6225) → 放棄市價,**也撤預掛 P (整檔放棄、釋放預算)**
+          - 致命拒單 (價格穩定 6144 / 全額交割 6225) → 放棄市價,**保留預掛 P 續守** (P 只在委託成功時撤)
         超買防線: 送 shortfall + 委託成功即撤 P → 正常情形部位 = target,不 2×。殘餘 race
         (P 撤單與成交在券商端賽跑、都成交) 才可能短暫超買,由出場全量賣掉;budget_used 為近似
         (超買 race 時略低估,已接受)。孤兒 P 若出場前未撤,出場/13:23 再兜底撤 (見 _cancel_orphan_pre)。"""
@@ -703,14 +703,12 @@ class TradingSession:
                 return
             except Exception as e:
                 if _is_fatal_reject(e):
-                    # 停止拒因 (全額交割 6225 / 價格穩定 6144) — 立即放棄此檔,不再送。
-                    # **也撤預掛 P**(使用者定案 2026-08-26,統一撤 P、回到 0efa46e 無條件撤 P 行為):
-                    # 遇致命拒單整檔放棄(價格穩定時市價被拒 + 限價 P 撤 → 該檔完全不買)。
-                    # 此時未委託成功、order_no 仍是 P → 用 cancel_symbol_orders (釋放 P 保留預算)。
+                    # 停止拒因 (全額交割 6225 / 價格穩定 6144) — 立即放棄市價,不再送;**保留預掛 P 續守**
+                    # (2026-08-26 定案: P 只在市價委託成功(A)時撤;其餘「市價沒成功」一律留 P。
+                    # 價格穩定時漲停限價 P 仍是有效排隊單,留著整天還可能成交;13:23 cancel_all 才兜底撤)。
                     with self._lock:
                         st.stopped_reason = "fatal_reject"
-                    logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 + 撤預掛 P: {e}")
-                    self.cancel_symbol_orders_async(symbol, "fatal_reject")
+                    logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 (保留預掛 P 續守): {e}")
                     return
                 # 停止條件 (B) 使用者定案 (2026-08-26 改保留 P): 「第一盤成交資訊來」時,這筆(剛送出
                 # 被暫時拒的)即最後一筆 → 收手停送,但**保留預掛 P 續守**(不撤、不動預算、不設 stopped_reason):
