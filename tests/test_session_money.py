@@ -357,10 +357,11 @@ class TestMarketBlindChase:
         assert s.trades["2330"].order_status == "cancelled"
         assert s.budget_used == 0                               # P 保留預算釋放
 
-    def test_fatal_reject_keeps_pre_even_if_first_trade_arrived(self):
-        # 致命拒單安全防線優先於 (B): 即使第一盤成交已來,價格穩定拒單仍保留預掛 P
+    def test_fatal_reject_cancels_pre_even_if_first_trade_arrived(self):
+        # 2026-08-26 定案: 致命拒單也撤預掛 P (統一撤 P、整檔放棄);即使第一盤成交已來也一樣撤
         s = make_session()
         s.place_pre_orders(["6144"], {"6144": 100.0})
+        pre_no = s.trades["6144"].pre_order_no
         s.trades["6144"].first_trade_fired = True
         def reject(symbol, lots):
             raise RuntimeError("證券委託觸及價格穩定措施上、下限價格")
@@ -368,8 +369,12 @@ class TestMarketBlindChase:
         s.broker.cancelled.clear()
         _fire_chase(s, "6144")
         assert s.trades["6144"].stopped_reason == "fatal_reject"
-        assert s.trades["6144"].order_kind == "pre_limit"       # P 續守,未撤
-        assert s.broker.cancelled == []
+        deadline = time.monotonic() + 2                         # 撤 P 走 async → 等落地
+        while time.monotonic() < deadline and s.trades["6144"].order_status != "cancelled":
+            time.sleep(0.01)
+        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 致命拒單也撤預掛 P
+        assert s.trades["6144"].order_status == "cancelled"
+        assert s.budget_used == 0                               # P 保留預算釋放
 
 
 class TestFirstTradeGating:
@@ -448,7 +453,11 @@ class TestFatalReject:
         _fire_chase(s, "6225")
         assert calls["n"] == 1                           # 只送 1 筆就停 (原本會無限狂送)
         assert s.trades["6225"].stopped_reason == "fatal_reject"
-        assert s.trades["6225"].order_kind == "pre_limit"   # 致命拒單 → 市價放棄、預掛 P 續守 (不撤)
+        # 致命拒單 → 市價放棄 + **也撤預掛 P** (2026-08-26 統一撤 P);async 撤單等落地
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and s.trades["6225"].order_status != "cancelled":
+            time.sleep(0.01)
+        assert s.trades["6225"].order_status == "cancelled"
 
     # 2026-08-21 6144 事故: 「價格穩定措施」拒單原本不在停止清單 → 26 秒狂送 100 筆
     PRICE_STABLE_MSG = "證券委託觸及價格穩定措施上、下限價格"
