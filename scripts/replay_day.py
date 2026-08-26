@@ -150,6 +150,10 @@ def run(args):
         session.set_day_tradable(day_tradable)
     session.set_limit_downs(limit_downs)
 
+    # replay 決定性: 把非同步/背景 thread 路徑改成同步 (單執行緒重放,免 race + 免 rate-limiter 真時間節流)
+    session.cancel_symbol_orders_async = session.cancel_symbol_orders
+    session.exit_position = lambda symbol, reason: session._exit_worker(symbol, reason)
+
     filter_cfg = SimpleNamespace(pre_order_time="08:59:58", final_check_start="08:59:58")
     trader_cfg = SimpleNamespace(first_trade_min_lots=args.first_trade_min_lots,
                                  bid_decline_sample_sec=60, bid_decline_minutes=5)
@@ -243,29 +247,19 @@ def run(args):
                 if ctx["phase"] in ("filter", "preopen"):
                     filter_on_book(symbol, bids, asks)
                 elif ctx["trader"] is not None:
-                    before = _exit_count(session)
-                    ctx["trader"].on_book(symbol, bids, asks)
-                    _record_new_exits(session, ctx, before)
+                    ctx["trader"].on_book(symbol, bids, asks)   # 支撐消失 → 同步出場
             elif channel == "trades":
                 n_trades += 1
                 if ctx["phase"] == "trading" and ctx["trader"] is not None:
                     ctx["trader"].on_trade(symbol, data)
 
+    # 出場清單: 重放結束後直接由 session 狀態算 (同步出場,已定案)
+    ctx["exits"] = [(s, st.stopped_reason, st.filled_lots)
+                    for s, st in session.trades.items() if st.exited]
     report = _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades)
     return SimpleNamespace(session=session, state=state, ctx=ctx,
                            broker=session.broker, report=report,
                            marked=ctx.get("pre_marked", []), exits=ctx["exits"])
-
-
-def _exit_count(session):
-    return sum(1 for st in session.trades.values() if st.exited)
-
-
-def _record_new_exits(session, ctx, before):
-    if _exit_count(session) > before:
-        for sym, st in session.trades.items():
-            if st.exited and sym not in {e[0] for e in ctx["exits"]}:
-                ctx["exits"].append((sym, st.stopped_reason, st.filled_lots))
 
 
 def _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades):
