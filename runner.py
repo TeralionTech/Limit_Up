@@ -711,7 +711,7 @@ class Runner:
             self._sweep_unmarked_pre_orders(marked)
             # 9:00:00 起市價盲送搶進 (時間驅動,不等首筆成交 tick;首筆委託成功即停)
             try:
-                cutoff = self._parse_time_hhmm(self.cfg.market_chase_cutoff) or dtime(9, 5)
+                cutoff = self._parse_time_hhmm(self.cfg.market_chase_cutoff) or dtime(9, 3)
                 self.session.start_market_chase(marked, self._trade_start_time, cutoff)
                 logger.info(f"[runner] 市價盲送已排程 — {len(marked)} 檔,"
                             f"{self._trade_start_time}~{cutoff}")

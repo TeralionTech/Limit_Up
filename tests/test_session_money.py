@@ -339,23 +339,25 @@ class TestMarketBlindChase:
         assert calls["n"] == 1
         assert s.trades["6144"].stopped_reason == "fatal_reject"
 
-    def test_first_trade_arrived_stops_and_cancels_pre(self):
-        # 停止條件 (B) 2026-08-25: 非致命拒單 + 第一盤成交已來 → 停送 + 撤預掛 P + 釋放預算
+    def test_first_trade_arrived_stops_keeps_pre(self):
+        # 停止條件 (B) 2026-08-26 改: 非致命拒單 + 第一盤成交已來 → 停送,但**保留預掛 P 續守**
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2,保留 200k
         pre_no = s.trades["2330"].pre_order_no
         s.trades["2330"].first_trade_fired = True           # 第一盤成交已來
+        sends = {"n": 0}
         def reject(symbol, lots):
+            sends["n"] += 1
             raise RuntimeError("busy")                      # 非致命
         s.broker.place_market_buy = reject
         s.broker.cancelled.clear()
         _fire_chase(s, "2330")
-        deadline = time.monotonic() + 2                     # 撤 P 走 async thread → 等它落地
-        while time.monotonic() < deadline and not s.broker.cancelled:
-            time.sleep(0.01)
-        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 撤預掛 P
-        assert s.trades["2330"].order_status == "cancelled"
-        assert s.budget_used == 0                               # P 保留預算釋放
+        assert sends["n"] == 1                              # 第一盤成交來 → 只送最後一筆就停
+        assert s.broker.cancelled == []                    # **不撤 P**
+        assert s.trades["2330"].order_no == pre_no         # P 續守
+        assert s.trades["2330"].order_status == "pending"
+        assert s.trades["2330"].order_kind == "pre_limit"
+        assert s.budget_used == 200_000                    # 預算不動
 
     def test_fatal_reject_cancels_pre_even_if_first_trade_arrived(self):
         # 2026-08-26 定案: 致命拒單也撤預掛 P (統一撤 P、整檔放棄);即使第一盤成交已來也一樣撤

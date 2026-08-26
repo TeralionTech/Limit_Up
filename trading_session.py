@@ -616,7 +616,7 @@ class TradingSession:
           - 每 0.1s 送一筆市價 **shortfall** 張 (非整包 target);**首筆委託成功即停**
           - 委託成功 → **撤掉還沒成交的預掛 P** (復原舊 first_trade_worker 的 first_trade_unfilled 撤單)
             + 預算轉移 (釋放預掛保留、改保留市價 shortfall,等額 → budget_used 不變)
-          - 停止: 委託成功 / 價格穩定或致命拒單 / cutoff (09:05) / kill switch / 該檔淘汰或出場 / 13:23
+          - 停止: 委託成功 / 價格穩定或致命拒單 / cutoff (09:03) / kill switch / 該檔淘汰或出場 / 13:23
           - 處置股禁市價 → 不盲送 (只留 08:59:58 漲停價預掛限價單)
           - 致命拒單 (價格穩定 6144 / 全額交割 6225) → 放棄市價,**也撤預掛 P (整檔放棄、釋放預算)**
         超買防線: 送 shortfall + 委託成功即撤 P → 正常情形部位 = target,不 2×。殘餘 race
@@ -668,7 +668,7 @@ class TradingSession:
             if projected_over:
                 logger.warning(f"[session] {symbol} 盲送前投影超總預算 → 不送 (總曝險硬上限;靠預掛/出場守)")
                 return
-            if datetime.now().time() >= cutoff_time:      # 09:05 時間兜底
+            if datetime.now().time() >= cutoff_time:      # 09:03 時間兜底
                 logger.warning(f"[session] {symbol} 市價盲送到 {cutoff_time} 仍未成功 → 停 (靠預掛守)")
                 return
             if (self.cancel_pending_time is not None
@@ -712,14 +712,13 @@ class TradingSession:
                     logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 + 撤預掛 P: {e}")
                     self.cancel_symbol_orders_async(symbol, "fatal_reject")
                     return
-                # 停止條件 (B) 使用者定案: 「第一盤成交資訊來」時,這筆(剛送出被暫時拒的)即最後一筆
-                # → 收手停送。此時尚無委託成功 → order_no 仍是 P、未做預算轉移,故用 cancel_symbol_orders
-                # (會釋放 P 保留預算) 撤掉;成交都來了還沒成交的漲停限價單,續掛難成,撤掉乾淨。
+                # 停止條件 (B) 使用者定案 (2026-08-26 改保留 P): 「第一盤成交資訊來」時,這筆(剛送出
+                # 被暫時拒的)即最後一筆 → 收手停送,但**保留預掛 P 續守**(不撤、不動預算、不設 stopped_reason):
+                # 市價這一搏沒成,但漲停限價 P 留著整天還可能成交,不主動撤 (與 cutoff 一致;13:23 才兜底撤)。
                 with self._lock:
                     first_came = bool(st.first_trade_fired)
                 if first_came:
-                    logger.warning(f"[session] {symbol} 第一盤成交已來、市價仍未成功委託 → 停送;撤預掛 P")
-                    self.cancel_symbol_orders_async(symbol, "chase_stop_first_trade")
+                    logger.warning(f"[session] {symbol} 第一盤成交已來、市價仍未成功委託 → 停送 (保留預掛 P 續守)")
                     return
                 time.sleep(0.1)           # 暫時性拒單 → 0.1s 後重試 (每筆 0.1s 節奏)
 

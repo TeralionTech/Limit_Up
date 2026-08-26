@@ -61,7 +61,7 @@ class Config:
     socket_count_2: int = 0    # 副帳號各自的 socket 數 (0/未設 → 同 SOCKET_COUNT)
     socket_count_3: int = 0
     avg_volume_min_lots: float = 500   # 月均量 < 此(張) 盤前剔除 (離線腳本產檔;0=不篩)
-    market_chase_cutoff: str = "09:05:00"   # 9:00 盲送市價單的時間兜底 (超過即停,靠預掛守)
+    market_chase_cutoff: str = "09:03:00"   # 9:00 盲送市價單的時間兜底 (超過即停,靠預掛守)
 
 
 def load_config() -> Config:
@@ -135,5 +135,5 @@ def load_config() -> Config:
         bid_decline_sample_sec=int(os.environ.get("BID_DECLINE_SAMPLE_SEC", "60")),
         skip_trader=os.environ.get("SKIP_TRADER", "true").lower() in ("1", "true", "yes"),
         avg_volume_min_lots=float(os.environ.get("AVG_VOLUME_MIN_LOTS", "500")),
-        market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:05:00").strip(),
+        market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:03:00").strip(),
     )
