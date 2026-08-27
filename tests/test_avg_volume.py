@@ -4,7 +4,7 @@ import json
 import pytest
 
 import avg_volume
-from scripts.compute_avg_volume import compute_avg_lots
+from scripts.compute_avg_volume import compute_avg_lots, _write_guard_ok, MIN_SANE_UNIVERSE
 
 
 def _c(date, vol):
@@ -208,3 +208,20 @@ class TestAvgVolumeFullEndpoint:
         f.write_text(json.dumps(_WRAPPED), encoding="utf-8")
         resp = self._call(monkeypatch, f, token="s3cret", auth="Bearer s3cret")
         assert resp["exists"] is True and resp["count"] == 2
+
+
+class TestWriteGuard:
+    """sanity 防護 (2026-08-27 事故): 抓到的檔數太少 → 不覆蓋既有好檔,沿用舊檔。"""
+
+    def test_enough_writes(self):
+        assert _write_guard_ok(1944, MIN_SANE_UNIVERSE) is True
+        assert _write_guard_ok(500, 500) is True          # 剛好門檻 → 可寫
+
+    def test_too_few_blocks(self):
+        assert _write_guard_ok(1, MIN_SANE_UNIVERSE) is False   # 今早的 1 檔殘檔 → 擋下
+        assert _write_guard_ok(0, MIN_SANE_UNIVERSE) is False
+        assert _write_guard_ok(499, 500) is False
+
+    def test_default_threshold_sane(self):
+        # 母體正常 ~1944 → 門檻 500 遠低於正常、遠高於殘檔 (0~1),不會誤擋也不會漏接
+        assert 1 < MIN_SANE_UNIVERSE < 1900

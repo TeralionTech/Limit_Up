@@ -33,6 +33,15 @@ sys.path.insert(0, str(REPO))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("avg_volume")
 
+# 母體正常 ~1944 檔;抓到的檔數 < 此 = get_universe 失敗 (盤前清單未發布) 或大量逐檔失敗 →
+# **中止、不覆蓋既有 avg_volume.json**,沿用舊檔 (寧可用舊資料,不要拿殘檔蓋掉好檔)。
+MIN_SANE_UNIVERSE = 500
+
+
+def _write_guard_ok(count: int, min_sane: int) -> bool:
+    """算出的檔數是否「夠健全、可覆蓋正式檔」。count < min_sane → 不寫 (沿用舊檔)。純函式,測試鎖死。"""
+    return count >= min_sane
+
 
 # ── 純計算核心 (無 SDK;測試鎖死正確性) ──────────────────────────────
 def compute_avg_lots(candles: list, days: int = 20) -> float:
@@ -97,6 +106,8 @@ def main():
     ap.add_argument("--max-per-min", type=int, default=55, help="歷史K線節流 (≤60/min, 預設 55)")
     ap.add_argument("--min-lots", type=float, default=500, help="低量門檻 (僅統計顯示)")
     ap.add_argument("--out", default=str(REPO / "input" / "avg_volume.json"))
+    ap.add_argument("--min-universe", type=int, default=MIN_SANE_UNIVERSE,
+                    help=f"母體/結果 < 此檔數 → 中止不覆蓋既有檔 (預設 {MIN_SANE_UNIVERSE})")
     ap.add_argument("--dry-run", action="store_true", help="只印不寫檔 (--symbols 時預設 dry)")
     args = ap.parse_args()
 
@@ -114,6 +125,12 @@ def main():
     else:
         symbols = get_universe(sdk, cfg.universe)
         dry = args.dry_run
+        # 抓清單防護: 母體太少 = get_universe 失敗 (盤前清單未發布,如 07:00) → 中止,不 fetch、
+        # **不覆蓋既有 avg_volume.json** (沿用舊檔)。免 35 分白抓 + 免殘檔蓋好檔 (2026-08-27 事故)。
+        if not _write_guard_ok(len(symbols), args.min_universe):
+            logger.critical(f"⚠ get_universe 只拿到 {len(symbols)} 檔 (< {args.min_universe}) — "
+                            f"疑似盤前券商清單未發布/抓取失敗 → 中止,**不覆蓋既有 avg_volume.json**,沿用舊檔")
+            sys.exit(1)
 
     throttle = 60.0 / max(1, args.max_per_min)
     result = run(symbols, args.days, args.calendar_days, reststock, throttle, args.min_lots)
@@ -126,6 +143,11 @@ def main():
     if dry:
         logger.info("dry-run / 抽驗 — 不寫檔")
         return
+    # 寫檔防護: 算出的檔數太少 (大量逐檔失敗) → 中止,不覆蓋既有好檔 (沿用舊檔)。
+    if not _write_guard_ok(len(result), args.min_universe):
+        logger.critical(f"⚠ 只算出 {len(result)} 檔 (< {args.min_universe}) — 大量抓取失敗 → "
+                        f"中止,**不覆蓋既有 avg_volume.json**,沿用舊檔")
+        sys.exit(1)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # 包裝形 (Stage A5): 檔內帶 date/generated_at — mtime 會被重佈署 touch 洗掉,
