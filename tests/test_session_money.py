@@ -337,25 +337,35 @@ class TestMarketBlindChase:
         assert calls["n"] == 1
         assert s.trades["6144"].stopped_reason == "fatal_reject"
 
-    def test_first_trade_arrived_stops_keeps_pre(self):
-        # 停止條件 (B) 2026-08-26 改: 非致命拒單 + 第一盤成交已來 → 停送,但**保留預掛 P 續守**
+    def test_first_trade_no_longer_stops_chase(self):
+        # 2026-08-28: rule B 移除 — 第一盤成交已來也**不停送**;續送直到真的委託成功 (→ 撤 P)。
+        # (快開盤股「集合競價全被退 → 第一盤成交一到就停」會從沒真送進逐筆 → 0 部位,故移除,6226。)
         s = make_session()
-        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2,保留 200k
+        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2
         pre_no = s.trades["2330"].pre_order_no
         s.trades["2330"].first_trade_fired = True           # 第一盤成交已來
-        sends = {"n": 0}
-        def reject(symbol, lots):
-            sends["n"] += 1
-            raise RuntimeError("busy")                      # 非致命
-        s.broker.place_market_buy = reject
+        fails = {"n": 0}
+        orig = s.broker.place_market_buy
+        def flaky(symbol, lots):
+            if fails["n"] < 3:
+                fails["n"] += 1
+                raise RuntimeError("busy")                  # 非致命 (集合競價/暫時)
+            return orig(symbol, lots)
+        s.broker.place_market_buy = flaky
         s.broker.cancelled.clear()
         _fire_chase(s, "2330")
-        assert sends["n"] == 1                              # 第一盤成交來 → 只送最後一筆就停
-        assert s.broker.cancelled == []                    # **不撤 P**
-        assert s.trades["2330"].order_no == pre_no         # P 續守
-        assert s.trades["2330"].order_status == "pending"
-        assert s.trades["2330"].order_kind == "pre_limit"
-        assert s.budget_used == 200_000                    # 預算不動
+        assert fails["n"] == 3                              # 第一盤成交來也照重試,不停
+        assert s.trades["2330"].order_kind == "market_buy"  # 最後委託成功
+        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 委託成功 → 撤 P
+
+    def test_stops_when_target_filled_no_market(self):
+        # 6226 情境: 預掛限價成交足額 target → shortfall≤0 → **一筆市價都不送** (免超 target;行為不變)
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2
+        s._on_fill(_fill(s.trades["2330"].order_no, "2330", 2, 100.0))   # 限價全成交 2 張
+        s.trades["2330"].first_trade_fired = True           # 第一盤成交也來
+        _fire_chase(s, "2330")
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]  # 足額 → 不送市價
 
     def test_fatal_reject_keeps_pre_even_if_first_trade_arrived(self):
         # 2026-08-26 定案: 致命拒單**保留預掛 P**(P 只在委託成功時撤);即使第一盤成交已來也一樣保留

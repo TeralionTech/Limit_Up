@@ -612,16 +612,18 @@ class TradingSession:
     def start_market_chase(self, symbols: list, start_time, cutoff_time):
         """9:00:00 起對每檔**盲送**市價單搶進 (2026-08-24 定案,取代首筆成交觸發):
           - start_time (09:00:00) 起,每檔一 daemon thread 精準等到時點才開始
-          - 9:00 算 shortfall = target − 已成交 (預掛在集合競價可能已成交部分);shortfall≤0 → 不搶
-          - 每 0.1s 送一筆市價 **shortfall** 張 (非整包 target);**首筆委託成功即停**
+          - **每輪重算** shortfall = target − 已成交 (預掛/先前市價成交會反映);shortfall≤0 → 停 (已足額)
+          - 每 0.1s 送一筆市價 **shortfall** 張 (非整包 target);**續送到委託成功** (或足額/cutoff/致命)
+          - 2026-08-28: **移除 rule B(第一盤成交來就停)** — 續送直到真的委託成功,免快開盤股(集合競價
+            全被退→第一盤成交一到就停)從沒送進逐筆 (6226)。shortfall 每輪重算,當防超 target 的閘門。
           - 委託成功 → **撤掉還沒成交的預掛 P** (復原舊 first_trade_worker 的 first_trade_unfilled 撤單)
             + 預算轉移 (釋放預掛保留、改保留市價 shortfall,等額 → budget_used 不變)
-          - 停止: 委託成功 / 價格穩定或致命拒單 / cutoff (09:03) / kill switch / 該檔淘汰或出場 / 13:23
+          - 停止: 委託成功 / shortfall≤0 / 價格穩定或致命拒單 / cutoff (09:03) / kill switch / 淘汰或出場 / 13:23
           - 處置股禁市價 → 不盲送 (只留 08:59:58 漲停價預掛限價單)
           - 致命拒單 (價格穩定 6144 / 全額交割 6225) → 放棄市價,**保留預掛 P 續守** (P 只在委託成功時撤)
-        超買防線: 送 shortfall + 委託成功即撤 P → 正常情形部位 = target,不 2×。殘餘 race
-        (P 撤單與成交在券商端賽跑、都成交) 才可能短暫超買,由出場全量賣掉;budget_used 為近似
-        (超買 race 時略低估,已接受)。孤兒 P 若出場前未撤,出場/13:23 再兜底撤 (見 _cancel_orphan_pre)。"""
+        超買防線: 每輪重算 shortfall + shortfall≤0 就停 → 一般不超 target;委託成功即撤 P。殘餘 race
+        (市價在飛的 ~200ms 內 P 也成交、市價又成功、撤 P 撤不掉 → 短暫 2 張) 使用者定案**接受、不處理**,
+        由出場全量賣掉;budget_used 為近似 (超買 race 時略低估,已接受)。孤兒 P 出場/13:23 兜底撤。"""
         with self._lock:
             if self._trade_date and self._chase_started_date == self._trade_date:
                 logger.warning("[session] 今日已啟動市價盲送 — 跳過重複 (冪等保護)")
@@ -642,17 +644,11 @@ class TradingSession:
             if remaining <= 0:
                 break
             time.sleep(0.01 if remaining < 1 else remaining - 0.5)
-        # 9:00 到 → 算差額一次: shortfall = target − 已成交 (預掛在集合競價可能已成交部分/全部)。
-        # 差額 ≤ 0 → 預掛已把我們買到 target,不搶 (預掛就是最終部位,不撤)。
-        with self._lock:
-            st = self.trades.get(symbol)
-            if (st is None or st.stopped_reason or st.exited or st.is_disposition
-                    or self._budget_breached):
-                return
-            shortfall = st.target_lots - st.filled_lots
-        if shortfall <= 0:
-            return
-        # 盲送迴圈: 只送 shortfall (不送整包 target → 免 2× 超買);首筆委託成功即停
+        # 盲送迴圈: **每輪重算** shortfall = target − 已成交 (預掛/先前市價成交會反映進來),續送到:
+        #   委託成功(撤 P) / shortfall≤0(已買到足額→停,免超 target) / cutoff / 致命拒單。
+        # 2026-08-28 定案: 移除 rule B(第一盤成交來就停)——那會讓快開盤股「集合競價全被退 → 第一盤
+        # 成交一到就停」而**從沒真送進逐筆**。改成續送直到真的委託成功或已買到足額;shortfall 每輪重算,
+        # 取代 rule B 當防超 target 的閘門 (避免拿 stale shortfall 送到超買)。
         while True:
             if not self.is_live():
                 return
@@ -662,6 +658,9 @@ class TradingSession:
                     return
                 if st.is_disposition:      # 處置股禁市價 → 只留預掛,不盲送
                     return
+                shortfall = st.target_lots - st.filled_lots   # 每輪重算 (限價/先前市價成交會反映進來)
+                if shortfall <= 0:
+                    return                 # 已買到足額 (預掛/先前市價) → 停,不再送 (6226 走這條)
                 # 總曝險硬上限 send-time 投影: 已實際買進 + 本筆最壞 (漲停價估) 若超總預算 → 不送
                 projected_over = (self.total_budget > 0 and self._buy_cost_actual
                                   + shortfall * st.limit_up * 1000 > self.total_budget)
@@ -710,14 +709,10 @@ class TradingSession:
                         st.stopped_reason = "fatal_reject"
                     logger.critical(f"[session] ⚠ {symbol} 市價盲送遇停止拒因 → 放棄市價 (保留預掛 P 續守): {e}")
                     return
-                # 停止條件 (B) 使用者定案 (2026-08-26 改保留 P): 「第一盤成交資訊來」時,這筆(剛送出
-                # 被暫時拒的)即最後一筆 → 收手停送,但**保留預掛 P 續守**(不撤、不動預算、不設 stopped_reason):
-                # 市價這一搏沒成,但漲停限價 P 留著整天還可能成交,不主動撤 (與 cutoff 一致;13:23 才兜底撤)。
-                with self._lock:
-                    first_came = bool(st.first_trade_fired)
-                if first_came:
-                    logger.warning(f"[session] {symbol} 第一盤成交已來、市價仍未成功委託 → 停送 (保留預掛 P 續守)")
-                    return
+                # 非致命拒單 (含集合競價「不可輸入市價、IOC、FOK」) → 續送重試。2026-08-28 定案:
+                # **移除 rule B(第一盤成交來就停)**——rule B 拿「集合競價那筆注定被退的 reject」當
+                # 「最後一筆試過了」就停,快開盤股會從沒真送進逐筆(6226)。改成續送直到真的委託成功、
+                # 或已買到足額(shortfall≤0,見迴圈頂重算)、或 cutoff/致命拒單。
                 time.sleep(0.1)           # 暫時性拒單 → 0.1s 後重試 (每筆 0.1s 節奏)
 
     def cancel_symbol_orders_async(self, symbol: str, reason: str):
