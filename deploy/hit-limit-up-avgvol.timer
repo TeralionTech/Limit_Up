@@ -1,13 +1,13 @@
 [Unit]
-Description=avg-volume compute (交易日盤後 14:30 Asia/Taipei; 產 input/avg_volume.json,隔早 runner 直接讀)
+Description=avg-volume compute (交易日盤後 17:30 Asia/Taipei; 產 input/avg_volume.json,隔早 runner 直接讀)
 
 [Timer]
-# 交易日**盤後** 14:30 (13:30 收盤後) 跑,~35 分 → 15:05;隔天早上 08:00 runner 直接讀。
+# 交易日**盤後** 17:30 (13:30 收盤後) 跑,~35 分 → 18:05;隔天早上 08:00 runner 直接讀。
 # ⚠ 為何盤後而非盤前 07:00: get_universe (當天 ticker 清單) **盤前抓不到** (2026-08-27 事故:
 #    07:00 只拿到 0~1 檔,把好檔蓋成殘檔);盤後才有清單 (實測 16:32 正常 1944)。
 #    登入衝突: 盤後主服務未在交易,實測可跑;且 compute 有 sanity 防護 (母體/結果 < 門檻就中止、
 #    不覆蓋既有檔),任何失敗都只是沿用舊檔,不會再毀檔。
-OnCalendar=Mon..Fri 14:30:00 Asia/Taipei
+OnCalendar=Mon..Fri 17:30:00 Asia/Taipei
 Persistent=false
 
 [Install]

@@ -152,7 +152,8 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # 包裝形 (Stage A5): 檔內帶 date/generated_at — mtime 會被重佈署 touch 洗掉,
     # 檔內日期才是強信號 (IDC 端 08:05 拉 /api/avg-volume/full 靠它判斷是否今日資料)。
-    # timer 是交易日早上 07:00 跑 (見 deploy/hit-limit-up-avgvol.timer) → date = 台北「今天」。
+    # timer 是交易日**盤後 17:30** 跑 (見 deploy/hit-limit-up-avgvol.timer) → date = 台北「今天(N)」,
+    # 內含「到 N 為止」的近 20 交易日均量;隔早 (N+1) runner 讀它 = 最新可得資料。
     now_tpe = datetime.now(ZoneInfo("Asia/Taipei"))
     payload = {
         "date": now_tpe.strftime("%Y-%m-%d"),
