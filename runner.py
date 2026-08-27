@@ -433,9 +433,10 @@ class Runner:
 
     # ─── 9:00 後 monitor handlers (LIVE_SUBSCRIBE 全程 / trader 建立前的空窗) ───
 
-    def _monitor_on_book(self, symbol: str, bids: list, asks: list):
+    def _monitor_on_book(self, symbol: str, bids: list, asks: list, is_continuous: bool = False):
         """9:00 後的看盤 handler — **不做 mark/unmark** (filter 規則對盤中 price=0
-        市價列會誤判)。轉送隔日賣標的的 book → session 跑純盤面賣出規則
+        市價列會誤判)。is_continuous 不用 (本 handler 本就不 mark/unmark),簽名對齊 subscriber。
+        轉送隔日賣標的的 book → session 跑純盤面賣出規則
         (委買一跌下今日漲停 → 跌停價限價賣;鎖著 → 抱)。"""
         if self.session.has_overnight(symbol):
             self.session.update_overnight_book(
@@ -458,6 +459,10 @@ class Runner:
         price = float(_pick(trade_data, "price") or 0)
         if price <= 0:
             return
+        # 首筆真成交 (isTrial 已濾、逐筆已開) → 標記該檔「已開盤」→ filter 退場,不再誤判開盤市價列
+        # (2026-08-27 8105/1312;成交與 book 同一 socket、成交先到 → 開盤後 book 進來時旗標已立)
+        if self.state is not None:
+            self.state.mark_opened(symbol)
         # 搶市價單優先 (速度至上): 有些 API 給股數、有的給張數 — >=1000 視為股數換算
         qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
         lots = qty // 1000 if qty >= 1000 else qty

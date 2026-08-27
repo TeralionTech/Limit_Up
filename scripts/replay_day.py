@@ -244,10 +244,11 @@ def run(args):
                         if bp is not None and abs(float(bp) - lu) < 0.001:
                             ctx["last_bid_at_limit"][symbol] = int(_pick(b, "size") or 0)
                             break
+                is_cont = bool(_pick(data, "isContinuous"))   # 交易所「已逐筆」旗標 (開盤訊號底線)
                 if ctx["phase"] in ("filter", "preopen"):
-                    filter_on_book(symbol, bids, asks)
+                    filter_on_book(symbol, bids, asks, is_cont)
                 elif ctx["trader"] is not None:
-                    ctx["trader"].on_book(symbol, bids, asks)   # 支撐消失 → 同步出場
+                    ctx["trader"].on_book(symbol, bids, asks, is_cont)   # 支撐消失 → 同步出場
             elif channel == "trades":
                 n_trades += 1
                 if ctx["phase"] == "trading" and ctx["trader"] is not None:

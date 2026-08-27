@@ -109,7 +109,9 @@ class Trader:
 
     # ─── 掛 subscriber 的 handlers ─────────────────────────
 
-    def on_book(self, symbol: str, bids: list, asks: list):
+    def on_book(self, symbol: str, bids: list, asks: list, is_continuous: bool = False):
+        # is_continuous: subscriber 傳來的交易所「已逐筆」旗標 — trader 不需要 (它本就是開盤後
+        # 的 handler、盤中規則已防市價列),簽名對齊 subscriber 呼叫即可。
         h = self.holdings.get(symbol)
         # 隔日賣標的: 只要在清單裡就轉送 book (顯示+算賣價),賣出規則在 session 端
         # (純盤面無狀態: 委買一跌下今日漲停 → 賣;市價列在/買牆在 = 鎖著 → 抱)。
@@ -228,6 +230,10 @@ class Trader:
         qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
         if price <= 0:
             return
+        # 首筆真成交到 → 標記「已開盤」(filter 退場,不再誤判開盤市價列;2026-08-27 8105/1312)。
+        # 冪等;開盤撮種子化 (runner 建 trader 後補餵 buffer 首筆) 也走這條 → 一併立旗標。
+        if self.state is not None:
+            self.state.mark_opened(symbol)
         h.last_trade_price = price
         h.trade_count += 1               # 累計每一筆成交 (統計用)
 

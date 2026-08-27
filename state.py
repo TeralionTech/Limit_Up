@@ -24,6 +24,9 @@ class State:
         self._lock = Lock()
         self.marked: Set[str] = set()
         self.discarded: Set[str] = set()                 # unmark 過 = 永久淘汰
+        # 「已開盤」— 該檔首筆真成交 (isOpen) 到 / book 轉逐筆 (isContinuous) → filter 對它退場,
+        # 不再 mark/unmark (盤中盤面交給 trader/monitor;免開盤市價列誤判,2026-08-27 8105/1312)
+        self._opened: Set[str] = set()
         # 「開盤即鎖」— 第一筆真實報價 (委買非空) 就滿足 mark 條件的強勢股 (顯示/分析用)
         self.first_tick_limit_up: Set[str] = set()
         self.history: Dict[str, List[dict]] = {}         # symbol → [event, ...]
@@ -174,6 +177,16 @@ class State:
     def is_discarded(self, symbol: str) -> bool:
         with self._lock:
             return symbol in self.discarded
+
+    def mark_opened(self, symbol: str):
+        """該股已開盤 (首筆真成交到 = isOpen,或 book 轉逐筆 = isContinuous)。
+        冪等;filter 之後對它退場,不再 mark/unmark (交給 trader/monitor)。"""
+        with self._lock:
+            self._opened.add(symbol)
+
+    def is_opened(self, symbol: str) -> bool:
+        with self._lock:
+            return symbol in self._opened
 
     def snapshot(self) -> List[dict]:
         with self._lock:

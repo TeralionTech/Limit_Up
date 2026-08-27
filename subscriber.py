@@ -621,7 +621,9 @@ class Subscriber:
                     bids = data.get("bids") or []
                     asks = data.get("asks") or []
                     try:
-                        self.on_book(symbol, bids, asks)
+                        # isContinuous = 交易所權威「已逐筆(開盤後)」旗標 → 傳給 handler
+                        # (filter 靠它退場,免拿開盤市價列 bids[0]=0 反推;2026-08-27 8105/1312)
+                        self.on_book(symbol, bids, asks, bool(data.get("isContinuous")))
                     except Exception as e:
                         self._log_handler_exc(socket_idx, e)
                     # 存 snapshot 給 API /api/tick/{symbol} 用

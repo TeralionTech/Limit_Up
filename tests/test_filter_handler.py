@@ -87,6 +87,85 @@ class TestUnmark:
         assert calls == ["2330"]
 
 
+# 開盤市價列 (五檔第一列 price=0) 出現時,filter 必須已「退場」不再 mark/unmark。
+# 開盤訊號來源: 主 = 首筆真成交 (isOpen,經 on_trade → state.mark_opened);
+#              底線 = book 已逐筆 (isContinuous 旗標)。2026-08-27 8105/1312 誤撤事故。
+MKT_COL_LOCKED = [{"price": 0.0, "size": 115},        # 市價列 (開盤後才有,佔第一列)
+                  {"price": 100.0, "size": 198580},   # 真實委買一 = 漲停,還死鎖
+                  {"price": 99.95, "size": 24}]
+
+
+class TestOpenedStepBack:
+    def test_opened_latch_skips_market_column(self):
+        # 已 marked + 首筆成交已到 (state.mark_opened,= on_trade 做的事) → 市價列 book 不誤撤
+        # 突變必殺: 拿掉 `if state.is_opened: return` → 讀到 bids[0].price=0 → unmark_bid_below_limit
+        state = State()
+        calls = []
+        h = _mk(state, {"2330": 100.0}, unsub_calls=calls)
+        h("2330", BID_LOCK, NO_ASKS)
+        assert state.is_marked("2330")
+        state.mark_opened("2330")                     # ← on_trade 收到首筆真成交會做這件事
+        h("2330", MKT_COL_LOCKED, NO_ASKS)            # 開盤市價列進來
+        assert state.is_marked("2330")                # 仍鎖著、沒被誤撤
+        assert not state.is_discarded("2330")
+        assert calls == []                            # 沒退訂
+
+    def test_continuous_book_skips_and_latches(self):
+        # 沒有 isOpen 成交 (開盤零成交鎖死股),但 book 帶 isContinuous=True → 底線接手:
+        # 退場 + 順手立「已開盤」旗標。突變必殺: 拿掉 is_continuous 分支 → bids[0]=0 → 誤撤
+        state = State()
+        h = _mk(state, {"2330": 100.0})
+        h("2330", BID_LOCK, NO_ASKS)
+        assert not state.is_opened("2330")
+        h("2330", MKT_COL_LOCKED, NO_ASKS, is_continuous=True)
+        assert state.is_marked("2330")                # 沒被誤撤
+        assert state.is_opened("2330")                # 底線也立了旗標
+
+    def test_opened_also_blocks_ask_path(self):
+        # 已開盤 → 整個 filter 退場 (連委賣出現也不由 filter 撤,交給 trader 第一盤檢查)。
+        # 突變必殺: 若 is_opened 檢查放在 ask 分支之後 → 開盤後出現賣單仍被 filter 撤
+        state = State()
+        calls = []
+        h = _mk(state, {"2330": 100.0}, unsub_calls=calls)
+        h("2330", BID_LOCK, NO_ASKS)
+        state.mark_opened("2330")
+        h("2330", BID_LOCK, [{"price": 100.5, "size": 3}])   # 開盤後冒賣單
+        assert state.is_marked("2330") and calls == []       # filter 不插手
+
+    def test_pre_open_unaffected(self):
+        # 迴歸: 未開盤 (無 mark_opened、is_continuous=False) → 盤前跌破漲停照常淘汰
+        state = State()
+        h = _mk(state, {"2330": 100.0})
+        h("2330", BID_LOCK, NO_ASKS)
+        h("2330", [{"price": 99.5, "size": 50}], NO_ASKS)    # 盤前真跌破
+        assert state.is_discarded("2330")
+
+
+class TestOnTradeSetsOpenedLatch:
+    """開盤訊號的來源: on_trade 收到首筆『真』成交 → state.mark_opened (filter 靠它退場)。"""
+
+    @staticmethod
+    def _trader(state, syms=("2330",)):
+        from types import SimpleNamespace
+        from trader import Trader
+        cfg = SimpleNamespace(first_trade_min_lots=10)
+        return Trader(list(syms), {s: 100.0 for s in syms}, cfg, state=state)
+
+    def test_real_trade_latches_opened(self):
+        state = State()
+        t = self._trader(state)
+        assert not state.is_opened("2330")
+        t.on_trade("2330", {"price": 100.0, "size": 15000, "isTrial": False})
+        assert state.is_opened("2330")
+
+    def test_trial_trade_does_not_latch(self):
+        # 盤前試撮成交 (isTrial) 不是開盤 → 不立旗標 (否則 filter 盤前就提早退場)
+        state = State()
+        t = self._trader(state, ("1101",))
+        t.on_trade("1101", {"price": 100.0, "size": 15000, "isTrial": True})
+        assert not state.is_opened("1101")
+
+
 class TestBidDropWindows:
     def test_record_window_only_tracks_max(self):
         # now < final_check_start → 量掉再多也不淘汰,只記 max
@@ -154,7 +233,7 @@ class TestSubscriberHandlerNeverSwallows:
     def test_on_book_exception_is_caught_and_counted(self):
         from subscriber import Subscriber
 
-        def _raiser(symbol, bids, asks):
+        def _raiser(symbol, bids, asks, is_continuous=False):
             raise RuntimeError("boom")
 
         sub = Subscriber(sdk=None, universe=[], on_book=_raiser, login_cfg=None)

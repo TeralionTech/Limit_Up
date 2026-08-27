@@ -134,13 +134,24 @@ def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
     # 同 symbol tick 序列單執行緒，closure set 安全。
     seen_first_quote: set = set()
 
-    def _on_book(symbol: str, bids: list, asks: list):
+    def _on_book(symbol: str, bids: list, asks: list, is_continuous: bool = False):
         # 永久淘汰的股票 — 退訂生效前的殘餘 tick 直接略過
         if state.is_discarded(symbol):
             return
         # 沒漲停價資料就跳過 (universe.fetch_limit_ups 抓不到那批)
         limit_up = limit_ups.get(symbol)
         if not limit_up:
+            return
+
+        # 已開盤 → filter 退場,盤中 mark/unmark 交給 trader/monitor (別再拿盤中盤面判)。
+        # 開盤訊號用「交易所權威旗標」,不是拿 bids[0] 反推 (2026-08-27 8105/1312: 開盤市價列
+        # bids[0]=0 被誤判成委買一跌破漲停 → 誤撤預掛 P):
+        #   主: 該檔首筆真成交 (isOpen) 已到 → runner/trader on_trade 已呼叫 state.mark_opened
+        #       (成交與 book 同一 socket、成交永遠先於開盤後 book,故 book 進來時旗標已立)
+        #   底線: book 已逐筆 (isContinuous) → 開盤零成交鎖死股沒有 isOpen 時接手,順手立旗標
+        if is_continuous:
+            state.mark_opened(symbol)
+        if state.is_opened(symbol):
             return
 
         # 解析 bid1 / ask1 (兼容 dict 跟 object)
