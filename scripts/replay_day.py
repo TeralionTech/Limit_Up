@@ -5,19 +5,39 @@
 TradingSession),用假時鐘重現 篩選 → 08:59:58 預掛 → 09:00 盲送 → 盤中出場,產出報告。
 因 handler 是正式碼,這等於用真實行情驗整條決策鏈。**只讀+餵,不改任何 production 邏輯。**
 
+忠實度 (2026-08-28 補,為重現 08-27 開盤事故):
+  - **換手延遲** `--swap-delay` (預設 1.0s): production 的 on_book 從 filter 換成 trader 要等
+    09:00 等待迴圈回來 + 寫快照 (~1s);這 1 秒內 filter 仍在線、會看到開盤後的市價列。
+    replay 照樣讓 filter 多活 swap-delay 秒 (0 = 立刻換手,舊行為)。
+  - **集合競價拒市價**: ReplayBroker 對「送出當下該檔尚未開盤 (還沒收到首筆非試撮成交)」的
+    市價單回拒單 (訊息同交易所),開盤後才接受。
+  - **市價追改 step-driven**: production 每檔一條 thread 送→拒→睡 0.1s→重送;replay 單執行緒,
+    把 worker 的 time.sleep 換成「讓出」,每一步由 tick 時間推進;每筆送單延遲取自 --orders
+    的真實 latency_ms (無則 --send-latency)。決定在**送出當下**,結果在 送出+延遲 才回到 worker
+    (重現 6226「集合競價期送出、回報回來時已開盤」)。
+  - **unmark → 撤單**: 仿 runner._unsub_and_cancel,unmark 同步呼叫 session.cancel_symbol_orders
+    (原 replay 只記退訂、不撤單 → 看不到誤撤)。
+  - **開盤後 trades**: 仿 runner._monitor_on_trade (08:59:58 掛上、09:00 起生效): 首筆非試撮成交
+    → state.mark_opened (若程式有) + session.on_first_trade;換手後改由 trader.on_trade,
+    並仿 runner 種子化最後一筆成交。
+
 用法:
   python scripts/replay_day.py --ticks replay_data/2026-08-21_ticks.jsonl \
       --limit-ups replay_data/2026-08-21_limit_ups.json --date 2026-08-21 \
       [--dispositions ...] [--limit-downs ...] [--fills ...] [--orders ...] \
+      [--swap-delay 1.0] [--send-latency 0.3] [--chase-cutoff 09:03:00] \
       [--total-budget 3700000] [--per-symbol 400000] [--report out.txt]
 
-出場區塊為「假設 marked 檔在 9:00 依 sized 張數成交」→ 驗出場**偵測邏輯**在真實五檔上的表現
+出場區塊為「假設 marked 檔依 sized 張數成交」→ 驗出場**偵測邏輯**在真實五檔上的表現
 (漲停鎖死常不會成交,故此為 if-filled 邏輯檢查,非宣稱真成交)。real 成交對照用 --fills 的台帳 diff。
 """
 import argparse
+import csv
+import inspect
 import json
 import sys
-from datetime import datetime, time as dtime
+import time as _real_time
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import filter as filter_mod          # noqa: E402
 import trader as trader_mod          # noqa: E402
 import trading_session as ts_mod     # noqa: E402
+import state as state_mod            # noqa: E402
 from state import State              # noqa: E402
 from filter import make_on_book_handler  # noqa: E402
 from trader import Trader            # noqa: E402
@@ -33,6 +54,8 @@ from trading_session import TradingSession  # noqa: E402
 
 PRE_ORDER_TIME = dtime(8, 59, 58)
 OPEN_TIME = dtime(9, 0, 0)
+CALL_AUCTION_REJECT = "證券集合競價時段不可輸入市價、IOC、FOK委託"
+RETRY_SLEEP_SEC = 0.1     # production worker 非致命拒單後 sleep 0.1 再送
 
 
 # ─── 假時鐘: 讓 production 的 datetime.now() 回「當前 tick 的 ts」 ───
@@ -49,6 +72,11 @@ def _set_clock(dt):
     filter_mod.datetime = FrozenDatetime
     trader_mod.datetime = FrozenDatetime
     ts_mod.datetime = FrozenDatetime
+    state_mod.datetime = FrozenDatetime    # mark/unmark 歷史 ts 用假時鐘 → 開盤後 unmark 判定才準
+
+
+class _ChaseYield(Exception):
+    """市價追 worker 要 sleep(0.1) 重試 → 讓出,由 tick 時間推進下一步。"""
 
 
 # ─── ReplayBroker: 仿 tests FakeBroker,只記錄,不打真 API ───
@@ -58,6 +86,9 @@ class ReplayBroker:
         self.healthy = True
         self.placed = []
         self.cancelled = []
+        self.rejected = []        # (symbol, lots, send_ts) 集合競價拒市價
+        self._decision = {}       # symbol → "accept"/"reject" (driver 於送出當下決定)
+        self.opened = set()       # 已開盤 (無 driver 決定時的 fallback)
         self._n = 0
 
     def _next(self):
@@ -70,6 +101,12 @@ class ReplayBroker:
         return no
 
     def place_market_buy(self, symbol, lots):
+        decision = self._decision.pop(symbol, None)
+        if decision is None:
+            decision = "accept" if symbol in self.opened else "reject"
+        if decision == "reject":
+            self.rejected.append((symbol, lots))
+            raise RuntimeError(f"下單被拒 {symbol}: {CALL_AUCTION_REJECT}")
         no = self._next()
         self.placed.append(("market_buy", symbol, None, lots))
         return no
@@ -115,7 +152,6 @@ def _load_ground_truth_symbols(path):
     """從 fills/orders CSV 抓有出現的 symbol 集合 (對照組)。"""
     if not path or not Path(path).exists():
         return set()
-    import csv
     syms = set()
     with open(path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -125,7 +161,46 @@ def _load_ground_truth_symbols(path):
     return syms
 
 
+def _load_market_latencies(path):
+    """從 orders CSV 抓每檔 BUY_MKT 的真實 latency (秒),依 ts_sent 排序 → {symbol: [sec, ...]}。"""
+    out = {}
+    if not path or not Path(path).exists():
+        return out
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if (row.get("action") or "").strip() != "BUY_MKT":
+                continue
+            try:
+                rows.append((row.get("ts_sent") or "", (row.get("symbol") or "").strip(),
+                             float(row.get("latency_ms") or 0) / 1000.0))
+            except ValueError:
+                continue
+    for ts, sym, lat in sorted(rows):
+        out.setdefault(sym, []).append(lat)
+    return out
+
+
+def _accepts_kw(fn, name):
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_hms(s, default):
+    try:
+        hh, mm, ss = map(int, str(s).split(":"))
+        return dtime(hh, mm, ss)
+    except Exception:
+        return default
+
+
 def run(args):
+    swap_delay = float(getattr(args, "swap_delay", 1.0) or 0.0)
+    default_latency = float(getattr(args, "send_latency", 0.3) or 0.0)
+    cutoff = _parse_hms(getattr(args, "chase_cutoff", "09:03:00"), dtime(9, 3, 0))
+
     # 假時鐘關掉出場等待窗口 (免真 3s)
     ts_mod._EXIT_FILL_WAIT_SEC = 0.0
 
@@ -134,13 +209,15 @@ def run(args):
     limit_downs = {str(k): float(v) for k, v in _load_json(args.limit_downs).items() if v}
     day_tradable = {str(k): bool(v) for k, v in _load_json(args.day_tradable).items()} \
         if args.day_tradable else {}
+    latencies = _load_market_latencies(getattr(args, "orders", ""))
 
     # ── 建 State + Session (ReplayBroker) ──
     state = State(bid_drop_ratio=args.bid_drop_ratio)
     session = TradingSession()
     session.roll_day(args.date)
     session.set_mode("real")
-    session.broker = ReplayBroker()
+    broker = ReplayBroker()
+    session.broker = broker
     session.set_params(total_budget=args.total_budget, per_symbol_budget=args.per_symbol,
                        sizing_mode=args.sizing_mode, fixed_lots=args.fixed_lots)
     session.set_armed(True)
@@ -153,17 +230,46 @@ def run(args):
     # replay 決定性: 把非同步/背景 thread 路徑改成同步 (單執行緒重放,免 race + 免 rate-limiter 真時間節流)
     session.cancel_symbol_orders_async = session.cancel_symbol_orders
     session.exit_position = lambda symbol, reason: session._exit_worker(symbol, reason)
+    if hasattr(session, "_rate"):
+        session._rate.acquire = lambda: None
+
+    ctx = {"phase": "filter", "trader": None, "last_bid_at_limit": {},
+           "pre_marked": [], "exits": [], "in_chase": False,
+           "swap_delay": swap_delay, "chase": {}, "opened_at": {}, "last_trade": {}}
+
+    # worker 的 time.sleep → 讓出 (只在 chase step 內);其餘 sleep 不睡 (replay 不等真時間)
+    def _sleep(sec):
+        if ctx["in_chase"]:
+            raise _ChaseYield()
+    time_proxy = SimpleNamespace(sleep=_sleep, time=_real_time.time,
+                                 monotonic=_real_time.monotonic,
+                                 perf_counter=_real_time.perf_counter)
+    orig_time_mod = ts_mod.time
+    ts_mod.time = time_proxy
 
     filter_cfg = SimpleNamespace(pre_order_time="08:59:58", final_check_start="08:59:58")
     trader_cfg = SimpleNamespace(first_trade_min_lots=args.first_trade_min_lots,
                                  bid_decline_sample_sec=60, bid_decline_minutes=5)
 
     unsubbed = []
-    unsub_ref = {"fn": lambda sym: unsubbed.append(sym)}
-    filter_on_book = make_on_book_handler(state, limit_ups, filter_cfg, unsub_ref)
 
-    ctx = {"phase": "filter", "trader": None, "last_bid_at_limit": {},
-           "pre_marked": [], "exits": []}
+    # 仿 runner._unsub_and_cancel: unmark → 退訂 + 撤該檔委託 (reason "unmarked")
+    def _unsub_and_cancel(sym):
+        unsubbed.append(sym)
+        try:
+            session.cancel_symbol_orders(sym, "unmarked")
+        except Exception:
+            pass
+    unsub_ref = {"fn": _unsub_and_cancel}
+    filter_on_book = make_on_book_handler(state, limit_ups, filter_cfg, unsub_ref)
+    filter_takes_cont = _accepts_kw(filter_on_book, "is_continuous")
+    mark_opened = getattr(state, "mark_opened", None)   # 舊碼沒有 → 不呼叫 (忠實重現舊行為)
+
+    def _lat(sym, i):
+        seq = latencies.get(sym) or []
+        if i < len(seq):
+            return seq[i]
+        return seq[-1] if seq else default_latency
 
     def do_pre_order():
         marked = state.get_marked_prioritized()
@@ -175,84 +281,213 @@ def run(args):
         bid_vols = {s: ctx["last_bid_at_limit"].get(s, 0) for s in marked}
         session.place_pre_orders(marked, limit_ups, limit_up_bid_vols=bid_vols)
 
-    def do_open():
+    def do_open(open_dt):
+        """09:00: 建 Trader (production 此刻建,但 on_book 要 swap_delay 後才換手) + 排程市價追。"""
         marked = ctx["pre_marked"]
         tr = Trader(watchlist=marked, limit_ups=limit_ups, cfg=trader_cfg,
                     state=state, session=session, dispositions=dispositions)
         ctx["trader"] = tr
-        # 9:00 盲送 (同步) — ReplayBroker 即接受 → 走 A:撤 P。之後假設成交建部位驗出場。
         for sym in marked:
             st = session.trades.get(sym)
             if st is None or st.stopped_reason or not st.order_no:
                 continue
-            session._market_chase_worker(sym, dtime(0, 0, 0), dtime(23, 59, 59))
-            # 假設成交: 依 target 建部位 (label: if-filled 出場邏輯檢查)
-            st = session.trades.get(sym)
-            if st and st.order_no and st.target_lots > 0:
-                session._on_fill({"order_no": st.order_no, "symbol": sym,
-                                  "lots": st.target_lots, "price": limit_ups.get(sym, 0),
-                                  "action": "buy", "filled_no": f"RF{sym}",
-                                  "filled_time": "09:00:00",
-                                  "quantity": st.target_lots * 1000})
+            ctx["chase"][sym] = {"send_at": open_dt, "resolve_at": open_dt + timedelta(seconds=_lat(sym, 0)),
+                                 "i": 0, "sends": 0, "rejects": 0, "done": None,
+                                 "accepted_at": None, "last": "none"}
+
+    def _fake_fill(sym):
+        # 假設成交: 依 target 建部位 (label: if-filled 出場邏輯檢查) — 對 st.order_no 那張 (M 或留守的 P)
+        st = session.trades.get(sym)
+        if st and st.order_no and st.target_lots > 0 and st.filled_lots < st.target_lots:
+            session._on_fill({"order_no": st.order_no, "symbol": sym,
+                              "lots": st.target_lots - st.filled_lots,
+                              "price": limit_ups.get(sym, 0),
+                              "action": "buy", "filled_no": f"RF{sym}",
+                              "filled_time": "09:00:00",
+                              "quantity": (st.target_lots - st.filled_lots) * 1000})
+
+    def chase_step(sym, c, cur):
+        """一步 = worker 收到上一筆送單的結果 (在 resolve_at 時刻) → 走 production 邏輯到下一次
+        sleep(讓出) 或 return(結束)。決定 (接受/拒) 依**送出當下**該檔是否已開盤。"""
+        oa = ctx["opened_at"].get(sym)
+        broker._decision[sym] = "accept" if (oa is not None and oa <= c["send_at"]) else "reject"
+        n_placed, n_rej = len(broker.placed), len(broker.rejected)
+        _set_clock(c["resolve_at"])
+        ctx["in_chase"] = True
+        try:
+            session._market_chase_worker(sym, dtime(0, 0, 0), cutoff)
+            outcome = "done"
+        except _ChaseYield:
+            outcome = "yield"
+        finally:
+            ctx["in_chase"] = False
+            broker._decision.pop(sym, None)
+            _set_clock(cur)
+        sent_accept = len(broker.placed) > n_placed
+        sent_reject = len(broker.rejected) > n_rej
+        if sent_accept or sent_reject:
+            c["sends"] += 1
+            c["i"] += 1
+        if sent_reject:
+            c["rejects"] += 1
+            c["last"] = "rejected"
+        if sent_accept:
+            c["last"] = "accepted"
+            c["accepted_at"] = c["resolve_at"]
+        if outcome == "yield":
+            # 拒單回來 → sleep 0.1 → 再送;下一筆的結果在 送出+延遲 才回來
+            c["send_at"] = c["resolve_at"] + timedelta(seconds=RETRY_SLEEP_SEC)
+            c["resolve_at"] = c["send_at"] + timedelta(seconds=_lat(sym, c["i"]))
+            return
+        st = session.trades.get(sym)
+        if sent_accept:
+            c["done"] = "accepted"
+        elif st is not None and st.stopped_reason:
+            c["done"] = f"stopped:{st.stopped_reason}"
+        elif st is not None and st.filled_lots >= st.target_lots:
+            c["done"] = "target_filled"
+        elif c["resolve_at"].time() >= cutoff:
+            c["done"] = "cutoff"
+        elif sent_reject:
+            c["done"] = "stop_after_reject"     # 舊碼 rule B (第一盤成交來 → 停) 走這條
+        else:
+            c["done"] = "no_send"
+        _fake_fill(sym)
+
+    def run_due_chase(cur):
+        for sym, c in ctx["chase"].items():
+            while c["done"] is None and cur >= c["resolve_at"]:
+                chase_step(sym, c, cur)
+
+    def monitor_on_trade(sym, data, dt):
+        """仿 runner._monitor_on_trade (08:59:58 掛上,09:00 起生效)。"""
+        if _pick(data, "isTrial"):
+            return
+        if dt.time() < OPEN_TIME:
+            return
+        price = float(_pick(data, "price") or 0)
+        if price <= 0:
+            return
+        if mark_opened is not None:
+            mark_opened(sym)
+        qty = int(_pick(data, "size", "qty") or 0)
+        lots = qty // 1000 if qty >= 1000 else qty
+        session.on_first_trade(sym, lots >= args.first_trade_min_lots)
+
+    def note_trade(sym, data, dt):
+        """replay 內部: 記該檔開盤時刻 (首筆非試撮真成交 = isOpen) + 最後一筆 (換手種子化用)。"""
+        if _pick(data, "isTrial") or dt.time() < OPEN_TIME:
+            return
+        if float(_pick(data, "price") or 0) <= 0:
+            return
+        if sym not in ctx["opened_at"]:
+            ctx["opened_at"][sym] = dt
+            broker.opened.add(sym)
+        ctx["last_trade"][sym] = data
+
+    def do_swap():
+        """filter → trader 換手 (production: 09:00 等待迴圈回來+寫快照後)。仿 runner 種子化首筆成交。"""
+        tr = ctx["trader"]
+        if tr is None:
+            return
+        for sym in ctx["pre_marked"]:
+            lt = ctx["last_trade"].get(sym)
+            if lt is not None:
+                try:
+                    tr.on_trade(sym, lt)
+                except Exception:
+                    pass
+
+    trader_takes_cont = None
 
     # ── 串流讀 tick ──
     n_books = n_trades = n_lines = 0
-    with open(args.ticks, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            channel = obj.get("channel")
-            data = obj.get("data") or {}
-            ts_str = obj.get("ts")
-            if channel not in ("books", "trades") or not ts_str:
-                continue
-            try:
-                dt = datetime.fromisoformat(ts_str)
-            except Exception:
-                continue
-            n_lines += 1
-            _set_clock(dt)
-            t = dt.time()
+    swap_dt = None
+    try:
+        with open(args.ticks, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                channel = obj.get("channel")
+                data = obj.get("data") or {}
+                ts_str = obj.get("ts")
+                if channel not in ("books", "trades") or not ts_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts_str)
+                except Exception:
+                    continue
+                n_lines += 1
+                _set_clock(dt)
+                t = dt.time()
 
-            # 相位推進
-            if ctx["phase"] == "filter" and t >= PRE_ORDER_TIME:
-                do_pre_order()
-                ctx["phase"] = "preopen"
-            if ctx["phase"] in ("filter", "preopen") and t >= OPEN_TIME:
-                do_open()
-                ctx["phase"] = "trading"
+                # 相位推進
+                if ctx["phase"] == "filter" and t >= PRE_ORDER_TIME:
+                    do_pre_order()
+                    ctx["phase"] = "preopen"
+                if ctx["phase"] in ("filter", "preopen") and t >= OPEN_TIME:
+                    open_dt = datetime.combine(dt.date(), OPEN_TIME)
+                    do_open(open_dt)
+                    swap_dt = open_dt + timedelta(seconds=swap_delay)
+                    ctx["phase"] = "opening"
+                if ctx["phase"] == "opening" and swap_dt is not None and dt >= swap_dt:
+                    do_swap()
+                    ctx["phase"] = "trading"
 
-            symbol = _pick(data, "symbol")
-            if not symbol:
-                continue
-            symbol = str(symbol)
+                # 市價追: 先結算到 dt 為止已回來的送單結果 (worker thread 與行情 thread 並行)
+                run_due_chase(dt)
 
-            if channel == "books":
-                n_books += 1
-                bids = data.get("bids") or []
-                asks = data.get("asks") or []
-                # 記漲停價委買量 (20% 母數用) — 篩選期間
-                lu = limit_ups.get(symbol)
-                if lu:
-                    for b in bids:
-                        bp = _pick(b, "price")
-                        if bp is not None and abs(float(bp) - lu) < 0.001:
-                            ctx["last_bid_at_limit"][symbol] = int(_pick(b, "size") or 0)
-                            break
-                is_cont = bool(_pick(data, "isContinuous"))   # 交易所「已逐筆」旗標 (開盤訊號底線)
-                if ctx["phase"] in ("filter", "preopen"):
-                    filter_on_book(symbol, bids, asks, is_cont)
-                elif ctx["trader"] is not None:
-                    ctx["trader"].on_book(symbol, bids, asks, is_cont)   # 支撐消失 → 同步出場
-            elif channel == "trades":
-                n_trades += 1
-                if ctx["phase"] == "trading" and ctx["trader"] is not None:
-                    ctx["trader"].on_trade(symbol, data)
+                symbol = _pick(data, "symbol")
+                if not symbol:
+                    continue
+                symbol = str(symbol)
+
+                if channel == "books":
+                    n_books += 1
+                    bids = data.get("bids") or []
+                    asks = data.get("asks") or []
+                    # 記漲停價委買量 (20% 母數用) — 篩選期間
+                    lu = limit_ups.get(symbol)
+                    if lu:
+                        for b in bids:
+                            bp = _pick(b, "price")
+                            if bp is not None and abs(float(bp) - lu) < 0.001:
+                                ctx["last_bid_at_limit"][symbol] = int(_pick(b, "size") or 0)
+                                break
+                    is_cont = bool(_pick(data, "isContinuous"))   # 交易所「已逐筆」旗標 (開盤訊號底線)
+                    if ctx["phase"] in ("filter", "preopen", "opening"):
+                        # opening = 換手前 filter 仍在線 (production 競態窗口)
+                        if filter_takes_cont:
+                            filter_on_book(symbol, bids, asks, is_cont)
+                        else:
+                            filter_on_book(symbol, bids, asks)
+                    elif ctx["trader"] is not None:
+                        tr = ctx["trader"]
+                        if trader_takes_cont is None:
+                            trader_takes_cont = _accepts_kw(tr.on_book, "is_continuous")
+                        if trader_takes_cont:
+                            tr.on_book(symbol, bids, asks, is_cont)   # 支撐消失 → 同步出場
+                        else:
+                            tr.on_book(symbol, bids, asks)
+                elif channel == "trades":
+                    n_trades += 1
+                    note_trade(symbol, data, dt)
+                    if ctx["phase"] in ("preopen", "opening"):
+                        monitor_on_trade(symbol, data, dt)
+                    elif ctx["phase"] == "trading" and ctx["trader"] is not None:
+                        ctx["trader"].on_trade(symbol, data)
+        # 檔尾: 把還在等結果的市價追收尾 (標 eof;部位假設同 done 語意)
+        for sym, c in ctx["chase"].items():
+            if c["done"] is None:
+                c["done"] = "eof"
+                _fake_fill(sym)
+    finally:
+        ts_mod.time = orig_time_mod
 
     # 出場清單: 重放結束後直接由 session 狀態算 (同步出場,已定案)
     ctx["exits"] = [(s, st.stopped_reason, st.filled_lots)
@@ -261,6 +496,18 @@ def run(args):
     return SimpleNamespace(session=session, state=state, ctx=ctx,
                            broker=session.broker, report=report,
                            marked=ctx.get("pre_marked", []), exits=ctx["exits"])
+
+
+def _unmarks_after_open(state, date):
+    """開盤 (≥09:00) 後被 filter unmark 的檔 (= 競態窗口誤撤候選)。"""
+    out = []
+    cut = f"{date}T09:00:00"
+    for sym, evs in state.history.items():
+        for e in evs:
+            if e.get("event") == "unmark" and str(e.get("ts") or "") >= cut \
+                    and e.get("reason") in ("bid_below_limit", "ask_appeared"):
+                out.append((sym, e.get("reason"), str(e.get("ts"))[11:19]))
+    return sorted(out)
 
 
 def _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades):
@@ -286,11 +533,11 @@ def _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades):
     w(f"  開盤即鎖: {' '.join(first_tick) or '—'}")
     w(f"  盤中鎖上: {' '.join(intraday) or '—'}")
     culled = ctx.get("culled") or []
-    w(f"量減半剔除 (08:59:58): {len(culled)} 檔  {' '.join(c[0] for c in culled) or '—'}")
+    w(f"量減半剔除 (08:59:58): {len(culled)} 檔  {' '.join(sorted(c[0] for c in culled)) or '—'}")
     try:
         disc = state.get_discarded_list()
         w(f"discarded 累計: {len(disc)} 檔")
-        for d in disc[:40]:
+        for d in sorted(disc, key=lambda x: x.get("symbol") or "")[:40]:
             w(f"    {d.get('symbol')}  {d.get('reason')}")
         if len(disc) > 40:
             w(f"    ... 另 {len(disc)-40} 檔")
@@ -301,10 +548,36 @@ def _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades):
     w(f"08:59:58 預掛限價單: {len(pre_orders)} 檔")
     for s, p, l in pre_orders:
         w(f"    {s}  @{p}  {l} 張")
-    w(f"09:00 市價盲送送出: {len(mkt)} 檔  (ReplayBroker 即接受 → 撤預掛 P)")
+    w(f"09:00 市價追委託成功: {len(mkt)} 檔  |  集合競價拒單: {len(getattr(broker, 'rejected', []))} 筆")
+    for s, l in mkt:
+        w(f"    market_buy {s} {l} 張")
     w(f"撤單筆數 (含撤 P): {len(broker.cancelled)}")
+    for no, s, reason in broker.cancelled:
+        w(f"    cancel {s} {no} ({reason})")
     w(f"budget_used={session.budget_used:,.0f}  buy_cost_actual={session._buy_cost_actual:,.0f}"
       f"  breached={session._budget_breached}")
+
+    w(f"\n── 開盤競態 (swap-delay={ctx.get('swap_delay', 0):.1f}s;集合競價拒市價;送單延遲取自 orders.csv) ──")
+    late = _unmarks_after_open(state, args.date)
+    late_bbl = [x for x in late if x[1] == "bid_below_limit"]
+    marked_set = set(marked)
+    # 重點: 09:00 後被 filter unmark 的**預掛標的** (= 誤撤,因為它們 08:59:58 還鎖著、已下 P)
+    marked_late = [x for x in late if x[0] in marked_set]
+    w(f"開盤 (≥09:00) 後 filter unmark: 共 {len(late)} 檔 (其中 bid_below_limit {len(late_bbl)} 檔)")
+    w(f"其中**預掛標的**被開盤後 unmark: {len(marked_late)} 檔"
+      + ("  ← 競態誤撤 (它們 08:59:58 已下預掛 P、當下仍鎖漲停)" if marked_late else "  ✅ 無 (修法生效)"))
+    for sym, reason, ts in marked_late:
+        w(f"    {sym}  {reason}  {ts}")
+    chase = ctx.get("chase") or {}
+    if chase:
+        w("市價追 (逐檔):")
+        for sym in sorted(chase):
+            c = chase[sym]
+            oa = ctx["opened_at"].get(sym)
+            oa_s = oa.strftime("%H:%M:%S.%f")[:-3] if oa else "—"
+            acc = c["accepted_at"].strftime("%H:%M:%S.%f")[:-3] if c["accepted_at"] else "—"
+            w(f"    {sym}  送 {c['sends']} 拒 {c['rejects']}  → {c['done']}  "
+              f"(該檔開盤 {oa_s};市價委託成功 {acc})")
 
     w("\n── 出場 (假設 marked 依 sized 張數成交 → 驗出場偵測邏輯) ──")
     if ctx["exits"]:
@@ -353,6 +626,11 @@ def main():
     ap.add_argument("--fixed-lots", type=int, default=0, dest="fixed_lots")
     ap.add_argument("--first-trade-min-lots", type=int, default=10, dest="first_trade_min_lots")
     ap.add_argument("--bid-drop-ratio", type=float, default=0.5, dest="bid_drop_ratio")
+    ap.add_argument("--swap-delay", type=float, default=1.0, dest="swap_delay",
+                    help="09:00 後 filter handler 多活幾秒才換 trader (production ~1s;0=立刻)")
+    ap.add_argument("--send-latency", type=float, default=0.3, dest="send_latency",
+                    help="市價送單往返延遲 (秒);--orders 有該檔真實 latency 時優先用真實值")
+    ap.add_argument("--chase-cutoff", default="09:03:00", dest="chase_cutoff")
     ap.add_argument("--report", default="")
     run(ap.parse_args())
 

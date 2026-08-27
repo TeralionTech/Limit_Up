@@ -12,6 +12,7 @@ import pytest
 import filter as filter_mod
 import trader as trader_mod
 import trading_session as ts_mod
+import state as state_mod
 from scripts.replay_day import run
 
 
@@ -59,19 +60,61 @@ def _args(tmp_path):
     lu.write_text(json.dumps({"AAAA": 100.0, "BBBB": 50.0, "CCCC": 30.0}), encoding="utf-8")
     ld = tmp_path / "ld.json"
     ld.write_text(json.dumps({"AAAA": 90.0}), encoding="utf-8")
+    # swap_delay=0 / send_latency=0: 這組合成情境驗「篩選→預掛→盲送→出場」全鏈,不含開盤競態
     return SimpleNamespace(
         ticks=str(ticks), limit_ups=str(lu), date="2026-08-21",
         dispositions="", limit_downs=str(ld), day_tradable="", fills="", orders="",
         total_budget=3_700_000, per_symbol=400_000, sizing_mode="budget", fixed_lots=0,
-        first_trade_min_lots=10, bid_drop_ratio=0.5, report="")
+        first_trade_min_lots=10, bid_drop_ratio=0.5, report="",
+        swap_delay=0.0, send_latency=0.0, chase_cutoff="09:03:00")
+
+
+def _write_fast_open_ticks(path):
+    """08-27 型「開太快」情境: 首筆成交 09:00:00.163 → 09:00:00.200 市價列 book (isContinuous)
+    在 filter 換手 (swap_delay=1s) 前就進來;股票其實還死鎖漲停。"""
+    L = []
+    L.append(_tick("books", "2026-08-27T08:30:00.000000", symbol="8105",
+                   bids=[{"price": 15.15, "size": 5000}], asks=[]))
+    L.append(_tick("books", "2026-08-27T08:59:58.000000", symbol="8105",
+                   bids=[{"price": 15.15, "size": 5000}], asks=[]))
+    # 09:00:00.163 首筆真成交 (isOpen) — 1080 張 ≥ 10
+    L.append(_tick("trades", "2026-08-27T09:00:00.163000", symbol="8105",
+                   price=15.15, size=1_080_000, isOpen=True))
+    # 09:00:00.200 市價列冒出 (bids[0].price=0),真實買一仍 15.15、無賣單,book 帶 isContinuous
+    L.append(_tick("books", "2026-08-27T09:00:00.200000", symbol="8105",
+                   bids=[{"price": 0.0, "size": 115}, {"price": 15.15, "size": 5000}], asks=[],
+                   isContinuous=True))
+    # 之後仍鎖著 (讓市價追的下一筆有 tick 可結算)
+    L.append(_tick("books", "2026-08-27T09:00:02.000000", symbol="8105",
+                   bids=[{"price": 0.0, "size": 900}, {"price": 15.15, "size": 5000}], asks=[],
+                   isContinuous=True))
+    L.append(_tick("books", "2026-08-27T09:00:05.000000", symbol="8105",
+                   bids=[{"price": 0.0, "size": 950}, {"price": 15.15, "size": 5000}], asks=[],
+                   isContinuous=True))
+    path.write_text("\n".join(L), encoding="utf-8")
+
+
+def _fast_open_args(tmp_path, swap_delay=1.0):
+    ticks = tmp_path / "fast.jsonl"
+    _write_fast_open_ticks(ticks)
+    lu = tmp_path / "lu.json"
+    lu.write_text(json.dumps({"8105": 15.15}), encoding="utf-8")
+    return SimpleNamespace(
+        ticks=str(ticks), limit_ups=str(lu), date="2026-08-27",
+        dispositions="", limit_downs="", day_tradable="", fills="", orders="",
+        total_budget=3_700_000, per_symbol=400_000, sizing_mode="budget", fixed_lots=0,
+        first_trade_min_lots=10, bid_drop_ratio=0.5, report="",
+        swap_delay=swap_delay, send_latency=0.5, chase_cutoff="09:03:00")
 
 
 @pytest.fixture
 def restore_clock():
     """replay 會全域 patch 三個模組的 datetime + _EXIT_FILL_WAIT_SEC — 測完還原,免污染別的測試。"""
-    orig = (filter_mod.datetime, trader_mod.datetime, ts_mod.datetime, ts_mod._EXIT_FILL_WAIT_SEC)
+    orig = (filter_mod.datetime, trader_mod.datetime, ts_mod.datetime,
+            state_mod.datetime, ts_mod._EXIT_FILL_WAIT_SEC, ts_mod.time)
     yield
-    (filter_mod.datetime, trader_mod.datetime, ts_mod.datetime, ts_mod._EXIT_FILL_WAIT_SEC) = orig
+    (filter_mod.datetime, trader_mod.datetime, ts_mod.datetime,
+     state_mod.datetime, ts_mod._EXIT_FILL_WAIT_SEC, ts_mod.time) = orig
 
 
 class TestReplayEngine:
@@ -107,3 +150,27 @@ class TestReplayEngine:
         # 首筆真成交 (非 isTrial) 有記到
         assert h.first_trade_seen is True
         assert h.first_trade.get("lots") == 94            # 94000 股 → 94 張
+
+
+class TestOpenRace:
+    """08-27 型開盤競態 (replay 忠實度 2026-08-28): swap_delay 內 filter 仍在線,市價列 book
+    在換手前到達;ReplayBroker 對開盤前送出的市價回集合競價拒單。
+    新碼: 首筆成交 → mark_opened → filter 退場不誤撤;市價追開盤後委託成功 → 撤 P (rule A)。"""
+
+    def test_fast_open_not_unmarked_and_chase_succeeds(self, tmp_path, restore_clock):
+        r = run(_fast_open_args(tmp_path, swap_delay=1.0))
+        assert "8105" in r.marked
+        assert not r.state.is_discarded("8105")                       # 市價列沒被當跌破漲停
+        assert not any(c[2] == "unmarked" for c in r.broker.cancelled)  # 沒有 unmarked 撤單
+        c = r.ctx["chase"]["8105"]
+        assert c["rejects"] >= 1                                      # 開盤前那筆被集合競價退
+        assert c["done"] == "accepted"                                # 開盤後續送 → 委託成功
+        assert c["accepted_at"] > r.ctx["opened_at"]["8105"]
+        # rule A: 委託成功 → 撤預掛剩餘 P
+        assert any(x[1] == "8105" and x[2] == "chase_sent_cancel_pre" for x in r.broker.cancelled)
+
+    def test_swap_delay_zero_has_no_race_window(self, tmp_path, restore_clock):
+        # 對照: swap_delay=0 → 開盤即換手,filter 看不到市價列 (競態只存在於窗口內)
+        r = run(_fast_open_args(tmp_path, swap_delay=0.0))
+        assert not r.state.is_discarded("8105")
+        assert r.ctx["chase"]["8105"]["done"] == "accepted"
