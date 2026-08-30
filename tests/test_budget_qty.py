@@ -66,8 +66,7 @@ class TestBudget100kTwoLots:
         s = _mk()
         s._on_fill(_fill(s.trades["1101"].order_no, "1101", 2, LIMIT))
         t = Trader(watchlist=["1101"], limit_ups={"1101": LIMIT},
-                   cfg=SimpleNamespace(first_trade_min_lots=10,
-                                       bid_decline_sample_sec=60,
+                   cfg=SimpleNamespace(bid_decline_sample_sec=60,
                                        bid_decline_minutes=5),
                    session=s)
         t.on_book("1101", [{"price": 0.0, "size": 300},

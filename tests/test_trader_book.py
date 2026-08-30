@@ -8,8 +8,7 @@ from trader import Trader, Holding
 
 
 def _cfg():
-    return SimpleNamespace(first_trade_min_lots=10,
-                           bid_decline_sample_sec=60,
+    return SimpleNamespace(bid_decline_sample_sec=60,
                            bid_decline_minutes=5)
 
 

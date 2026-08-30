@@ -44,7 +44,6 @@ class Config:
     trading_end_time: str  # "13:24:00" 收盤時間 script 結束
     target_lots: int       # 每檔目標買到幾張
     order_lots_per_sec: int  # 每秒每檔下幾張 (若已達 target 就停)
-    first_trade_min_lots: int  # 首筆真實成交量 < 此則 discard
     bid_decline_minutes: int  # 連續遞減幾分鐘 = discard
     bid_decline_sample_sec: int  # 每 N 秒抓一次 bid 五檔總量 sample
     skip_trader: bool      # true → 篩選完不進 trader，改成常駐收 tick (LIVE_SUBSCRIBE)
@@ -61,6 +60,8 @@ class Config:
     socket_count_2: int = 0    # 副帳號各自的 socket 數 (0/未設 → 同 SOCKET_COUNT)
     socket_count_3: int = 0
     avg_volume_min_lots: float = 500   # 月均量 < 此(張) 盤前剔除 (離線腳本產檔;0=不篩)
+    market_chase_start: str = "08:59:59"    # 市價盲送開始時點 (提早於 09:00 開盤暖機:此刻起 cadence
+                                            #   已在跑,集合競價期市價會被拒→續送,一開盤第一筆最快排到)
     market_chase_cutoff: str = "09:03:00"   # 9:00 盲送市價單的時間兜底 (超過即停,靠預掛守)
 
 
@@ -130,10 +131,10 @@ def load_config() -> Config:
         trading_end_time=os.environ.get("TRADING_END_TIME", "13:24:00").strip(),
         target_lots=int(os.environ.get("TARGET_LOTS", "5")),
         order_lots_per_sec=int(os.environ.get("ORDER_LOTS_PER_SEC", "1")),
-        first_trade_min_lots=int(os.environ.get("FIRST_TRADE_MIN_LOTS", "10")),
         bid_decline_minutes=int(os.environ.get("BID_DECLINE_MINUTES", "5")),
         bid_decline_sample_sec=int(os.environ.get("BID_DECLINE_SAMPLE_SEC", "60")),
         skip_trader=os.environ.get("SKIP_TRADER", "true").lower() in ("1", "true", "yes"),
         avg_volume_min_lots=float(os.environ.get("AVG_VOLUME_MIN_LOTS", "500")),
+        market_chase_start=os.environ.get("MARKET_CHASE_START", "08:59:59").strip(),
         market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:03:00").strip(),
     )

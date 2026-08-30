@@ -22,8 +22,7 @@ DOWN_A = 81.9                                   # A 的跌停價 (出場限價�
 
 
 def _trader_cfg():
-    return SimpleNamespace(first_trade_min_lots=10,
-                           bid_decline_sample_sec=60, bid_decline_minutes=5)
+    return SimpleNamespace(bid_decline_sample_sec=60, bid_decline_minutes=5)
 
 
 def _filter_cfg():
@@ -97,7 +96,7 @@ class TestFullLifecycle:
         t.on_trade(A, {"price": 100.0, "size": 94000, "isTrial": True})
         assert t.holdings[A].first_trade_seen is False
         assert s.trades[A].first_trade_fired is False
-        # 真首筆成交 94 張 ≥ 門檻 10 → on_first_trade 設旗標 (不再觸發市價追)
+        # 真首筆成交到 → on_first_trade 設旗標 (無量門檻;不再觸發市價追)
         t.on_trade(A, {"price": 100.0, "size": 94000})
         assert s.trades[A].first_trade_fired is True
         # 9:00 市價盲送 (時間驅動,取代首筆成交觸發) — 送 shortfall=2 (filled=0),委託成功後撤預掛 P

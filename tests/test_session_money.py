@@ -86,9 +86,21 @@ def _fill(order_no, symbol, lots, price, action="buy", filled_no="F1"):
 
 def _fire_chase(s, symbol):
     """直接跑一次市價盲送 worker (start 過去 / cutoff 遠未來 → 略過等待、立刻送,
-    首筆委託成功/致命拒單即停)。取代舊的 _first_trade_worker 直呼。"""
+    首筆委託成功/致命拒單即停)。取代舊的 _first_trade_worker 直呼。
+
+    管線化後 worker 會噴 sender daemon thread (不等券商回覆就送下一筆);worker 回來時那些
+    thread 可能還在跑 (委託成功→撤 P、多送→自撤 尚未落地)。測試要確定性 → 這裡等 sender
+    thread 全部收斂再回,免與後續斷言 race (2026-08-29: 全負載下 test_exit_logic 曾偶發)。"""
     from datetime import time as _tm
+    import threading as _th
+    import time as _t
     s._market_chase_worker(symbol, _tm(0, 0, 0), _tm(23, 59, 59))
+    deadline = _t.monotonic() + 3
+    while _t.monotonic() < deadline:
+        if not any(t.is_alive() and t.name.startswith(f"chase-send-{symbol}")
+                   for t in _th.enumerate()):
+            break
+        _t.sleep(0.005)
 
 
 class TestCalcLots:
@@ -270,105 +282,69 @@ class TestManageGates:
 
 
 class TestMarketBlindChase:
-    """9:00 市價盲送 (2026-08-24 定案 + 2026-08-25 修正: 時間驅動、送 shortfall(=target−已成交)、
-    首筆委託成功即停、**委託成功即撤預掛剩餘 P**、預算轉移 (釋放預掛保留、改保留市價))。"""
+    """9:00 市價盲送 (2026-08-28 **管線化**: 不等券商回覆就送、45/s 唯一節拍;送/處理拆成
+    _chase_send_one 供同步驗)。送單邏輯用 _chase_send_one 直接驗 (確定性);
+    cadence gating (0 送) 用 _fire_chase;管線速率用真併發測。"""
 
-    def test_fires_shortfall_cancels_preorder(self):
+    @staticmethod
+    def _send_one(s, sym):
+        st = s.trades.get(sym)
+        return s._chase_send_one(sym, st.target_lots - st.filled_lots)
+
+    # ── 送一筆的邏輯 (_chase_send_one,同步、確定性) ──
+    def test_send_first_success_transfers_budget_cancels_pre(self):
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})     # target=2, 預掛保留 200k
         pre_no = s.trades["2330"].pre_order_no
-        _fire_chase(s, "2330")
+        assert self._send_one(s, "2330") == "accepted"
         assert ("market_buy", "2330", None, 2) in s.broker.placed   # filled=0 → shortfall=2
-        assert [c[0] for c in s.broker.cancelled] == [pre_no]       # 委託成功 → 撤預掛 P
+        assert [c[0] for c in s.broker.cancelled] == [pre_no]       # 委託成功 → 撤預掛 P (rule A)
         st = s.trades["2330"]
-        assert st.order_kind == "market_buy" and st.order_status == "pending"
-        # 預算轉移等額 (釋放預掛 200k、改保留市價 200k) → budget_used 不變
-        assert s.budget_used == 200_000
+        assert st.chase_done and st.order_kind == "market_buy" and st.order_status == "pending"
+        assert s.budget_used == 200_000                            # 預算轉移等額 → 不變
 
-    def test_sends_shortfall_not_full_target(self):
-        # 「扣已買」: 預掛已成 1 張 → 盲送只送差額 shortfall=1 (非整包 target=2),免 2× 超買
+    def test_send_shortfall_not_full_target(self):
+        # 預掛已成 1 張 → 送差額 shortfall=1 (非整包 target=2)
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
         s._on_fill(_fill(s.trades["2330"].order_no, "2330", 1, 100.0))
-        _fire_chase(s, "2330")
+        self._send_one(s, "2330")
         assert [c for c in s.broker.placed if c[0] == "market_buy"] == \
-            [("market_buy", "2330", None, 1)]             # 差額 1 張,非固定 2
+            [("market_buy", "2330", None, 1)]
 
-    def test_disposition_no_market_chase(self):
+    def test_send_extra_after_done_cancels_itself(self):
+        # 管線多送: chase_done 已立 → 這筆也成功 → 撤掉它 (免多部位),不動第一筆 order_no
         s = make_session()
-        s.set_dispositions({"2330": True})
+        s._cancel_one_order_async = s._cancel_one_order        # 測試同步化 (免 thread race)
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        _fire_chase(s, "2330")
-        assert not [c for c in s.broker.placed if c[0] == "market_buy"]   # 處置股禁市價,不盲送
+        self._send_one(s, "2330")                              # 第一筆 → accepted, chase_done
+        first_no = s.trades["2330"].order_no
+        s.broker.cancelled.clear()
+        assert s._chase_send_one("2330", 2) == "accepted_extra"   # 管線多送
+        assert len([p for p in s.broker.placed if p[0] == "market_buy"]) == 2   # 兩筆都送出
+        assert s.trades["2330"].order_no == first_no          # 第一筆 order_no 不動
+        assert any(c[0] != first_no for c in s.broker.cancelled)  # 多送那筆被自撤
 
-    def test_stopped_reason_aborts(self):
+    def test_send_reject_then_success(self):
+        # 非致命拒 → "rejected",不改狀態;續呼叫直到成功 → "accepted"
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        s.trades["2330"].stopped_reason = "first_check_failed"
-        _fire_chase(s, "2330")
-        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
-
-    def test_retries_transient_until_success(self):
-        # 暫時性拒單 → 每 0.1s 重試到成功;首筆委託成功即停
-        s = make_session()
-        s.place_pre_orders(["2330"], {"2330": 100.0})
-        fails = {"n": 0}
-        orig = s.broker.place_market_buy
-        def flaky(symbol, lots):
-            if fails["n"] < 5:
-                fails["n"] += 1
-                raise RuntimeError("busy")
-            return orig(symbol, lots)
-        s.broker.place_market_buy = flaky
-        _fire_chase(s, "2330")
-        assert fails["n"] == 5
-        assert s.trades["2330"].order_kind == "market_buy"
-
-    def test_fatal_reject_stops(self):
-        # 價格穩定/致命拒單 → 送一筆即停 (6144 事故防護)
-        s = make_session()
-        s.place_pre_orders(["6144"], {"6144": 100.0})
-        calls = {"n": 0}
-        def reject(symbol, lots):
-            calls["n"] += 1
-            raise RuntimeError("證券委託觸及價格穩定措施上、下限價格")
-        s.broker.place_market_buy = reject
-        _fire_chase(s, "6144")
-        assert calls["n"] == 1
-        assert s.trades["6144"].stopped_reason == "fatal_reject"
-
-    def test_first_trade_no_longer_stops_chase(self):
-        # 2026-08-28: rule B 移除 — 第一盤成交已來也**不停送**;續送直到真的委託成功 (→ 撤 P)。
-        # (快開盤股「集合競價全被退 → 第一盤成交一到就停」會從沒真送進逐筆 → 0 部位,故移除,6226。)
-        s = make_session()
-        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2
-        pre_no = s.trades["2330"].pre_order_no
-        s.trades["2330"].first_trade_fired = True           # 第一盤成交已來
         fails = {"n": 0}
         orig = s.broker.place_market_buy
         def flaky(symbol, lots):
             if fails["n"] < 3:
                 fails["n"] += 1
-                raise RuntimeError("busy")                  # 非致命 (集合競價/暫時)
+                raise RuntimeError("busy")                    # 非致命 (集合競價/暫時)
             return orig(symbol, lots)
         s.broker.place_market_buy = flaky
-        s.broker.cancelled.clear()
-        _fire_chase(s, "2330")
-        assert fails["n"] == 3                              # 第一盤成交來也照重試,不停
-        assert s.trades["2330"].order_kind == "market_buy"  # 最後委託成功
-        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 委託成功 → 撤 P
+        for _ in range(3):
+            assert s._chase_send_one("2330", 2) == "rejected"
+            assert not s.trades["2330"].chase_done            # 拒單不改狀態
+        assert s._chase_send_one("2330", 2) == "accepted"
+        assert s.trades["2330"].chase_done
 
-    def test_stops_when_target_filled_no_market(self):
-        # 6226 情境: 預掛限價成交足額 target → shortfall≤0 → **一筆市價都不送** (免超 target;行為不變)
-        s = make_session()
-        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2
-        s._on_fill(_fill(s.trades["2330"].order_no, "2330", 2, 100.0))   # 限價全成交 2 張
-        s.trades["2330"].first_trade_fired = True           # 第一盤成交也來
-        _fire_chase(s, "2330")
-        assert not [c for c in s.broker.placed if c[0] == "market_buy"]  # 足額 → 不送市價
-
-    def test_fatal_reject_keeps_pre_even_if_first_trade_arrived(self):
-        # 2026-08-26 定案: 致命拒單**保留預掛 P**(P 只在委託成功時撤);即使第一盤成交已來也一樣保留
+    def test_send_fatal_keeps_pre_even_if_first_trade_arrived(self):
+        # 致命拒單 → stopped_reason,不撤 P (即使第一盤成交已來也保留)
         s = make_session()
         s.place_pre_orders(["6144"], {"6144": 100.0})
         pre_no = s.trades["6144"].pre_order_no
@@ -377,43 +353,126 @@ class TestMarketBlindChase:
             raise RuntimeError("證券委託觸及價格穩定措施上、下限價格")
         s.broker.place_market_buy = reject
         s.broker.cancelled.clear()
-        _fire_chase(s, "6144")
+        assert s._chase_send_one("6144", 2) == "fatal"
         assert s.trades["6144"].stopped_reason == "fatal_reject"
-        assert s.broker.cancelled == []                         # 致命拒單不撤 P
-        assert s.trades["6144"].order_no == pre_no              # P 續守
-        assert s.trades["6144"].order_status == "pending"
-        assert s.trades["6144"].order_kind == "pre_limit"
-        assert s.budget_used == 100_000 * 2                     # 預算不動 (2 張 × 100k)
+        assert s.broker.cancelled == []                       # 不撤 P
+        assert s.trades["6144"].order_no == pre_no and s.trades["6144"].order_kind == "pre_limit"
+        assert s.budget_used == 100_000 * 2                   # 預算不動
+
+    # ── cadence 迴圈 gating (確定性 0 送) ──
+    def test_disposition_no_send(self):
+        s = make_session()
+        s.set_dispositions({"2330": True})
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        _fire_chase(s, "2330")
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]   # 處置股禁市價
+
+    def test_stopped_reason_no_send(self):
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        s.trades["2330"].stopped_reason = "first_check_failed"
+        _fire_chase(s, "2330")
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
+
+    def test_target_filled_no_send(self):
+        # shortfall≤0 (預掛成交足額) → cadence 一筆都不送 (6226 情境;rule B 已移除,first_trade 不影響)
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        s._on_fill(_fill(s.trades["2330"].order_no, "2330", 2, 100.0))
+        s.trades["2330"].first_trade_fired = True
+        _fire_chase(s, "2330")
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
+
+    def test_chase_done_stops_cadence(self):
+        # chase_done 已立 → cadence 不再送 (管線第一筆成功後停送的依據)
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        s.trades["2330"].chase_done = True
+        _fire_chase(s, "2330")
+        assert not [c for c in s.broker.placed if c[0] == "market_buy"]
+
+    # ── 管線化併發: 續送到成功 + 45/s 節拍 (真 thread + 真 rate limiter) ──
+    def test_pipelined_reaches_success_and_paces_near_45s(self):
+        import time as _t, threading as _th
+        from datetime import time as _tm
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        sends, lock, state = [], _th.Lock(), {"opened": False}
+        def slow(symbol, lots):
+            with lock:
+                sends.append(_t.monotonic())
+                opened = state["opened"]
+            _t.sleep(0.1)                     # REST 往返 100ms (同步版會被這個卡在 ~5/s/檔)
+            if not opened:
+                raise RuntimeError("證券集合競價時段不可輸入市價、IOC、FOK委託")   # 未開盤 → 拒
+            return f"M{len(sends)}"
+        s.broker.place_market_buy = slow
+        _th.Thread(target=lambda: (_t.sleep(0.3), state.__setitem__("opened", True)),
+                   daemon=True).start()       # 0.3s 後「開盤」
+        _th.Thread(target=s._market_chase_worker, args=("2330", _tm(0, 0, 0), _tm(23, 59, 59)),
+                   daemon=True).start()
+        deadline = _t.monotonic() + 3
+        while _t.monotonic() < deadline and not s.trades["2330"].chase_done:
+            _t.sleep(0.01)
+        assert s.trades["2330"].chase_done                    # 開盤後委託成功 → 停 (續送到成功)
+        t0 = sends[0]
+        pre_open = [t for t in sends if t < t0 + 0.3]
+        assert len(pre_open) >= 8, f"管線化前 0.3s 應送 ≫ 同步的 ~3 筆,實得 {len(pre_open)}"
+        gaps = sorted((sends[i] - sends[i - 1]) * 1000 for i in range(1, len(sends)))
+        median = gaps[len(gaps) // 2]
+        assert median < 60, f"管線相鄰送出間隔中位 {median:.0f}ms 應 <60ms (45/s≈22ms),非同步的 ~100ms+"
+
+    # ── 開盤訊號 → 送一筆 final 後停 (2026-08-28 使用者定案: 停在訊號、非委託成功回報) ──
+    def test_first_trade_signal_sends_one_final_and_stops(self):
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})       # target 2
+        pre_no = s.trades["2330"].pre_order_no
+        s.trades["2330"].first_trade_fired = True           # 開盤訊號到
+        _fire_chase(s, "2330")                              # cadence: first_came → 同步送 final → 停
+        mkt = [p for p in s.broker.placed if p[0] == "market_buy"]
+        assert mkt == [("market_buy", "2330", None, 2)]     # 只送一筆 final (不再噴)
+        assert s.trades["2330"].chase_done
+        assert [c[0] for c in s.broker.cancelled] == [pre_no]   # 委託成功 → 撤 P
+
+    def test_stray_extra_market_buy_swept_by_cancel_all(self):
+        # 管線多送的額外 M 只在 order_log (不在 st.order_no) → 13:23 cancel_all_pending 用 order_log
+        # 權威掃到、撤掉 (免變隔夜隱形裸單)。這是超買不做防護、但**絕不留裸單**的底線。
+        s = make_session()
+        s.place_pre_orders(["2330"], {"2330": 100.0})
+        self._send_one(s, "2330")                           # 第一筆 M1 = st.order_no, chase_done, 撤 P
+        s._log_order("Mextra", "2330", "buy", "market_buy", 2, 0)   # 模擬額外 M 仍 pending 在 order_log
+        s.broker.cancelled.clear()
+        s.cancel_all_pending("trading_end")
+        assert "Mextra" in [c[0] for c in s.broker.cancelled]   # 額外 M 被 order_log 權威掃到撤掉
+        assert s.order_log["Mextra"]["status"] == "cancelled"
+        assert s.trades["2330"].last_buy_cancel_ts > 0          # 撤了 live 買單 → 出場會等在途成交 (審查 #3)
 
 
 class TestFirstTradeGating:
-    """on_first_trade 重寫 (2026-08-24): 只做第一盤淘汰,不再觸發市價追 (改時間驅動盲送)。"""
+    """on_first_trade 簡化 (2026-08-29): 只立開盤訊號旗標,不再做量門檻淘汰。單參數。"""
 
-    def test_passed_only_sets_flag_no_order(self):
+    def test_sets_flag_no_order(self):
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        s.on_first_trade("2330", True)
+        s.on_first_trade("2330")
         assert s.trades["2330"].first_trade_fired is True
         assert not [c for c in s.broker.placed if c[0] == "market_buy"]
+        assert s.trades["2330"].stopped_reason == ""       # 不再有 first_check_failed 停檔
 
-    def test_not_passed_stops_and_cancels(self):
-        import time as _t
+    def test_no_cancel_on_first_trade(self):
+        # 首筆量門檻已移除: 開盤訊號到不撤預掛 (P 續留,盲送送最後一筆市價後停)
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        s.on_first_trade("2330", False)                   # 首筆成交量太小 → 淘汰 + 撤預掛
-        assert s.trades["2330"].stopped_reason == "first_check_failed"
-        deadline = _t.monotonic() + 2
-        while _t.monotonic() < deadline and not s.broker.cancelled:
-            _t.sleep(0.01)
-        assert s.broker.cancelled                          # async 撤預掛
-        assert s.budget_used == 0
+        s.on_first_trade("2330")
+        assert not s.broker.cancelled
+        assert s.budget_used > 0                            # 預掛預算仍佔用 (未淘汰)
 
     def test_idempotent(self):
         s = make_session()
         s.place_pre_orders(["2330"], {"2330": 100.0})
-        s.on_first_trade("2330", True)
-        s.on_first_trade("2330", False)                    # 已 fired → 第二次不動作
-        assert s.trades["2330"].stopped_reason == ""
+        s.on_first_trade("2330")
+        s.on_first_trade("2330")                            # 已 fired → 第二次不動作
+        assert s.trades["2330"].first_trade_fired is True
 
 
 class TestAsyncCancel:

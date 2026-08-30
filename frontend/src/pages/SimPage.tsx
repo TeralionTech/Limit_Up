@@ -3,9 +3,6 @@ import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTr
 
 export default function SimPage() {
   const [sum, setSum] = useState<TraderSummary | null>(null)
-  const [minLots, setMinLots] = useState<string>('')
-  const [savedLots, setSavedLots] = useState<number | null>(null)
-  const [saveMsg, setSaveMsg] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -19,27 +16,6 @@ export default function SimPage() {
     const id = window.setInterval(tick, 1500)
     return () => { cancelled = true; window.clearInterval(id) }
   }, [])
-
-  // 載入目前張數參數
-  useEffect(() => {
-    api.getTraderParams().then(p => {
-      setSavedLots(p.first_trade_min_lots)
-      setMinLots(String(p.first_trade_min_lots))
-    }).catch(() => {})
-  }, [])
-
-  async function saveLots() {
-    const n = parseInt(minLots, 10)
-    if (!n || n < 1) { setSaveMsg('請輸入 >= 1 的整數'); return }
-    try {
-      await api.setTraderParams({ first_trade_min_lots: n })
-      setSavedLots(n)
-      setSaveMsg(`✓ 已套用 ${n} 張`)
-      window.setTimeout(() => setSaveMsg(''), 3000)
-    } catch (e: any) {
-      setSaveMsg(`失敗: ${e.message}`)
-    }
-  }
 
   const [trackMsg, setTrackMsg] = useState('')
 
@@ -62,30 +38,6 @@ export default function SimPage() {
     <div className="space-y-4">
       {/* 交易模式 (模擬/真實) — 連線/預算/開始交易 */}
       <TradingPanel />
-
-      {/* 參數列 — trader 未啟動也可先調 */}
-      <section className="bg-white rounded-lg shadow p-4 flex items-end gap-3 flex-wrap">
-        <div>
-          <label className="block text-xs text-gray-600 mb-1">
-            第一盤最小成交張數 (小於此淘汰)
-          </label>
-          <input
-            type="number" min={1} value={minLots}
-            onChange={e => setMinLots(e.target.value)}
-            className="border rounded px-3 py-2 w-32 font-mono"
-          />
-        </div>
-        <button
-          onClick={saveLots}
-          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
-        >
-          套用
-        </button>
-        {savedLots != null && (
-          <span className="text-xs text-gray-500 pb-2">目前生效: {savedLots} 張</span>
-        )}
-        {saveMsg && <span className="text-sm pb-2 text-green-700">{saveMsg}</span>}
-      </section>
 
       {!sum || !sum.trader_active ? (
         <div className="bg-white rounded-lg shadow p-8 text-center text-gray-500">
@@ -307,7 +259,6 @@ function Wait() {
 
 function failLabel(reason: string): string {
   if (reason.startsWith('first_books_ask_appeared')) return '委賣一出現'
-  if (reason.startsWith('first_trade_qty_too_small')) return '首筆量不足'
   return reason
 }
 

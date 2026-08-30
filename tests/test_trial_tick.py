@@ -15,15 +15,15 @@ from subscriber import Subscriber
 
 def _mk_runner():
     r = Runner()                                   # 直接建構 (不走 get() singleton)
-    r.cfg = SimpleNamespace(first_trade_min_lots=10)
+    r.cfg = SimpleNamespace()                       # _monitor_on_trade 已不讀任何 cfg
     r._trade_start_time = dtime(0, 0)              # 測試不受牆鐘影響 (預設全放行)
     calls = []
-    r.session.on_first_trade = lambda sym, passed: calls.append((sym, passed))
+    r.session.on_first_trade = lambda sym: calls.append(sym)   # 2026-08-29 單參,無量門檻
     return r, calls
 
 
-REAL_TICK = {"price": 100.0, "size": 50000}        # 50 張
-TRIAL_TICK = {"price": 100.0, "size": 50000, "isTrial": True}
+REAL_TICK = {"price": 100.0, "size": 500}          # size 單位是張
+TRIAL_TICK = {"price": 100.0, "size": 500, "isTrial": True}
 
 
 class TestMonitorOnTrade:
@@ -35,12 +35,13 @@ class TestMonitorOnTrade:
     def test_real_tick_triggers(self):
         r, calls = _mk_runner()
         r._monitor_on_trade("2491", REAL_TICK)
-        assert calls == [("2491", True)]           # 50 張 >= 門檻 10
+        assert calls == ["2491"]                    # 首筆真成交到 → 立開盤訊號 (無量門檻)
 
-    def test_small_real_tick_fails_check(self):
+    def test_tiny_real_tick_still_triggers(self):
+        # 首筆量門檻已移除 (2026-08-29): 再小的首筆真成交也照樣立旗、不淘汰
         r, calls = _mk_runner()
-        r._monitor_on_trade("2491", {"price": 100.0, "size": 5000})   # 5 張
-        assert calls == [("2491", False)]
+        r._monitor_on_trade("2491", {"price": 100.0, "size": 1})
+        assert calls == ["2491"]
 
     def test_time_gate_blocks_before_open(self):
         # 逐筆撮合開始前,連沒帶 isTrial 的 tick 也擋 (欄位缺失保險)
@@ -53,8 +54,7 @@ class TestMonitorOnTrade:
 class TestTraderTrialGuard:
     def test_trial_tick_not_counted_as_first_trade(self):
         t = Trader(watchlist=["2491"], limit_ups={"2491": 34.9},
-                   cfg=SimpleNamespace(first_trade_min_lots=10,
-                                       bid_decline_sample_sec=60, bid_decline_minutes=5))
+                   cfg=SimpleNamespace(bid_decline_sample_sec=60, bid_decline_minutes=5))
         t.on_trade("2491", TRIAL_TICK)
         h = t.holdings["2491"]
         assert h.first_trade_seen is False         # 試撮不算首筆

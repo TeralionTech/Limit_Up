@@ -63,6 +63,10 @@ class RealOrderClient:
         self.healthy = False
         self.error_msg = ""
         self.is_test = False
+        # 已認領/回傳過的書號 (每筆下單成功後記) — 缺書號反查時排除,讓管線化同標同量多筆在飛時
+        # 仍能唯一認領那筆剛送、還沒書號的 (2026-08-28: 管線化打破「每檔同時僅一張活躍委託」假設)
+        self._claimed_order_nos: set = set()
+        self._unknown_ctr = 0          # UNKNOWN 書號流水號 — 免同秒兩筆撞同 key 覆寫掉一筆 live 單
         # callbacks
         self.on_fill: Optional[Callable[[dict], None]] = None
         self.on_order: Optional[Callable[[dict], None]] = None
@@ -332,9 +336,11 @@ class RealOrderClient:
             # 不 raise: raise 會觸發上層重試 → 重複下單,比丟追蹤更糟。
             order_no = self._recover_order_no(symbol, buy, lots)
             if not order_no:
+                self._unknown_ctr += 1
                 logger.critical(f"[broker] ⚠⚠ {symbol} 委託已送出但無法取得書號!"
                                 f"未追蹤曝險 — 請立即人工至券商查驗 (user_def=hitlimit)")
-                order_no = f"UNKNOWN-{int(ts_sent)}"
+                order_no = f"UNKNOWN-{int(ts_sent)}-{self._unknown_ctr}"  # 唯一 → 不覆寫掉另一筆 live 單
+        self._claimed_order_nos.add(order_no)   # 記已認領 → 之後同標同量缺書號反查能排除本筆
         self._write_row(order_no, ts_sent, ts_accepted, action, symbol, lots,
                         "MARKET" if market else price, extra)
         logger.info(f"[broker] {action} {symbol} × {lots} 張 @ "
@@ -344,9 +350,10 @@ class RealOrderClient:
     def _recover_order_no(self, symbol: str, buy: bool, lots: int) -> str:
         """place 回傳缺書號時,用 get_order_results 反查認領。
 
-        候選 = user_def=="hitlimit" (策略單權威識別) + 標的 + 買賣別 + 股數 全相符
-        且書號有值。**恰好 1 筆才認領** — 0 或多筆一律回 "" (寧可不認不亂認;
-        狀態機每檔同時僅一張活躍委託,此路徑只在剛下單瞬間觸發,正常必唯一)。
+        候選 = user_def=="hitlimit" (策略單權威識別) + 標的 + 買賣別 + 股數 全相符、書號有值、
+        **且尚未被認領** (不在 self._claimed_order_nos)。**恰好 1 筆才認領** — 0 或多筆一律回 ""。
+        2026-08-28 管線化: 同標同量可有多筆在飛 (打破「每檔僅一張活躍委託」),但先前那 N-1 筆的書號
+        都已 add 進 _claimed → 排除後只剩剛送、還沒書號的這一筆 → 仍唯一可認。
         """
         try:
             result = self.sdk.stock.get_order_results(self.account)
@@ -363,7 +370,7 @@ class RealOrderClient:
                 if int(_attr(o, "quantity", default=0) or 0) != lots * 1000:
                     continue
                 no = str(getattr(o, "order_no", "") or "")
-                if no:
+                if no and no not in self._claimed_order_nos:   # 排除先前已認領的管線在飛單
                     candidates.append(no)
             if len(candidates) == 1:
                 logger.warning(f"[broker] {symbol} 書號反查認領成功: {candidates[0]}")

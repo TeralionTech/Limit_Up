@@ -250,34 +250,6 @@ def get_trader_summary():
     return summary
 
 
-class TraderParams(BaseModel):
-    first_trade_min_lots: Optional[int] = None
-
-
-@router.get("/trader/params")
-def get_trader_params():
-    """目前 trader 參數 (前端顯示用)."""
-    r = Runner.get()
-    if r.cfg is not None:
-        v = r.cfg.first_trade_min_lots
-    else:
-        v = r._param_overrides.get("first_trade_min_lots", 10)
-    return {"first_trade_min_lots": v}
-
-
-@router.post("/trader/params")
-def set_trader_params(p: TraderParams):
-    """調 trader 參數 — runtime 立即生效 (trader 共用同一 cfg 物件)."""
-    r = Runner.get()
-    applied = {}
-    if p.first_trade_min_lots is not None:
-        if p.first_trade_min_lots < 1:
-            raise HTTPException(400, "first_trade_min_lots 必須 >= 1")
-        r.set_param_override("first_trade_min_lots", p.first_trade_min_lots)
-        applied["first_trade_min_lots"] = p.first_trade_min_lots
-    return {"ok": True, "applied": applied}
-
-
 class AbandonReq(BaseModel):
     symbol: str
 

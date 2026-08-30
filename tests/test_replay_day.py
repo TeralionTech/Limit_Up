@@ -43,10 +43,10 @@ def _write_ticks(path):
                    bids=[{"price": 0.0, "size": 800}, {"price": 100.0, "size": 500}], asks=[]))
     # 09:00 試撮 trade (isTrial) → 應被忽略,不算首筆
     L.append(_tick("trades", "2026-08-21T09:00:00.500000", symbol="AAAA",
-                   price=100.0, size=94000, isTrial=True))
-    # 09:00 真首筆成交 (94 張 ≥ 10) → TRACKING
+                   price=100.0, size=94, isTrial=True))
+    # 09:00 真首筆成交 (size 單位是張) → TRACKING
     L.append(_tick("trades", "2026-08-21T09:00:01.000000", symbol="AAAA",
-                   price=100.0, size=94000))
+                   price=100.0, size=94))
     # 09:01 市價買隊伍消失 (無 price=0 列) → 支撐消失 → 出場
     L.append(_tick("books", "2026-08-21T09:01:00.000000", symbol="AAAA",
                    bids=[{"price": 100.0, "size": 500}], asks=[]))
@@ -65,7 +65,7 @@ def _args(tmp_path):
         ticks=str(ticks), limit_ups=str(lu), date="2026-08-21",
         dispositions="", limit_downs=str(ld), day_tradable="", fills="", orders="",
         total_budget=3_700_000, per_symbol=400_000, sizing_mode="budget", fixed_lots=0,
-        first_trade_min_lots=10, bid_drop_ratio=0.5, report="",
+        bid_drop_ratio=0.5, report="",
         swap_delay=0.0, send_latency=0.0, chase_cutoff="09:03:00")
 
 
@@ -103,7 +103,7 @@ def _fast_open_args(tmp_path, swap_delay=1.0):
         ticks=str(ticks), limit_ups=str(lu), date="2026-08-27",
         dispositions="", limit_downs="", day_tradable="", fills="", orders="",
         total_budget=3_700_000, per_symbol=400_000, sizing_mode="budget", fixed_lots=0,
-        first_trade_min_lots=10, bid_drop_ratio=0.5, report="",
+        bid_drop_ratio=0.5, report="",
         swap_delay=swap_delay, send_latency=0.5, chase_cutoff="09:03:00")
 
 
@@ -149,7 +149,7 @@ class TestReplayEngine:
         assert h is not None
         # 首筆真成交 (非 isTrial) 有記到
         assert h.first_trade_seen is True
-        assert h.first_trade.get("lots") == 94            # 94000 股 → 94 張
+        assert h.first_trade.get("lots") == 94            # size 單位是張 (無 //1000)
 
 
 class TestOpenRace:

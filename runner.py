@@ -78,8 +78,6 @@ class Runner:
         # Progress tracking
         self._limit_up_progress: Dict[str, int] = {"done": 0, "total": 0, "ok": 0, "fail": 0}
         self._started_at: Optional[datetime] = None
-        # API runtime 調參 (例 first_trade_min_lots) — 蓋過 .env，重啟 runner 也保留
-        self._param_overrides: Dict[str, object] = {}
 
         # 執行 thread
         self._main_thread: Optional[threading.Thread] = None
@@ -150,11 +148,6 @@ class Runner:
     def is_running(self) -> bool:
         return self._main_thread is not None and self._main_thread.is_alive()
 
-    def set_param_override(self, key: str, value):
-        """API runtime 調參 — 立即生效 (cfg 是 trader 共用的同一物件)。"""
-        self._param_overrides[key] = value
-        if self.cfg is not None:
-            setattr(self.cfg, key, value)
         logger.info(f"[runner] param override: {key} = {value}")
 
     def get_status(self) -> dict:
@@ -187,10 +180,7 @@ class Runner:
             self.error_msg = str(e) or type(e).__name__
 
     def _run_all_phases(self):
-        # 讀 config + 套 API runtime overrides
         self.cfg = load_config()
-        for k, v in self._param_overrides.items():
-            setattr(self.cfg, k, v)
         self._trade_start_time = self._parse_time_hhmm(self.cfg.end_time) or dtime(9, 0)
 
         # 每日重置交易 state (新交易日 → 清前日 trades/委託表/預算 + armed=False;
@@ -463,10 +453,8 @@ class Runner:
         # (2026-08-27 8105/1312;成交與 book 同一 socket、成交先到 → 開盤後 book 進來時旗標已立)
         if self.state is not None:
             self.state.mark_opened(symbol)
-        # 搶市價單優先 (速度至上): 有些 API 給股數、有的給張數 — >=1000 視為股數換算
-        qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
-        lots = qty // 1000 if qty >= 1000 else qty
-        self.session.on_first_trade(symbol, lots >= self.cfg.first_trade_min_lots)
+        # 搶市價單優先 (速度至上): 開盤訊號一到 → 盲送送最後一筆後停 (不再判首筆量門檻)
+        self.session.on_first_trade(symbol)
         # (隔日賣不再由成交觸發 — 2026-08-16 改純 book 驅動,見 _monitor_on_book
         #  → session.update_overnight_book;今日活躍閘門在 session 端)
 
@@ -714,12 +702,15 @@ class Runner:
             # → 這裡補撤 (沒單的檔 cancel 自然 no-op)。sweep 之後才淘汰的,
             # 由淘汰自身的撤單路徑處理 (st 已存在) — 兩側無縫覆蓋。
             self._sweep_unmarked_pre_orders(marked)
-            # 9:00:00 起市價盲送搶進 (時間驅動,不等首筆成交 tick;首筆委託成功即停)
+            # 市價盲送搶進 (時間驅動,不等首筆成交 tick;首筆委託成功即停)。開始時點 08:59:59
+            # (早於 09:00 開盤暖機:cadence 先跑,集合競價期市價被拒→續送,一開盤第一筆最快排到)。
+            # ⚠ 注意這是「盲送開始」,非「首筆成交 gate」— 後者 (_monitor_on_trade) 仍守 _trade_start_time=09:00。
             try:
+                chase_start = self._parse_time_hhmm(self.cfg.market_chase_start) or dtime(8, 59, 59)
                 cutoff = self._parse_time_hhmm(self.cfg.market_chase_cutoff) or dtime(9, 3)
-                self.session.start_market_chase(marked, self._trade_start_time, cutoff)
+                self.session.start_market_chase(marked, chase_start, cutoff)
                 logger.info(f"[runner] 市價盲送已排程 — {len(marked)} 檔,"
-                            f"{self._trade_start_time}~{cutoff}")
+                            f"{chase_start}~{cutoff}")
             except Exception as e:
                 logger.exception(f"[runner] 啟動市價盲送失敗: {e}")
 

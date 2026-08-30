@@ -11,10 +11,10 @@ TradingSession),用假時鐘重現 篩選 → 08:59:58 預掛 → 09:00 盲送 �
     replay 照樣讓 filter 多活 swap-delay 秒 (0 = 立刻換手,舊行為)。
   - **集合競價拒市價**: ReplayBroker 對「送出當下該檔尚未開盤 (還沒收到首筆非試撮成交)」的
     市價單回拒單 (訊息同交易所),開盤後才接受。
-  - **市價追改 step-driven**: production 每檔一條 thread 送→拒→睡 0.1s→重送;replay 單執行緒,
-    把 worker 的 time.sleep 換成「讓出」,每一步由 tick 時間推進;每筆送單延遲取自 --orders
-    的真實 latency_ms (無則 --send-latency)。決定在**送出當下**,結果在 送出+延遲 才回到 worker
-    (重現 6226「集合競價期送出、回報回來時已開盤」)。
+  - **市價追改 step-driven** (2026-08-28 管線化後): production 是 cadence thread 不等回覆就送
+    (45/s 節拍) + sender thread 跑 _chase_send_one;replay 單執行緒逐步同步呼叫 _chase_send_one
+    (每 CHASE_SEND_INTERVAL 一筆),決定 accept/拒 依**送出當下**該檔是否已開盤。管線化下送單不等
+    回覆、回報晚到不擋下一筆,故 replay 不再模型化「回報延遲」。
   - **unmark → 撤單**: 仿 runner._unsub_and_cancel,unmark 同步呼叫 session.cancel_symbol_orders
     (原 replay 只記退訂、不撤單 → 看不到誤撤)。
   - **開盤後 trades**: 仿 runner._monitor_on_trade (08:59:58 掛上、09:00 起生效): 首筆非試撮成交
@@ -25,7 +25,7 @@ TradingSession),用假時鐘重現 篩選 → 08:59:58 預掛 → 09:00 盲送 �
   python scripts/replay_day.py --ticks replay_data/2026-08-21_ticks.jsonl \
       --limit-ups replay_data/2026-08-21_limit_ups.json --date 2026-08-21 \
       [--dispositions ...] [--limit-downs ...] [--fills ...] [--orders ...] \
-      [--swap-delay 1.0] [--send-latency 0.3] [--chase-cutoff 09:03:00] \
+      [--swap-delay 1.0] [--chase-cutoff 09:03:00] \
       [--total-budget 3700000] [--per-symbol 400000] [--report out.txt]
 
 出場區塊為「假設 marked 檔依 sized 張數成交」→ 驗出場**偵測邏輯**在真實五檔上的表現
@@ -55,7 +55,6 @@ from trading_session import TradingSession  # noqa: E402
 PRE_ORDER_TIME = dtime(8, 59, 58)
 OPEN_TIME = dtime(9, 0, 0)
 CALL_AUCTION_REJECT = "證券集合競價時段不可輸入市價、IOC、FOK委託"
-RETRY_SLEEP_SEC = 0.1     # production worker 非致命拒單後 sleep 0.1 再送
 
 
 # ─── 假時鐘: 讓 production 的 datetime.now() 回「當前 tick 的 ts」 ───
@@ -75,8 +74,7 @@ def _set_clock(dt):
     state_mod.datetime = FrozenDatetime    # mark/unmark 歷史 ts 用假時鐘 → 開盤後 unmark 判定才準
 
 
-class _ChaseYield(Exception):
-    """市價追 worker 要 sleep(0.1) 重試 → 讓出,由 tick 時間推進下一步。"""
+CHASE_SEND_INTERVAL = 0.05   # replay 模型的管線送單節奏 (production 是 45/s≈22ms;此處夠覆蓋開盤轉換)
 
 
 # ─── ReplayBroker: 仿 tests FakeBroker,只記錄,不打真 API ───
@@ -161,26 +159,6 @@ def _load_ground_truth_symbols(path):
     return syms
 
 
-def _load_market_latencies(path):
-    """從 orders CSV 抓每檔 BUY_MKT 的真實 latency (秒),依 ts_sent 排序 → {symbol: [sec, ...]}。"""
-    out = {}
-    if not path or not Path(path).exists():
-        return out
-    rows = []
-    with open(path, encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if (row.get("action") or "").strip() != "BUY_MKT":
-                continue
-            try:
-                rows.append((row.get("ts_sent") or "", (row.get("symbol") or "").strip(),
-                             float(row.get("latency_ms") or 0) / 1000.0))
-            except ValueError:
-                continue
-    for ts, sym, lat in sorted(rows):
-        out.setdefault(sym, []).append(lat)
-    return out
-
-
 def _accepts_kw(fn, name):
     try:
         return name in inspect.signature(fn).parameters
@@ -198,7 +176,6 @@ def _parse_hms(s, default):
 
 def run(args):
     swap_delay = float(getattr(args, "swap_delay", 1.0) or 0.0)
-    default_latency = float(getattr(args, "send_latency", 0.3) or 0.0)
     cutoff = _parse_hms(getattr(args, "chase_cutoff", "09:03:00"), dtime(9, 3, 0))
 
     # 假時鐘關掉出場等待窗口 (免真 3s)
@@ -209,7 +186,6 @@ def run(args):
     limit_downs = {str(k): float(v) for k, v in _load_json(args.limit_downs).items() if v}
     day_tradable = {str(k): bool(v) for k, v in _load_json(args.day_tradable).items()} \
         if args.day_tradable else {}
-    latencies = _load_market_latencies(getattr(args, "orders", ""))
 
     # ── 建 State + Session (ReplayBroker) ──
     state = State(bid_drop_ratio=args.bid_drop_ratio)
@@ -230,17 +206,18 @@ def run(args):
     # replay 決定性: 把非同步/背景 thread 路徑改成同步 (單執行緒重放,免 race + 免 rate-limiter 真時間節流)
     session.cancel_symbol_orders_async = session.cancel_symbol_orders
     session.exit_position = lambda symbol, reason: session._exit_worker(symbol, reason)
+    if hasattr(session, "_cancel_one_order_async"):
+        session._cancel_one_order_async = session._cancel_one_order   # 管線多送自撤 → 同步 (2026-08-28)
     if hasattr(session, "_rate"):
         session._rate.acquire = lambda: None
 
     ctx = {"phase": "filter", "trader": None, "last_bid_at_limit": {},
-           "pre_marked": [], "exits": [], "in_chase": False,
+           "pre_marked": [], "exits": [],
            "swap_delay": swap_delay, "chase": {}, "opened_at": {}, "last_trade": {}}
 
-    # worker 的 time.sleep → 讓出 (只在 chase step 內);其餘 sleep 不睡 (replay 不等真時間)
+    # replay 不等真時間: 所有 time.sleep 都 no-op (出場重試等)。市價追改逐步驅動 (見 chase_send)。
     def _sleep(sec):
-        if ctx["in_chase"]:
-            raise _ChaseYield()
+        return None
     time_proxy = SimpleNamespace(sleep=_sleep, time=_real_time.time,
                                  monotonic=_real_time.monotonic,
                                  perf_counter=_real_time.perf_counter)
@@ -248,8 +225,7 @@ def run(args):
     ts_mod.time = time_proxy
 
     filter_cfg = SimpleNamespace(pre_order_time="08:59:58", final_check_start="08:59:58")
-    trader_cfg = SimpleNamespace(first_trade_min_lots=args.first_trade_min_lots,
-                                 bid_decline_sample_sec=60, bid_decline_minutes=5)
+    trader_cfg = SimpleNamespace(bid_decline_sample_sec=60, bid_decline_minutes=5)
 
     unsubbed = []
 
@@ -265,11 +241,6 @@ def run(args):
     filter_takes_cont = _accepts_kw(filter_on_book, "is_continuous")
     mark_opened = getattr(state, "mark_opened", None)   # 舊碼沒有 → 不呼叫 (忠實重現舊行為)
 
-    def _lat(sym, i):
-        seq = latencies.get(sym) or []
-        if i < len(seq):
-            return seq[i]
-        return seq[-1] if seq else default_latency
 
     def do_pre_order():
         marked = state.get_marked_prioritized()
@@ -291,9 +262,8 @@ def run(args):
             st = session.trades.get(sym)
             if st is None or st.stopped_reason or not st.order_no:
                 continue
-            ctx["chase"][sym] = {"send_at": open_dt, "resolve_at": open_dt + timedelta(seconds=_lat(sym, 0)),
-                                 "i": 0, "sends": 0, "rejects": 0, "done": None,
-                                 "accepted_at": None, "last": "none"}
+            ctx["chase"][sym] = {"next_at": open_dt, "sends": 0, "rejects": 0,
+                                 "done": None, "accepted_at": None}
 
     def _fake_fill(sym):
         # 假設成交: 依 target 建部位 (label: if-filled 出場邏輯檢查) — 對 st.order_no 那張 (M 或留守的 P)
@@ -306,58 +276,55 @@ def run(args):
                               "filled_time": "09:00:00",
                               "quantity": (st.target_lots - st.filled_lots) * 1000})
 
-    def chase_step(sym, c, cur):
-        """一步 = worker 收到上一筆送單的結果 (在 resolve_at 時刻) → 走 production 邏輯到下一次
-        sleep(讓出) 或 return(結束)。決定 (接受/拒) 依**送出當下**該檔是否已開盤。"""
+    def chase_send(sym, c, cur):
+        """管線化 (2026-08-28): 逐步送**一筆**市價 (同步呼叫 _chase_send_one)。決定 accept/reject 依
+        送出當下 (next_at) 該檔是否已開盤。不模型化「回報延遲」——管線化下送單不等回覆、回報晚到不擋下一筆。
+        停送依 cadence 相同條件: chase_done / stopped / shortfall≤0 / 淘汰出場硬上限處置 / cutoff。"""
+        send_at = c["next_at"]
         oa = ctx["opened_at"].get(sym)
-        broker._decision[sym] = "accept" if (oa is not None and oa <= c["send_at"]) else "reject"
+        broker._decision[sym] = "accept" if (oa is not None and oa <= send_at) else "reject"
+        with session._lock:
+            st = session.trades.get(sym)
+            sf = 0 if st is None else st.target_lots - st.filled_lots
+            stop = (st is None or st.chase_done or st.stopped_reason or st.exited
+                    or session._budget_breached or st.is_disposition)
+            first_came = bool(st and st.first_trade_fired)   # 開盤訊號 (monitor_on_trade 設)
+        if stop or sf <= 0 or send_at.time() >= cutoff:
+            broker._decision.pop(sym, None)
+            c["done"] = ("chase_done" if (st is not None and st.chase_done)
+                         else f"stopped:{st.stopped_reason}" if (st is not None and st.stopped_reason)
+                         else "target_filled" if sf <= 0 else "cutoff")
+            _fake_fill(sym)
+            return
         n_placed, n_rej = len(broker.placed), len(broker.rejected)
-        _set_clock(c["resolve_at"])
-        ctx["in_chase"] = True
+        _set_clock(send_at)
         try:
-            session._market_chase_worker(sym, dtime(0, 0, 0), cutoff)
-            outcome = "done"
-        except _ChaseYield:
-            outcome = "yield"
+            outcome = session._chase_send_one(sym, sf)
         finally:
-            ctx["in_chase"] = False
             broker._decision.pop(sym, None)
             _set_clock(cur)
-        sent_accept = len(broker.placed) > n_placed
-        sent_reject = len(broker.rejected) > n_rej
-        if sent_accept or sent_reject:
+        if len(broker.placed) > n_placed:
             c["sends"] += 1
-            c["i"] += 1
-        if sent_reject:
+        if len(broker.rejected) > n_rej:
             c["rejects"] += 1
-            c["last"] = "rejected"
-        if sent_accept:
-            c["last"] = "accepted"
-            c["accepted_at"] = c["resolve_at"]
-        if outcome == "yield":
-            # 拒單回來 → sleep 0.1 → 再送;下一筆的結果在 送出+延遲 才回來
-            c["send_at"] = c["resolve_at"] + timedelta(seconds=RETRY_SLEEP_SEC)
-            c["resolve_at"] = c["send_at"] + timedelta(seconds=_lat(sym, c["i"]))
-            return
-        st = session.trades.get(sym)
-        if sent_accept:
+        if outcome == "accepted":
             c["done"] = "accepted"
-        elif st is not None and st.stopped_reason:
-            c["done"] = f"stopped:{st.stopped_reason}"
-        elif st is not None and st.filled_lots >= st.target_lots:
-            c["done"] = "target_filled"
-        elif c["resolve_at"].time() >= cutoff:
-            c["done"] = "cutoff"
-        elif sent_reject:
-            c["done"] = "stop_after_reject"     # 舊碼 rule B (第一盤成交來 → 停) 走這條
-        else:
-            c["done"] = "no_send"
-        _fake_fill(sym)
+            c["accepted_at"] = send_at
+            _fake_fill(sym)
+        elif outcome in ("fatal", "aborted"):
+            c["done"] = outcome
+        elif first_came:
+            # 開盤訊號已到 → 這筆即 final,送完就停 (production: cadence 收到 first_trade_fired
+            # → 送最後一筆 → return,不再噴;2026-08-28 使用者定案)
+            c["done"] = "final_after_open"
+            _fake_fill(sym)
+        else:                                   # blind-fire rejected / accepted_extra → 排下一筆
+            c["next_at"] = send_at + timedelta(seconds=CHASE_SEND_INTERVAL)
 
     def run_due_chase(cur):
         for sym, c in ctx["chase"].items():
-            while c["done"] is None and cur >= c["resolve_at"]:
-                chase_step(sym, c, cur)
+            while c["done"] is None and cur >= c["next_at"]:
+                chase_send(sym, c, cur)
 
     def monitor_on_trade(sym, data, dt):
         """仿 runner._monitor_on_trade (08:59:58 掛上,09:00 起生效)。"""
@@ -370,9 +337,7 @@ def run(args):
             return
         if mark_opened is not None:
             mark_opened(sym)
-        qty = int(_pick(data, "size", "qty") or 0)
-        lots = qty // 1000 if qty >= 1000 else qty
-        session.on_first_trade(sym, lots >= args.first_trade_min_lots)
+        session.on_first_trade(sym)
 
     def note_trade(sym, data, dt):
         """replay 內部: 記該檔開盤時刻 (首筆非試撮真成交 = isOpen) + 最後一筆 (換手種子化用)。"""
@@ -557,7 +522,7 @@ def _report(args, session, state, ctx, unsubbed, n_lines, n_books, n_trades):
     w(f"budget_used={session.budget_used:,.0f}  buy_cost_actual={session._buy_cost_actual:,.0f}"
       f"  breached={session._budget_breached}")
 
-    w(f"\n── 開盤競態 (swap-delay={ctx.get('swap_delay', 0):.1f}s;集合競價拒市價;送單延遲取自 orders.csv) ──")
+    w(f"\n── 開盤競態 (swap-delay={ctx.get('swap_delay', 0):.1f}s;集合競價拒市價;市價追管線化逐步送) ──")
     late = _unmarks_after_open(state, args.date)
     late_bbl = [x for x in late if x[1] == "bid_below_limit"]
     marked_set = set(marked)
@@ -624,12 +589,9 @@ def main():
     ap.add_argument("--per-symbol", type=float, default=400_000, dest="per_symbol")
     ap.add_argument("--sizing-mode", default="budget", dest="sizing_mode")
     ap.add_argument("--fixed-lots", type=int, default=0, dest="fixed_lots")
-    ap.add_argument("--first-trade-min-lots", type=int, default=10, dest="first_trade_min_lots")
     ap.add_argument("--bid-drop-ratio", type=float, default=0.5, dest="bid_drop_ratio")
     ap.add_argument("--swap-delay", type=float, default=1.0, dest="swap_delay",
                     help="09:00 後 filter handler 多活幾秒才換 trader (production ~1s;0=立刻)")
-    ap.add_argument("--send-latency", type=float, default=0.3, dest="send_latency",
-                    help="市價送單往返延遲 (秒);--orders 有該檔真實 latency 時優先用真實值")
     ap.add_argument("--chase-cutoff", default="09:03:00", dest="chase_cutoff")
     ap.add_argument("--report", default="")
     run(ap.parse_args())

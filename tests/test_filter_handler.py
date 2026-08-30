@@ -148,7 +148,7 @@ class TestOnTradeSetsOpenedLatch:
     def _trader(state, syms=("2330",)):
         from types import SimpleNamespace
         from trader import Trader
-        cfg = SimpleNamespace(first_trade_min_lots=10)
+        cfg = SimpleNamespace(bid_decline_sample_sec=60, bid_decline_minutes=5)
         return Trader(list(syms), {s: 100.0 for s in syms}, cfg, state=state)
 
     def test_real_trade_latches_opened(self):

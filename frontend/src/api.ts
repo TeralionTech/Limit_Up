@@ -26,9 +26,6 @@ export const api = {
     req<AvgVolInfo>('/api/avg-volume' + (symbol ? `?symbol=${encodeURIComponent(symbol)}` : '')),
   tick: (symbol: string) => req<TickSnapshot>(`/api/tick/${symbol}`),
   traderSummary: () => req<TraderSummary>('/api/trader/summary'),
-  getTraderParams: () => req<{ first_trade_min_lots: number }>('/api/trader/params'),
-  setTraderParams: (p: { first_trade_min_lots: number }) =>
-    req<{ ok: boolean }>('/api/trader/params', { method: 'POST', body: JSON.stringify(p) }),
   // ─── 交易 (模擬/真實) ───
   tradingStatus: () => req<TradingStatus>('/api/trading/status'),
   tradingConnect: (p: TradingConnectReq) =>
@@ -179,7 +176,6 @@ export interface TraderSummary {
   n_tracking?: number
   n_pulled?: number        // 已出場 (支撐隊伍消失) 檔數
   n_first_failed?: number
-  min_lots?: number
   trading?: TradingStatus | null
   first_stage?: FirstStageRow[]
   tracking?: TrackingRow[]

@@ -4,9 +4,8 @@
 
   第一盤檢查 (block 1) — 每檔 watchlist 股票收「開盤第一筆」:
     - 首筆 books: 委賣一出現單子 → unmark 丟棄 (+ 退訂 + 撤委託)
-    - 首筆 trades: 成交量 < first_trade_min_lots 張 (前端可調) → unmark 丟棄 (+ 退訂 + 撤委託)
-    - 兩者都通過 → 進入盤中追蹤 (status=tracking)
-      [real] 首筆成交到達時: 預掛單未(全)成交 → 撤剩餘留已成交;通過檢查 → 市價單追差額
+    - 首筆 trades: 立開盤訊號旗標 → 進入盤中追蹤 (2026-08-29 移除首筆量門檻)
+      [real] 首筆成交到達時: 預掛單未(全)成交 → 撤剩餘留已成交;盲送市價單追差額
 
   盤中追蹤 (block 2) — 通過第一盤的標的:
     - 顯示 委買一價 / 委買一量
@@ -78,7 +77,7 @@ class Trader:
         """
         watchlist: List[str] — filter 結束時的 marked 名單
         limit_ups: Dict[str, float] — 每檔漲停價
-        cfg: config.Config (first_trade_min_lots 可被 API 在 runtime 改)
+        cfg: config.Config
         state: state.State — 第一盤淘汰要同步 unmark (可 None)
         unsub_fn: callable(symbol) — 第一盤淘汰要退訂 (可 None)
         session: trading_session.TradingSession — real+armed 時同步掛真單 (可 None = 純監控)
@@ -95,8 +94,7 @@ class Trader:
         self.session = session
         self._stop = threading.Event()
         live = bool(session and session.is_live())
-        logger.info(f"[trader] 建立 — {'真實交易' if live else '純監控'} {len(self.holdings)} 檔 "
-                    f"(第一盤最小成交 {cfg.first_trade_min_lots} 張)")
+        logger.info(f"[trader] 建立 — {'真實交易' if live else '純監控'} {len(self.holdings)} 檔")
 
     # ─── 對外 API ──────────────────────────────────────────
 
@@ -240,24 +238,20 @@ class Trader:
         # === 第一盤: 開盤第一筆成交 ===
         if not h.first_trade_seen:
             h.first_trade_seen = True
-            # 有些 API 給股數、有的給張數 — >= 1000 視為股數換算
-            lots = qty // 1000 if qty >= 1000 else qty
+            # size 單位是張 (2026-08-29 實證: 整股成交量非 1000 倍數 → 非股數)。純顯示/log 用。
+            lots = qty
             h.first_trade = {
                 "price": price, "qty": qty, "lots": lots,
                 "ts": datetime.now().isoformat(timespec="seconds"),
             }
             if h.status == Holding.DISCARDED_FIRST:
-                return   # books 那邊已淘汰，只補記錄 (委託已在 _fail_first 撤)
-            # 檢查: 成交量 < 最小張數 (cfg 值 API 可 runtime 調) → 淘汰
-            if lots < self.cfg.first_trade_min_lots:
-                self._fail_first(h, f"first_trade_qty_too_small "
-                                    f"({lots} 張 < {self.cfg.first_trade_min_lots})")
-                return
+                return   # books 那邊已淘汰 (五檔賣單出現),只補記錄 (委託已在 _fail_first 撤)
+            # 首筆量門檻判斷已移除 (2026-08-29) — 首筆成交到就進追蹤 + 送最後一筆市價
             self._maybe_enter_tracking(h)
-            # [real] 首筆成交資訊到達且通過檢查: 預掛單未(全)成交 → 撤剩餘、
-            # 留已成交,再市價單追差額 (session 內背景 thread 處理)
+            # [real] 首筆成交到達: 預掛單未(全)成交 → 撤剩餘、留已成交,再市價單追差額
+            # (session 盲送 thread 讀 first_trade_fired 送最後一筆後停)
             if self.session is not None:
-                self.session.on_first_trade(symbol, passed_first_check=True)
+                self.session.on_first_trade(symbol)
 
     # ─── 狀態轉換 ──────────────────────────────────────────
 
@@ -350,7 +344,6 @@ class Trader:
             "n_tracking": n_track,
             "n_pulled": n_pulled,
             "n_first_failed": n_failed,
-            "min_lots": self.cfg.first_trade_min_lots,
             "trading": self.session.status() if self.session else None,
             "first_stage": sorted(first_stage, key=lambda x: x["symbol"]),
             "tracking": sorted(tracking, key=lambda x: x["symbol"]),
