@@ -90,6 +90,7 @@ class SymbolTrade:
         self.order_status: str = ""    # "" / pending / cancelled / rejected / done
         self.filled_lots = 0
         self.avg_price = 0.0
+        self.buy_cost_actual = 0.0     # 該檔實際買進現金累計 (單調;賣出不減) — 花費表/超額用
         self.stopped_reason: str = ""  # 非空 = 此檔不再進場
         self.exited = False            # 已出場 (委賣出現)
         self.last_buy_cancel_ts = 0.0  # 最近撤掉 live 買單的時刻 (time.time()) — 出場據此判斷
@@ -1561,6 +1562,7 @@ class TradingSession:
                 # 總曝險硬上限: 實際買進現金累計 (每筆都加、不 floor → 超買 race 也真實反映)。
                 # 超過 total_budget → 一次性 breach:出鎖後停盲送 + 撤所有 pending 買單。
                 self._buy_cost_actual += lots * fill["price"] * 1000
+                st.buy_cost_actual += lots * fill["price"] * 1000    # 該檔實際買進累計 (花費表用)
                 if (not self._budget_breached and self.total_budget > 0
                         and self._buy_cost_actual > self.total_budget):
                     self._budget_breached = True
@@ -1653,6 +1655,38 @@ class TradingSession:
         with self._lock:
             st = self.trades.get(symbol)
             return st.to_dict() if st else None
+
+    def spending_summary(self) -> dict:
+        """花費表 (前端顯示;只看實際成交)。各檔實際花費 + 超額;總實際花費 + 總預算超額。
+        - 各檔花費 = 該檔實際買進現金累計 (buy_cost_actual,單調不因賣出減)
+        - 各檔超額 = max(0, 花費 − 目標金額);目標金額 = target_lots × 漲停價 × 1000 (沒超過=0)
+        - 總實際花費 = _buy_cost_actual (硬上限同源);總超額 = max(0, 總花費 − total_budget)"""
+        with self._lock:
+            rows = []
+            for sym, st in self.trades.items():
+                if st.target_lots <= 0 and st.buy_cost_actual <= 0:
+                    continue
+                intended = st.target_lots * st.limit_up * 1000
+                over = max(0.0, st.buy_cost_actual - intended)
+                rows.append({
+                    "symbol": sym,
+                    "filled_lots": st.filled_lots,
+                    "target_lots": st.target_lots,
+                    "avg_price": round(st.avg_price, 2),
+                    "spent": round(st.buy_cost_actual, 0),
+                    "intended": round(intended, 0),
+                    "over": round(over, 0),
+                })
+            rows.sort(key=lambda r: (-r["over"], -r["spent"]))   # 超額大的、花最多的排前面
+            total_over = (max(0.0, self._buy_cost_actual - self.total_budget)
+                          if self.total_budget > 0 else 0.0)
+            return {
+                "total_budget": round(self.total_budget, 0),
+                "total_spent": round(self._buy_cost_actual, 0),
+                "total_over": round(total_over, 0),
+                "budget_breached": self._budget_breached,
+                "symbols": rows,
+            }
 
     def status(self) -> dict:
         with self._lock:

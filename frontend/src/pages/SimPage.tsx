@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useRef, useState } from 'react'
-import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade, OrderRow } from '../api'
+import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade, OrderRow, SpendingSummary } from '../api'
 
 export default function SimPage() {
   const [sum, setSum] = useState<TraderSummary | null>(null)
@@ -38,6 +38,9 @@ export default function SimPage() {
     <div className="space-y-4">
       {/* 交易模式 (模擬/真實) — 連線/預算/開始交易 */}
       <TradingPanel />
+
+      {/* 花費表 (只看實際成交) — 各檔花費/超額 + 總預算超額 */}
+      <SpendingTable />
 
       {!sum || !sum.trader_active ? (
         <div className="bg-white rounded-lg shadow p-8 text-center text-gray-500">
@@ -641,6 +644,73 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <label className="block text-xs text-gray-600 mb-1">{label}</label>
       {children}
     </div>
+  )
+}
+
+
+function SpendingTable() {
+  const [sp, setSp] = useState<SpendingSummary | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const s = await api.tradingSpending()
+        if (!cancelled) setSp(s)
+      } catch { /* ignore — sim 模式 / 未連線時端點可能不可用 */ }
+    }
+    tick()
+    const id = window.setInterval(tick, 2000)
+    return () => { cancelled = true; window.clearInterval(id) }
+  }, [])
+
+  // 沒有任何花費也沒有標的 → 不顯示 (sim/未進場)
+  if (!sp || (sp.total_spent <= 0 && sp.symbols.length === 0)) return null
+  const fmt = (n: number) => Math.round(n).toLocaleString()
+
+  return (
+    <section className="bg-white rounded-lg shadow p-4">
+      <h2 className="font-semibold mb-3">
+        💰 花費表 <span className="font-normal text-xs text-gray-400">(只看實際成交)</span>
+      </h2>
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 mb-3 text-sm">
+        <span>總花費 <b className="font-mono">{fmt(sp.total_spent)}</b>
+          <span className="text-gray-400"> / 預算 </span><span className="font-mono">{fmt(sp.total_budget)}</span></span>
+        <span>總超額 <b className={`font-mono ${sp.total_over > 0 ? 'text-red-600' : 'text-gray-500'}`}>
+          {fmt(sp.total_over)}</b></span>
+        {sp.budget_breached &&
+          <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs">⚠ 已觸總曝險硬上限</span>}
+      </div>
+      {sp.symbols.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-gray-500 border-b bg-gray-50">
+              <tr>
+                <th className="text-left py-2 px-2">標的</th>
+                <th className="text-right py-2 px-2">成交/目標 (張)</th>
+                <th className="text-right py-2 px-2">均價</th>
+                <th className="text-right py-2 px-2">花費</th>
+                <th className="text-right py-2 px-2" title="花費 − 目標金額 (target×漲停×1000);沒超過=0">超額</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sp.symbols.map(r => (
+                <tr key={r.symbol} className={`border-b ${r.over > 0 ? 'bg-red-50' : ''}`}>
+                  <td className="py-1.5 px-2 font-mono font-semibold">{r.symbol}</td>
+                  <td className="py-1.5 px-2 text-right font-mono">{r.filled_lots}/{r.target_lots}</td>
+                  <td className="py-1.5 px-2 text-right font-mono">
+                    {r.avg_price > 0 ? r.avg_price.toFixed(2) : '—'}</td>
+                  <td className="py-1.5 px-2 text-right font-mono">{fmt(r.spent)}</td>
+                  <td className={`py-1.5 px-2 text-right font-mono ${
+                    r.over > 0 ? 'text-red-600 font-bold' : 'text-gray-400'}`}>{fmt(r.over)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="text-gray-400 text-sm py-2">尚無成交</div>
+      )}
+    </section>
   )
 }
 

@@ -55,6 +55,7 @@ export const api = {
       method: 'POST', body: JSON.stringify({ symbol }),
     }),
   tradingOrders: () => req<{ orders: OrderRow[] }>('/api/trading/orders'),
+  tradingSpending: () => req<SpendingSummary>('/api/trading/spending'),
   tradingCancelOrder: (order_no: string) =>
     req<{ ok: boolean }>('/api/trading/cancel_order', {
       method: 'POST', body: JSON.stringify({ order_no }),
@@ -267,6 +268,24 @@ export interface OrderRow {
   status: 'pending' | 'filled' | 'cancelled' | 'rejected'
   filled_lots: number
   ts: string
+}
+
+// 花費表 (只看實際成交)
+export interface SpendRow {
+  symbol: string
+  filled_lots: number
+  target_lots: number
+  avg_price: number
+  spent: number            // 該檔實際買進現金 (單調)
+  intended: number         // 目標金額 = target × 漲停 × 1000
+  over: number             // max(0, spent − intended)
+}
+export interface SpendingSummary {
+  total_budget: number
+  total_spent: number      // = _buy_cost_actual
+  total_over: number       // max(0, total_spent − total_budget)
+  budget_breached: boolean
+  symbols: SpendRow[]
 }
 
 // 帳務台帳 row (每日手動輸入,後端已算好累積)

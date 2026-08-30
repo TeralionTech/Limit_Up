@@ -315,6 +315,12 @@ def trading_status():
     return Runner.get().session.status()
 
 
+@router.get("/trading/spending")
+def trading_spending():
+    """花費表 (只看實際成交): 各檔花費/超額 + 總花費/總預算超額。"""
+    return Runner.get().session.spending_summary()
+
+
 @router.post("/trading/disconnect")
 def trading_disconnect():
     Runner.get().session.disconnect()
