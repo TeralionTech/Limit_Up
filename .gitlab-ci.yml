@@ -1,19 +1,23 @@
-# GitLab CI/CD — hit_limit_up
+# GitLab CI/CD — hit_limit_up (多主機)
 #
-# CI (自動): 每次 push / Merge Request 跑 pytest + 前端 tsc/build。
-# CD (手動): main 分支上出現手動按鈕 — **刻意不自動部署**,因為這是真金交易系統,
-#            不能在盤中被 merge 觸發自動重啟。
-#   ▶ deploy         : VPS 拉碼 + 重啟 + 傳前端 dist + 同步/排程 avgvol 夜間 timer
-#   ▶ avgvol-run-now : 立刻觸發一次「月均量全量計算」(不等 18:00;背景跑 ~35 分)
+# CI (自動): 每次 push / MR → pytest + 前端 tsc/build。
+# CD (手動): main 分支上出現手動按鈕 — **刻意不自動部署**,真金交易系統不能被 merge 觸發盤中重啟。
+#   ▶ bootstrap      : 首次安裝到 DEPLOY_HOSTS 每一台 (需先人工上傳 secrets,見下)
+#   ▶ deploy         : 更新 DEPLOY_HOSTS 每一台 (傳碼 + 傳 dist + 重啟 + 同步夜間 timer)
+#   ▶ avgvol-run-now : 立刻觸發一次月均量計算 (逐台;見帳號衝突警告)
 #
-# Runner: 所有 job 都在「已註冊的 Runner」上執行 (GitLab 網站本身不跑指令)。
-#         deploy/avgvol 用 group/project runner (docker executor) 再 ssh 進 VPS。
-# 需要的前置 (GitLab 設定):
-#   1. 可用的 docker-executor Runner (Settings → CI/CD → Runners)。
-#   2. CI/CD 變數 (Settings → CI/CD → Variables,Protected + Masked):
-#        VPS_SSH_KEY = 能登入 root@45.76.222.150 的私鑰 (File 型別最方便)。
-#      且 VPS 的 git remote 要能取到本 GitLab 的 main。
-#   ⚠ avgvol 計算會用富邦帳號登入 — 手動 avgvol-run-now 請挑主服務閒置時段按,免登入衝突。
+# ── GitLab 設定 (Settings → CI/CD → Variables) ──
+#   DEPLOY_SSH_KEY  (File, Protected)  : 私鑰,公鑰已授權在**每一台** DEPLOY_HOSTS 的 root@ (或 deploy user)
+#   DEPLOY_HOSTS    (Var,  Protected)  : 空白分隔 user@host,例 "root@10.0.0.1 root@10.0.0.2 root@10.0.0.3"
+#
+# ── 每台主機「首次」人工前置 (secrets 不進 git/CI) ──
+#   1. mkdir -p /opt/hit_limit_up/{secrets,certs,wheels} ; timedatectl set-timezone Asia/Taipei
+#   2. scp 上傳: secrets/.env (PFX 路徑改成 /opt/hit_limit_up/certs/*.pfx) + certs/*.pfx
+#      + wheels/fubon_neo*manylinux*.whl
+#   → 之後按 bootstrap 完成安裝;日後改版按 deploy。
+#
+# ⚠ 富邦帳號: 同一帳號**不能多台同時登入** (08:00 主服務 / 17:30 avgvol 都會撞)。
+#   多台都要實際跑交易 → 各用**不同帳號**;否則多台僅能作備援 (同時只一台 active)。
 
 stages: [test, build, deploy]
 
@@ -34,7 +38,7 @@ test:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH'
 
-# ── CI: 前端型別檢查 + build ─────────────────────────────────
+# ── CI: 前端型別檢查 + build (產 dist artifact 給 deploy) ─────
 frontend-build:
   stage: build
   image: node:20-slim
@@ -53,48 +57,89 @@ frontend-build:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH'
 
-# ── 共用: SSH 進 VPS 的前置 (Runner 上跑,連到 45.76.222.150) ──
-.vps_ssh:
+# ── 共用: Runner 上 SSH/rsync 前置 (連 DEPLOY_HOSTS 每一台) ──
+.remote:
   image: alpine:latest
   before_script:
-    - apk add --no-cache openssh-client
+    - apk add --no-cache openssh-client rsync
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - cp "$VPS_SSH_KEY" ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
-    - ssh-keyscan -H 45.76.222.150 >> ~/.ssh/known_hosts 2>/dev/null
+    - cp "$DEPLOY_SSH_KEY" ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+    - for h in $DEPLOY_HOSTS; do ssh-keyscan -H "${h#*@}" >> ~/.ssh/known_hosts 2>/dev/null || true; done
+    - echo "$CI_COMMIT_SHORT_SHA" > .deployed_commit
   variables:
-    VPS: root@45.76.222.150
-    SSH: ssh -i ~/.ssh/id_deploy
+    # --delete 清 stale;排除主機端獨有 (output 每日資料/隔日賣、.env symlink、venv 在 repo 外不受影響)
+    RSYNC_EXCL: "--exclude=.git --exclude=output --exclude=.env --exclude=.cache --exclude=frontend/dist --exclude=frontend/node_modules"
 
-# ── CD: 手動部署到 VPS (只在 main;按鈕觸發,非自動) ──────────
-# 部署 = VPS 拉最新 main + 重啟 + 傳前端 dist + 同步/排程 avgvol 夜間 timer。
-# 真金系統務必人工挑非交易時段按。
-deploy:
+# ── CD: 首次安裝到每一台 (手動;main) ───────────────────────
+bootstrap:
   stage: deploy
-  extends: .vps_ssh
-  needs: [test, frontend-build]        # 測試+build 綠才可部署;帶 build 的 dist artifact
+  extends: .remote
+  needs: [test, frontend-build]
   script:
-    # 後端: VPS 端拉碼 + 重啟 (VPS 的 origin 要能取到最新 main)
-    - $SSH $VPS "cd /opt/hit_limit_up/repo && git fetch origin main && git reset --hard origin/main && systemctl restart hit-limit-up"
-    # avgvol 夜間 timer: 同步 unit 檔 + 排程 (--now 啟動 timer 排 18:00,不會立刻跑計算)
-    - $SSH $VPS "cp /opt/hit_limit_up/repo/deploy/hit-limit-up-avgvol.service /etc/systemd/system/ && cp /opt/hit_limit_up/repo/deploy/hit-limit-up-avgvol.timer /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now hit-limit-up-avgvol.timer && systemctl list-timers hit-limit-up-avgvol.timer --no-pager"
-    # 前端: 傳 frontend-build 產出的 dist
-    - $SSH $VPS "rm -rf /opt/hit_limit_up/repo/frontend/dist"
-    - scp -i ~/.ssh/id_deploy -r frontend/dist $VPS:/opt/hit_limit_up/repo/frontend/
-    - $SSH $VPS "cd /opt/hit_limit_up/repo && git log --oneline -1 && systemctl is-active hit-limit-up"
+    - if [ -z "$DEPLOY_HOSTS" ]; then echo "✗ DEPLOY_HOSTS 未設 (Settings→CI/CD→Variables)"; exit 1; fi
+    - |
+      SSHK="ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes"
+      rc=0
+      for H in $DEPLOY_HOSTS; do
+        echo "════════════ bootstrap → $H ════════════"
+        if $SSHK "$H" "mkdir -p /opt/hit_limit_up/repo/frontend" \
+           && rsync -az --delete $RSYNC_EXCL -e "$SSHK" ./ "$H:/opt/hit_limit_up/repo/" \
+           && rsync -az --delete -e "$SSHK" frontend/dist/ "$H:/opt/hit_limit_up/repo/frontend/dist/" \
+           && $SSHK "$H" "bash /opt/hit_limit_up/repo/deploy/ci_bootstrap_remote.sh"; then
+          echo "✓ $H bootstrap OK"
+        else
+          echo "✗ $H bootstrap 失敗 (常見: secrets 還沒人工上傳,見檔頭前置)"; rc=1
+        fi
+      done
+      exit $rc
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: manual
   environment:
     name: production
 
-# ── CD: 手動觸發一次「月均量全量計算」(不等 18:00 timer) ──────
-# --no-block: 服務在 VPS 背景跑 ~35 分,CI job 幾秒就結束。
+# ── CD: 更新部署到每一台 (手動;main) ───────────────────────
+# 真金系統:務必人工挑**非交易時段** (13:30 後 ~ 隔日 08:00 前) 按。
+deploy:
+  stage: deploy
+  extends: .remote
+  needs: [test, frontend-build]
+  script:
+    - if [ -z "$DEPLOY_HOSTS" ]; then echo "✗ DEPLOY_HOSTS 未設"; exit 1; fi
+    - |
+      SSHK="ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes"
+      rc=0
+      for H in $DEPLOY_HOSTS; do
+        echo "════════════ deploy → $H ════════════"
+        if rsync -az --delete $RSYNC_EXCL -e "$SSHK" ./ "$H:/opt/hit_limit_up/repo/" \
+           && rsync -az --delete -e "$SSHK" frontend/dist/ "$H:/opt/hit_limit_up/repo/frontend/dist/" \
+           && $SSHK "$H" "bash /opt/hit_limit_up/repo/deploy/ci_deploy_remote.sh"; then
+          echo "✓ $H"
+        else
+          echo "✗ $H 失敗"; rc=1
+        fi
+      done
+      [ $rc -eq 0 ] && echo "══ 全部主機部署成功 ══" || echo "══ 有主機失敗 (見上;修好可單獨重跑本 job) ══"
+      exit $rc
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  environment:
+    name: production
+
+# ── CD: 逐台觸發一次月均量計算 (手動) ───────────────────────
+# ⚠ 同一富邦帳號多台會登入衝突 (compute 各跑 ~35min 會重疊)。同帳號請一次只對一台跑,或各台不同帳號。
 avgvol-run-now:
   stage: deploy
-  extends: .vps_ssh
+  extends: .remote
   script:
-    - $SSH $VPS "systemctl start --no-block hit-limit-up-avgvol.service"
-    - $SSH $VPS "sleep 3; systemctl is-active hit-limit-up-avgvol.service || true; journalctl -u hit-limit-up-avgvol.service -n 15 --no-pager"
+    - if [ -z "$DEPLOY_HOSTS" ]; then echo "✗ DEPLOY_HOSTS 未設"; exit 1; fi
+    - |
+      SSHK="ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes"
+      for H in $DEPLOY_HOSTS; do
+        echo "════ avgvol run-now → $H ════"
+        $SSHK "$H" "systemctl start --no-block hit-limit-up-avgvol.service; sleep 2; systemctl is-active hit-limit-up-avgvol.service || true; journalctl -u hit-limit-up-avgvol.service -n 8 --no-pager"
+      done
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: manual
