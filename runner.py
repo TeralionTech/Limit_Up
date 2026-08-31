@@ -61,6 +61,7 @@ class Runner:
         self.limit_ups: Dict[str, float] = {}
         self.limit_downs: Dict[str, float] = {}   # symbol → 跌停價 (出場限價賣用,2026-08-12)
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
+        self._marked_frozen: bool = False   # hub 模式 08:59:50 凍結 marked 後 = True (marked-snapshot final 旗標)
         self.day_tradable: Dict[str, bool] = {}   # symbol → canDayTrade (禁現沖減半用,風控①)
         self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
         self._avgvol: dict = {}          # 月均量篩選結果 (今天 ran/dropped/kept/meta) — /api/avg-volume 顯示用
@@ -148,7 +149,25 @@ class Runner:
     def is_running(self) -> bool:
         return self._main_thread is not None and self._main_thread.is_alive()
 
-        logger.info(f"[runner] param override: {key} = {value}")
+    def marked_snapshot(self) -> dict:
+        """中心過濾 Hub → 交易節點的 marked 快照 (見架構 plan)。node 靠它預掛+訂閱,不自己 filter。
+        每檔帶: 漲停價 / 處置旗標 / 開盤即鎖 / 優先序。final=True = hub 已於 08:59:50 凍結。"""
+        role = self.cfg.role if self.cfg else "standalone"
+        now = datetime.now().isoformat(timespec="seconds")
+        if not self.state:
+            return {"ts": now, "final": False, "role": role, "symbols": []}
+        marked = self.state.get_marked_prioritized()          # 已排序: 開盤即鎖優先
+        first_tick = self.state.first_tick_limit_up
+        symbols = [{
+            "symbol": s,
+            "limit_up": float(self.limit_ups.get(s, 0.0)),
+            "is_disposition": bool(self.dispositions.get(s, False)),
+            "first_tick": s in first_tick,
+            "priority": i,
+            # mark 以來最大委買量 (峰值) — node 08:59:58 用「自己當前 < 此 × ratio」判量減半 (見架構 plan)
+            "max_bid_vol": self.state.get_max_bid_size(s),
+        } for i, s in enumerate(marked)]
+        return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols}
 
     def get_status(self) -> dict:
         """給 API /api/status 用的整體狀態 snapshot."""

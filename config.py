@@ -63,6 +63,10 @@ class Config:
     market_chase_start: str = "08:59:59"    # 市價盲送開始時點 (提早於 09:00 開盤暖機:此刻起 cadence
                                             #   已在跑,集合競價期市價會被拒→續送,一開盤第一筆最快排到)
     market_chase_cutoff: str = "09:03:00"   # 9:00 盲送市價單的時間兜底 (超過即停,靠預掛守)
+    # ─── 中心過濾 Hub / 分散交易節點 (2026-08-31) ───
+    role: str = "standalone"   # standalone=現行單機自己 filter+trade / hub=只 filter+分發 marked /
+                               #   node=只拉 marked+交易 (不 filter)。預設 standalone,不破壞現有部署。
+    hub_url: str = ""          # node 用: 去哪拉 marked 快照 (例 http://10.0.0.9:8100);空=不拉
 
 
 def load_config() -> Config:
@@ -137,4 +141,6 @@ def load_config() -> Config:
         avg_volume_min_lots=float(os.environ.get("AVG_VOLUME_MIN_LOTS", "500")),
         market_chase_start=os.environ.get("MARKET_CHASE_START", "08:59:59").strip(),
         market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:03:00").strip(),
+        role=os.environ.get("ROLE", "standalone").strip().lower(),
+        hub_url=os.environ.get("HUB_URL", "").strip(),
     )

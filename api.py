@@ -79,6 +79,12 @@ def get_watchlist():
     }
 
 
+@router.get("/marked-snapshot")
+def marked_snapshot():
+    """交易節點 (ROLE=node) 08:59:50 來拉的 marked 快照 (見中心過濾架構)。"""
+    return Runner.get().marked_snapshot()
+
+
 class FilterRemoveReq(BaseModel):
     symbol: str
 

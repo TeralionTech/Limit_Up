@@ -233,6 +233,12 @@ class State:
             rest = sorted(self.marked - self.first_tick_limit_up)
             return first + rest
 
+    def get_max_bid_size(self, symbol: str) -> int:
+        """該檔 mark 以來最大委買一量 (峰值) — Hub marked 快照帶給 node 判量減半用
+        (node 08:59:50 才開訂,看不到 8:30–9:00 峰值,故須由 Hub 提供)。"""
+        with self._lock:
+            return self._max_bid_size.get(symbol, 0)
+
     def is_first_tick(self, symbol: str) -> bool:
         """該股是否「開盤即鎖」(第一筆真實報價就漲停) — trader/SimPage 徽章用."""
         with self._lock:
