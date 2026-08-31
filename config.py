@@ -67,6 +67,7 @@ class Config:
     role: str = "standalone"   # standalone=現行單機自己 filter+trade / hub=只 filter+分發 marked /
                                #   node=只拉 marked+交易 (不 filter)。預設 standalone,不破壞現有部署。
     hub_url: str = ""          # node 用: 去哪拉 marked 快照 (例 http://10.0.0.9:8100);空=不拉
+    hub_freeze_time: str = "08:59:50"   # hub 於此時點凍結 marked (final=true,通知 node 來拉)
 
 
 def load_config() -> Config:
@@ -143,4 +144,5 @@ def load_config() -> Config:
         market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:03:00").strip(),
         role=os.environ.get("ROLE", "standalone").strip().lower(),
         hub_url=os.environ.get("HUB_URL", "").strip(),
+        hub_freeze_time=os.environ.get("HUB_FREEZE_TIME", "08:59:50").strip(),
     )

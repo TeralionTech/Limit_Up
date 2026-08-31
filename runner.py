@@ -169,6 +169,107 @@ class Runner:
         } for i, s in enumerate(marked)]
         return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols}
 
+    def _wait_until_clock(self, time_str: str):
+        """精準等到今天的 HH:MM:SS (已過則立即返回);stop_event 可中斷。"""
+        try:
+            hh, mm, ss = map(int, time_str.split(":"))
+        except Exception:
+            logger.warning(f"[runner] 時點格式錯 ({time_str!r}) — 不等待")
+            return
+        stop_event = self._stop_event
+        while not stop_event.is_set():
+            now = datetime.now()
+            remaining = (now.replace(hour=hh, minute=mm, second=ss, microsecond=0) - now).total_seconds()
+            if remaining <= 0:
+                return
+            stop_event.wait(0.05 if remaining < 1 else remaining - 0.5)
+
+    def _start_freeze_timer(self):
+        """hub 模式: 等到 HUB_FREEZE_TIME (08:59:50) → _marked_frozen=True
+        (marked-snapshot final=true,通知各 node 來拉)。背景 thread。"""
+        def _timer():
+            self._wait_until_clock(self.cfg.hub_freeze_time)
+            if self._stop_event.is_set():
+                return
+            n = len(self.state.get_marked_list()) if self.state else 0
+            self._marked_frozen = True
+            logger.warning(f"[runner] ⏸ {self.cfg.hub_freeze_time} 凍結 marked ({n} 檔) "
+                           f"→ final=true,node 可拉")
+        t = threading.Thread(target=_timer, name="hub-freeze-timer", daemon=True)
+        t.start()
+        self._timer_threads.append(t)
+
+    def _run_node_phases(self):
+        """ROLE=node: 略過 universe/limit_ups/filter;等到 HUB_FREEZE_TIME 向 Hub 拉 marked 快照 →
+        seed state (含 Hub 峰值) → 只訂 marked (1 socket) → 08:59:58 預掛 (量減半 final_check_all 不變:
+        seed 的 Hub 峰值 + node book handler 08:59:50–58 續墊高) → 09:00 狂送/首盤/出場 (共用 _trade_phase)。"""
+        from state import State
+        from recorder import TickRecorder
+        from subscriber import Subscriber
+        from filter import make_node_book_handler, wait_until_end_time
+        from node_client import pull_marked_snapshot
+
+        self.phase = Phase.SUBSCRIBE
+        self.state = State(bid_drop_ratio=self.cfg.bid_drop_ratio)
+        output_dir = Path(__file__).parent / "output"
+        output_dir.mkdir(exist_ok=True)
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.recorder = TickRecorder(output_dir / f"{today}_ticks.jsonl")
+
+        # 等到 Hub 凍結時點才拉 (免 08:00–08:59:50 空輪詢);死線 = 預掛前 1 秒 (08:59:57)
+        self._wait_until_clock(self.cfg.hub_freeze_time)
+        pre_t = self._parse_time_hhmm(self.cfg.pre_order_time) or dtime(8, 59, 58)
+        now = datetime.now()
+        deadline_ts = now.replace(hour=pre_t.hour, minute=pre_t.minute,
+                                  second=pre_t.second, microsecond=0).timestamp() - 1.0
+
+        snap = None
+        if self.cfg.hub_url:
+            snap = pull_marked_snapshot(self.cfg.hub_url, deadline_ts)
+        else:
+            logger.error("[node] ROLE=node 但 HUB_URL 未設 → 今日不交易")
+
+        marked = []
+        if snap and snap.get("symbols"):
+            for s in snap["symbols"]:
+                sym = s["symbol"]
+                lu = float(s.get("limit_up") or 0.0)
+                self.limit_ups[sym] = lu
+                self.dispositions[sym] = bool(s.get("is_disposition"))
+                # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
+                self.state.mark(sym, lu, int(s.get("max_bid_vol") or 0), lu,
+                                first_tick=bool(s.get("first_tick")))
+            marked = self.state.get_marked_prioritized()
+            logger.info(f"[node] 由 Hub 快照建 marked {len(marked)} 檔 (hub ts={snap.get('ts')})")
+        else:
+            logger.warning("[node] 無 marked 快照 → 今日不交易 (仍常駐收 tick 供查詢)")
+
+        self.session.set_dispositions(self.dispositions)
+
+        # 只訂 marked (1 socket);node book handler 只更新漲停委買峰值/當前,不 mark/unmark
+        on_book = make_node_book_handler(self.state, self.limit_ups)
+        self.subscriber = Subscriber(
+            sdk=self.sdk, universe=list(marked), on_book=on_book, login_cfg=self.cfg,
+            recorder=self.recorder, batch_size=self.cfg.batch_size,
+            batch_rotate_sec=self.cfg.batch_rotate_sec,
+            socket_count=self.cfg.socket_count, debug=self.cfg.debug,
+        )
+        self.subscriber.start()
+        if marked:
+            self.subscriber.subscribe_trades_for(marked)
+        # 首筆成交 → 開盤訊號 (mark_opened + on_first_trade),與 standalone 同
+        self.subscriber.set_handlers(on_trade=self._monitor_on_trade)
+
+        # 08:59:58 預掛 (量減半 final_check_all 用 seed 峰值 + node 當前) + 13:23 撤單
+        self._start_pre_order_timer()
+        self._start_cancel_pending_timer()
+
+        # 等到收盤 → 交易 (共用 _trade_phase);watchlist = 量減半後存活的 marked
+        wait_until_end_time(self.state, self.cfg)
+        watchlist = self.state.get_marked_list()
+        logger.info(f"[node] 轉場交易,watchlist {len(watchlist)} 檔 (量減半後)")
+        self._trade_phase(watchlist, [])
+
     def get_status(self) -> dict:
         """給 API /api/status 用的整體狀態 snapshot."""
         stats = self.state.stats() if self.state else {}
@@ -218,6 +319,12 @@ class Runner:
         self.phase = Phase.LOGIN
         from filter import login_fubon
         self.sdk, _ = login_fubon(self.cfg)
+
+        # ─── ROLE 分岔 (中心過濾架構) ───
+        # node: 不自己 filter,08:59:50 向 Hub 拉 marked 快照 → 只訂那幾檔 → 交易。
+        if self.cfg.role == "node":
+            self._run_node_phases()
+            return
 
         # Phase 2: Universe
         self.phase = Phase.FETCH_UNIVERSE
@@ -318,7 +425,11 @@ class Runner:
 
         # 預掛限價單 timer (08:59:58) — real mode + armed 才會真的下;
         # 對「當下還在 marked 清單」的標的掛漲停價限價買單 (搶開盤集合競價排隊)。
-        self._start_pre_order_timer()
+        # hub 模式不交易 → 不預掛,改 08:59:50 凍結 marked (通知 node 來拉)。
+        if self.cfg.role == "hub":
+            self._start_freeze_timer()
+        else:
+            self._start_pre_order_timer()
         # 13:23 (CANCEL_PENDING_TIME) 撤所有未成交委託 timer (持倉不動、留倉)
         self._start_cancel_pending_timer()
 
@@ -349,9 +460,9 @@ class Runner:
         else:
             logger.warning("[runner] watchlist + 隔日賣皆空 — 不退訂 (留全母體訂閱供查詢)")
 
-        # ── 分岔: SKIP_TRADER 決定進 LIVE_SUBSCRIBE 或 TRADING ──
+        # ── 分岔: SKIP_TRADER (或 hub 不交易) 決定進 LIVE_SUBSCRIBE 或 TRADING ──
 
-        if self.cfg.skip_trader:
+        if self.cfg.skip_trader or self.cfg.role == "hub":
             logger.info("[runner] SKIP_TRADER=true → 進 LIVE_SUBSCRIBE (subscriber 常駐收 tick，"
                         "不下單。第二個分頁可查任何股票 tick)")
             self.phase = Phase.LIVE_SUBSCRIBE
@@ -367,6 +478,11 @@ class Runner:
             logger.info("[runner] LIVE_SUBSCRIBE 結束")
             return
 
+        self._trade_phase(watchlist, overnight_syms)
+
+    def _trade_phase(self, watchlist, overnight_syms):
+        """9:00 起交易 (建 Trader + 首筆種子化 + 等到 13:24) + 收盤 (撤單/存隔日賣/收檔) —
+        standalone 與 node 共用同一段,避免兩條路徑漂移。"""
         if not watchlist and not overnight_syms:
             logger.info("[runner] 篩選結果空 + 無隔日賣 + SKIP_TRADER=false → 直接 finished")
             self.subscriber.stop()

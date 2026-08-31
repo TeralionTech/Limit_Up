@@ -101,6 +101,22 @@ def login_fubon(cfg: Config):
 
 # ─── mark/unmark 判斷邏輯 ────────────────────────────────────
 
+def make_node_book_handler(state: State, limit_ups: dict):
+    """ROLE=node 用的輕量 book handler (中心過濾架構):**只更新漲停價委買層的峰值/當前量**
+    (state.update_max_bid),**不做 mark/unmark**(marked 清單由 Hub 快照固定 seed)。
+    08:59:50–08:59:58 一路墊高 Hub 帶來的峰值 → node 08:59:58 量減半用 state.final_check_all 不動即可。"""
+    def _on_book(symbol: str, bids: list, asks: list, is_continuous: bool = False):
+        limit_up = limit_ups.get(symbol)
+        if not limit_up or not bids:
+            return
+        bid1_price = _pick(bids[0], "price")
+        bid1_size = int(_pick(bids[0], "size") or 0)
+        # 只認漲停價那一層 (避開開盤市價列 price=0;集合競價期漲停鎖死股 bid1 即漲停)
+        if bid1_price and bid1_price >= limit_up - 0.001:
+            state.update_max_bid(symbol, bid1_size)
+    return _on_book
+
+
 def make_on_book_handler(state: State, limit_ups: dict, cfg: Config,
                          unsub_ref: dict):
     """建 on_book callback — closure 捕獲 state / limit_ups / unsub_ref。
