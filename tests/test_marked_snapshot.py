@@ -16,6 +16,10 @@ def _runner():
     r.state = State(bid_drop_ratio=0.5)
     r.limit_ups = {"8105": 16.65, "6933": 260.0, "2330": 600.0}
     r.dispositions = {"6933": True}
+    # 風控三欄來源 (2026-09-01): 跌停價 / T30 / 禁現沖
+    r.limit_downs = {"8105": 13.65}
+    r.day_tradable = {"8105": True, "6933": False}
+    r.session.set_untradable({"8105"})
     # 8105 & 2330 開盤即鎖 (first_tick), 6933 盤中鎖
     r.state.mark("8105", 16.65, 500, 16.65, first_tick=True)
     r.state.mark("6933", 260.0, 100, 260.0, first_tick=False)
@@ -38,6 +42,20 @@ def test_payload_fields():
     # max_bid_vol = mark 以來峰值 (node 判量減半用): 8105 峰值 820 (非 mark 時 500,也非後來的 300)
     assert m["8105"]["max_bid_vol"] == 820
     assert m["6933"]["max_bid_vol"] == 100 and m["2330"]["max_bid_vol"] == 200
+    # last_bid_vol = 最後已知量 (node 兩步 seed 用): 8105 最後掉到 300 (≠ 峰值 820)
+    assert m["8105"]["last_bid_vol"] == 300
+    assert m["6933"]["last_bid_vol"] == 100 and m["2330"]["last_bid_vol"] == 200
+
+
+def test_risk_fields():
+    # 風控三欄 (2026-09-01): limit_down / is_t30 / day_tradable;缺資料 → 安全預設
+    m = {s["symbol"]: s for s in build_marked_snapshot(_runner())["symbols"]}
+    assert m["8105"]["limit_down"] == 13.65 and m["8105"]["is_t30"] is True
+    assert m["6933"]["day_tradable"] is False
+    # 2330 三欄全缺來源 → 預設 0.0 / False / True (= standalone 查無資料時的行為)
+    assert m["2330"]["limit_down"] == 0.0
+    assert m["2330"]["is_t30"] is False
+    assert m["2330"]["day_tradable"] is True
 
 
 def test_priority_first_tick_first():

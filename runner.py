@@ -158,6 +158,9 @@ class Runner:
             return {"ts": now, "final": False, "role": role, "symbols": []}
         marked = self.state.get_marked_prioritized()          # 已排序: 開盤即鎖優先
         first_tick = self.state.first_tick_limit_up
+        # session.untradable 在 runner-main 執行緒被整組 rebind、這裡在 FastAPI 執行緒讀 —
+        # 先 bind local (單次屬性讀取原子),list comprehension 全程看同一組
+        untradable = self.session.untradable if self.session else set()
         symbols = [{
             "symbol": s,
             "limit_up": float(self.limit_ups.get(s, 0.0)),
@@ -166,6 +169,12 @@ class Runner:
             "priority": i,
             # mark 以來最大委買量 (峰值) — node 08:59:58 用「自己當前 < 此 × ratio」判量減半 (見架構 plan)
             "max_bid_vol": self.state.get_max_bid_size(s),
+            # 最後已知當前量 — node 兩步 seed 用 (last≠max,盤前尾段量崩檔才剔得掉)
+            "last_bid_vol": self.state.get_last_bid_size(s),
+            # ─── 風控三欄 (2026-09-01) ───
+            "limit_down": float(self.limit_downs.get(s, 0.0)),   # 出場=跌停價限價賣 (處置股必要)
+            "is_t30": s in untradable,                           # 全額交割禁單 (08-12 事故防線)
+            "day_tradable": bool(self.day_tradable.get(s, True)),  # 禁現沖 → 減半 (is False 嚴格比對,務必 bool)
         } for i, s in enumerate(marked)]
         return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols}
 
@@ -199,6 +208,53 @@ class Runner:
         t.start()
         self._timer_threads.append(t)
 
+    def _apply_marked_snapshot(self, snap) -> list:
+        """node: 把 Hub 快照灌進本地 state/session。回 marked 清單 (優先序);無快照 → 空 (今日不交易)。
+
+        每檔: limit_ups/處置 + 風控三欄 (limit_down 出場跌停價 / is_t30 全額交割禁單 /
+        day_tradable 禁現沖減半;2026-09-01 補 — 之前 node 全缺 → T30 狂送單風險 + 處置股卡倉)
+        + 兩步 seed: mark(峰值) → update_max_bid(last)。只設 last=max 的話,
+        08:59:50–58 無新 tick 的量崩檔 final_check_all (last < max×ratio) 永遠剔不掉。
+        舊 hub 快照缺欄 → 各預設 = 原行為,不炸。"""
+        marked: list = []
+        t30_set: set = set()
+        self._node_bid_vol_fallback = {}     # sym → Hub 最後已知漲停層委買量 (20% cap 兜底)
+        if snap and snap.get("symbols"):
+            for s in snap["symbols"]:
+                sym = s["symbol"]
+                lu = float(s.get("limit_up") or 0.0)
+                self.limit_ups[sym] = lu
+                self.dispositions[sym] = bool(s.get("is_disposition"))
+                down = float(s.get("limit_down") or 0.0)
+                if down > 0:
+                    self.limit_downs[sym] = down
+                self.day_tradable[sym] = bool(s.get("day_tradable", True))
+                if s.get("is_t30"):
+                    t30_set.add(sym)
+                # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
+                max_vol = int(s.get("max_bid_vol") or 0)
+                self.state.mark(sym, lu, max_vol, lu,
+                                first_tick=bool(s.get("first_tick")))
+                last_vol = s.get("last_bid_vol")
+                self.state.update_max_bid(sym, max_vol if last_vol is None else int(last_vol))
+                # 20% 風控②母數兜底: node 08:59:58 若 subscriber 還沒有該檔 book
+                # (8 秒內零 tick、訂閱 snapshot 也沒到),退用 Hub 最後已知漲停層委買量
+                # → 有 cap 總比無 cap 好 (無 cap = 純預算算張,可能超過隊伍 20%)
+                self._node_bid_vol_fallback[sym] = int(
+                    max_vol if last_vol is None else int(last_vol))
+            marked = self.state.get_marked_prioritized()
+            logger.info(f"[node] 由 Hub 快照建 marked {len(marked)} 檔 (hub ts={snap.get('ts')}; "
+                        f"T30 {len(t30_set)} 檔, 跌停價 {len(self.limit_downs)} 檔)")
+        else:
+            logger.warning("[node] 無 marked 快照 → 今日不交易 (仍常駐收 tick 供查詢)")
+
+        # 風控資料交給交易會話 (與 standalone runner 的 set 流程對齊)
+        self.session.set_dispositions(self.dispositions)
+        self.session.set_limit_downs(self.limit_downs)      # 出場=跌停價限價賣 (處置股必要)
+        self.session.set_day_tradable(self.day_tradable)    # 禁現沖 → 部位減半 (風控①)
+        self.session.set_untradable(t30_set)                # T30 全額交割禁單 (08-12 事故防線)
+        return marked
+
     def _run_node_phases(self):
         """ROLE=node: 略過 universe/limit_ups/filter;等到 HUB_FREEZE_TIME 向 Hub 拉 marked 快照 →
         seed state (含 Hub 峰值) → 只訂 marked (1 socket) → 08:59:58 預掛 (量減半 final_check_all 不變:
@@ -206,7 +262,7 @@ class Runner:
         from state import State
         from recorder import TickRecorder
         from subscriber import Subscriber
-        from filter import make_node_book_handler, wait_until_end_time
+        from filter import make_on_book_handler, wait_until_end_time
         from node_client import pull_marked_snapshot
 
         self.phase = Phase.SUBSCRIBE
@@ -229,25 +285,15 @@ class Runner:
         else:
             logger.error("[node] ROLE=node 但 HUB_URL 未設 → 今日不交易")
 
-        marked = []
-        if snap and snap.get("symbols"):
-            for s in snap["symbols"]:
-                sym = s["symbol"]
-                lu = float(s.get("limit_up") or 0.0)
-                self.limit_ups[sym] = lu
-                self.dispositions[sym] = bool(s.get("is_disposition"))
-                # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
-                self.state.mark(sym, lu, int(s.get("max_bid_vol") or 0), lu,
-                                first_tick=bool(s.get("first_tick")))
-            marked = self.state.get_marked_prioritized()
-            logger.info(f"[node] 由 Hub 快照建 marked {len(marked)} 檔 (hub ts={snap.get('ts')})")
-        else:
-            logger.warning("[node] 無 marked 快照 → 今日不交易 (仍常駐收 tick 供查詢)")
+        marked = self._apply_marked_snapshot(snap)
 
-        self.session.set_dispositions(self.dispositions)
-
-        # 只訂 marked (1 socket);node book handler 只更新漲停委買峰值/當前,不 mark/unmark
-        on_book = make_node_book_handler(self.state, self.limit_ups)
+        # 只訂 marked (1 socket);handler 用**與 standalone 相同的完整 filter handler**
+        # (2026-09-01 對齊: 原輕量 handler 只更新峰值、不 unmark → 08:59:50–開盤間鎖破
+        # (賣單出現/跌下漲停) 的檔 node 照樣預掛且不撤,standalone 卻 unmark+撤單。
+        # 完整 handler 對 marked 檔跑 unmark 檢查 + 08:59:58 前記 max/last;
+        # 未 marked 檔沒訂閱、也沒 limit_up → mark 分支自然不觸發,清單仍由 Hub 快照固定)
+        unsub_ref = {"fn": None}
+        on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
         self.subscriber = Subscriber(
             sdk=self.sdk, universe=list(marked), on_book=on_book, login_cfg=self.cfg,
             recorder=self.recorder, batch_size=self.cfg.batch_size,
@@ -259,6 +305,16 @@ class Runner:
             self.subscriber.subscribe_trades_for(marked)
         # 首筆成交 → 開盤訊號 (mark_opened + on_first_trade),與 standalone 同
         self.subscriber.set_handlers(on_trade=self._monitor_on_trade)
+
+        # unmark 淘汰 → 立即退訂 + 撤該檔預掛/pending 委託 (與 standalone _unsub_and_cancel 同款;
+        # session 未 armed 時撤單為 no-op)
+        def _unsub_and_cancel(symbol: str):
+            self._unsub_symbol(symbol)
+            try:
+                self.session.cancel_symbol_orders_async(symbol, "unmarked")
+            except Exception as e:
+                logger.warning(f"[node] 撤 {symbol} 委託失敗: {e}")
+        unsub_ref["fn"] = _unsub_and_cancel
 
         # 08:59:58 預掛 (量減半 final_check_all 用 seed 峰值 + node 當前) + 13:23 撤單
         self._start_pre_order_timer()
@@ -828,6 +884,11 @@ class Runner:
                     if _up and abs(float(_pick(_lv, "price") or 0) - _up) < 0.001:
                         bid_vols[_s] = int(_pick(_lv, "size") or 0)
                         break
+            # node 兜底 (2026-09-01): subscriber 沒該檔 book (訂閱後零 tick) → 退用
+            # Hub 快照最後已知量,20% cap 不失效 (standalone 此 dict 恆空 → 零行為變化)
+            for _s, _v in getattr(self, "_node_bid_vol_fallback", {}).items():
+                if _s not in bid_vols and _s in marked and _v > 0:
+                    bid_vols[_s] = _v
             try:
                 self.session.place_pre_orders(marked, self.limit_ups, stop_event,
                                               limit_up_bid_vols=bid_vols)
@@ -926,6 +987,7 @@ class Runner:
         cache_file = output_dir / f"{today}_limit_ups.json"
         disp_file = output_dir / f"{today}_dispositions.json"
         down_file = output_dir / f"{today}_limit_downs.json"
+        dt_file = output_dir / f"{today}_day_tradable.json"
 
         # 讀 cache
         if cache_file.exists():
@@ -953,6 +1015,15 @@ class Runner:
                                 self.limit_downs = {k: float(v) for k, v in _json.load(f).items()}
                         except Exception:
                             pass
+                    # 禁現沖 cache (best-effort;缺 → 全視為可現沖,減半風控①不觸發。
+                    # day_tradable 只在 _query_limit_up 填 — cache hit 不補讀的話
+                    # hub 盤中重啟後快照 day_tradable 欄全預設 True)
+                    if dt_file.exists():
+                        try:
+                            with dt_file.open(encoding="utf-8") as f:
+                                self.day_tradable = {k: bool(v) for k, v in _json.load(f).items()}
+                        except Exception:
+                            pass
                     return {k: float(v) for k, v in cached.items()}
             except Exception as e:
                 logger.warning(f"[runner] cache 讀失敗 ({e})，改走 REST 重抓")
@@ -971,8 +1042,11 @@ class Runner:
                     _json.dump(self.dispositions, f, ensure_ascii=False, indent=2)
                 with down_file.open("w", encoding="utf-8") as f:
                     _json.dump(self.limit_downs, f, ensure_ascii=False, indent=2)
+                with dt_file.open("w", encoding="utf-8") as f:
+                    _json.dump(self.day_tradable, f, ensure_ascii=False, indent=2)
                 logger.info(f"[runner] cache 已寫 {cache_file.name} ({len(result)} 檔,"
-                            f"其中處置股 {n_disp} 檔,跌停價 {len(self.limit_downs)} 檔)")
+                            f"其中處置股 {n_disp} 檔,跌停價 {len(self.limit_downs)} 檔,"
+                            f"禁現沖 {sum(1 for v in self.day_tradable.values() if not v)} 檔)")
             except Exception as e:
                 logger.warning(f"[runner] cache 寫失敗: {e}")
         return result

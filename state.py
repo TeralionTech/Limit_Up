@@ -239,6 +239,13 @@ class State:
         with self._lock:
             return self._max_bid_size.get(symbol, 0)
 
+    def get_last_bid_size(self, symbol: str) -> int:
+        """該檔最後已知委買一量 (last) — Hub 快照帶給 node 兩步 seed 用。
+        若 node seed 只把 last 設成峰值,08:59:50–58 之間無新 tick 的量崩檔
+        final_check_all (last < max×ratio) 永遠剔不掉 → 量減半失效。"""
+        with self._lock:
+            return self._last_bid1_size.get(symbol, 0)
+
     def is_first_tick(self, symbol: str) -> bool:
         """該股是否「開盤即鎖」(第一筆真實報價就漲停) — trader/SimPage 徽章用."""
         with self._lock:
