@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compute_avg_volume.py — 離線算全市場近 N 交易日「日均成交量(張)」,寫 input/avg_volume.json。
 
-用途: 盤前篩選要「過去一個月日均量 > 500 張」才追蹤。歷史 K 線 REST 限 60/min、逐檔無批次,
+用途: 盤前篩選要「過去一個月日均量 > 300 張」才追蹤 (2026-09-02 500→300)。歷史 K 線 REST 限 60/min、逐檔無批次,
 全母體 ~1900 檔要 ~35 分鐘 → **夜間 systemd timer 跑**,盤前 runner 直接讀檔 (零盤中 REST)。
 
 ⚠ 單位: 富邦 historical.candles 的 volume 是**股**,÷1000 換**張** (與五檔的「張」統一)。
@@ -104,7 +104,7 @@ def main():
     ap.add_argument("--calendar-days", type=int, default=40,
                     help="往回抓幾個日曆天 (要 > days 的交易日, 預設 40)")
     ap.add_argument("--max-per-min", type=int, default=55, help="歷史K線節流 (≤60/min, 預設 55)")
-    ap.add_argument("--min-lots", type=float, default=500, help="低量門檻 (僅統計顯示)")
+    ap.add_argument("--min-lots", type=float, default=300, help="低量門檻 (僅統計顯示)")
     ap.add_argument("--out", default=str(REPO / "input" / "avg_volume.json"))
     ap.add_argument("--min-universe", type=int, default=MIN_SANE_UNIVERSE,
                     help=f"母體/結果 < 此檔數 → 中止不覆蓋既有檔 (預設 {MIN_SANE_UNIVERSE})")

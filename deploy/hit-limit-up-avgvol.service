@@ -11,4 +11,4 @@ WorkingDirectory=/opt/hit_limit_up/repo
 ExecStart=/opt/hit_limit_up/venv/bin/python scripts/compute_avg_volume.py
 TimeoutStartSec=3000
 Environment=PYTHONUNBUFFERED=1
-# 產出 input/avg_volume.json;runner 盤前讀來剔除日均量 < AVG_VOLUME_MIN_LOTS(預設500) 張的股票
+# 產出 input/avg_volume.json;runner 盤前讀來剔除日均量 < AVG_VOLUME_MIN_LOTS(預設300) 張的股票
