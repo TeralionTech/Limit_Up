@@ -255,6 +255,39 @@ class Runner:
         self.session.set_untradable(t30_set)                # T30 全額交割禁單 (08-12 事故防線)
         return marked
 
+    def _prepare_overnight(self, output_dir) -> list:
+        """載入隔日賣清單 (昨天買到未出場的持倉) + 補查今日漲停/跌停價 → 交給 session。
+        standalone 與 node 共用 (避免兩路徑漂移)。回 overnight_syms。
+
+        出場=跌停價限價賣;漲停價=鎖漲停續抱判斷 (隔日賣標的可能不在今日 limit_ups 抓取範圍)。
+        查無漲停價 → 該檔續抱功能停用退回開盤即賣。
+        ⚠ 漲停價收進獨立 _overnight_ups 傳 session,**絕不寫 self.limit_ups** — filter handler closure
+        捕獲該 dict,混入會讓 8:30 篩選把昨日持倉當新標的 mark → 預掛買單加碼!"""
+        self._load_overnight_file(output_dir)
+        overnight_syms = self.session.overnight_symbols()
+        _stock = self.sdk.marketdata.rest_client.stock
+        _overnight_ups: dict = {}
+        for _s in overnight_syms:
+            up = self.limit_ups.get(_s)            # universe 抓過的直接複用 (node 為空 → 走補查)
+            if up is None or _s not in self.limit_downs:
+                for _try in range(3):              # 小重試 (原本單次靜默失敗)
+                    got = self._query_limit_up(_stock, _s)   # 副作用寫 dispositions/limit_downs
+                    if got:
+                        up = up or got
+                        break
+                    time.sleep(1)
+            if up:
+                _overnight_ups[_s] = float(up)
+            else:
+                logger.warning(f"[runner] 隔日賣 {_s} 查無今日漲停價 → "
+                               f"鎖漲停判斷停用 (無市價列時開盤即賣)")
+        # 跌停價/處置股/隔日賣漲停價交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)
+        self.session.set_limit_downs(self.limit_downs)
+        self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
+        self.session.set_day_tradable(self.day_tradable)   # 補查後含隔日賣標的的禁現沖資訊
+        self.session.set_overnight_limit_ups(_overnight_ups)
+        return overnight_syms
+
     def _run_node_phases(self):
         """ROLE=node: 略過 universe/limit_ups/filter;等到 HUB_FREEZE_TIME 向 Hub 拉 marked 快照 →
         seed state (含 Hub 峰值) → 只訂 marked (1 socket) → 08:59:58 預掛 (量減半 final_check_all 不變:
@@ -271,6 +304,12 @@ class Runner:
         output_dir.mkdir(exist_ok=True)
         today = datetime.now().strftime("%Y-%m-%d")
         self.recorder = TickRecorder(output_dir / f"{today}_ticks.jsonl")
+
+        # 隔日賣清單 + 補查 — 趁 08:00~08:59:50 空檔先做 (REST 補查不吃 08:59:50→58 預掛時窗)。
+        # 08:59:50 _apply_marked_snapshot 會再以 self.* 合併重設 marked+overnight,最後狀態正確。
+        overnight_syms = self._prepare_overnight(output_dir)
+        if overnight_syms:
+            logger.info(f"[node] 隔日賣標的 {len(overnight_syms)} 檔 → 一併訂閱、9:00 開盤賣")
 
         # 等到 Hub 凍結時點才拉 (免 08:00–08:59:50 空輪詢);死線 = 預掛前 1 秒 (08:59:57)
         self._wait_until_clock(self.cfg.hub_freeze_time)
@@ -294,15 +333,17 @@ class Runner:
         # 未 marked 檔沒訂閱、也沒 limit_up → mark 分支自然不觸發,清單仍由 Hub 快照固定)
         unsub_ref = {"fn": None}
         on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
+        # 訂閱 = marked + 隔日賣標的 (隔日賣標的無 limit_up → filter handler 不會 mark;09:00 由 trader 賣出)
+        sub_syms = list(marked) + [s for s in overnight_syms if s not in marked]
         self.subscriber = Subscriber(
-            sdk=self.sdk, universe=list(marked), on_book=on_book, login_cfg=self.cfg,
+            sdk=self.sdk, universe=sub_syms, on_book=on_book, login_cfg=self.cfg,
             recorder=self.recorder, batch_size=self.cfg.batch_size,
             batch_rotate_sec=self.cfg.batch_rotate_sec,
             socket_count=self.cfg.socket_count, debug=self.cfg.debug,
         )
         self.subscriber.start()
-        if marked:
-            self.subscriber.subscribe_trades_for(marked)
+        if sub_syms:
+            self.subscriber.subscribe_trades_for(sub_syms)
         # 首筆成交 → 開盤訊號 (mark_opened + on_first_trade),與 standalone 同
         self.subscriber.set_handlers(on_trade=self._monitor_on_trade)
 
@@ -323,8 +364,8 @@ class Runner:
         # 等到收盤 → 交易 (共用 _trade_phase);watchlist = 量減半後存活的 marked
         wait_until_end_time(self.state, self.cfg)
         watchlist = self.state.get_marked_list()
-        logger.info(f"[node] 轉場交易,watchlist {len(watchlist)} 檔 (量減半後)")
-        self._trade_phase(watchlist, [])
+        logger.info(f"[node] 轉場交易,watchlist {len(watchlist)} 檔 (量減半後) + 隔日賣 {len(overnight_syms)} 檔")
+        self._trade_phase(watchlist, overnight_syms)
 
     def get_status(self) -> dict:
         """給 API /api/status 用的整體狀態 snapshot."""
@@ -421,35 +462,10 @@ class Runner:
         unsub_ref = {"fn": None}
         on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
 
-        # 載入隔日賣清單 (昨天買到未出場的持倉);把它們也放進訂閱母體,
-        # 8:30 起就收得到五檔+成交 (隔日賣標的可能不在漲停母體裡)
-        self._load_overnight_file(output_dir)
-        overnight_syms = self.session.overnight_symbols()
-        # 隔日賣標的補查今日漲停/跌停價 (出場=跌停價限價賣;漲停價=鎖漲停續抱判斷。
-        # 它們可能不在今日 limit_ups 抓取範圍)。查無漲停價 → 該檔續抱功能停用退回開盤即賣。
-        # ⚠ 漲停價收進獨立 dict,**絕不寫 self.limit_ups** — filter handler closure
-        # 捕獲該 dict,混入會讓 8:30 篩選把昨日持倉當新標的 mark → 預掛買單加碼!
-        _stock = self.sdk.marketdata.rest_client.stock
-        _overnight_ups: dict = {}
-        for _s in overnight_syms:
-            up = self.limit_ups.get(_s)            # universe 抓過的直接複用
-            if up is None or _s not in self.limit_downs:
-                for _try in range(3):              # 小重試 (原本單次靜默失敗)
-                    got = self._query_limit_up(_stock, _s)   # 副作用寫 dispositions/limit_downs
-                    if got:
-                        up = up or got
-                        break
-                    time.sleep(1)
-            if up:
-                _overnight_ups[_s] = float(up)
-            else:
-                logger.warning(f"[runner] 隔日賣 {_s} 查無今日漲停價 → "
-                               f"鎖漲停判斷停用 (無市價列時開盤即賣)")
-        # 跌停價/處置股/隔日賣漲停價交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)
-        self.session.set_limit_downs(self.limit_downs)
-        self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
-        self.session.set_day_tradable(self.day_tradable)   # 補查後含隔日賣標的的禁現沖資訊
-        self.session.set_overnight_limit_ups(_overnight_ups)
+        # 載入隔日賣清單 (昨天買到未出場的持倉) + 補查今日漲停/跌停價 → 交給 session。
+        # standalone 與 node 共用同 helper (避免兩路徑漂移)。把它們也放進訂閱母體,
+        # 8:30 起就收得到五檔+成交 (隔日賣標的可能不在漲停母體裡)。
+        overnight_syms = self._prepare_overnight(output_dir)
         sub_universe = [s for s in self.universe if s in self.limit_ups]
         for s in overnight_syms:
             if s not in sub_universe:
