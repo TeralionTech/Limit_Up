@@ -3,3 +3,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 apscheduler==3.10.4
 
+# 富邦行情相依 — 必須 pin (2026-09-02 事故: 新建 venv pip 抓了 fugle-marketdata 2.6.0,
+# 它新增嚴格 base_url 檢查,拒絕 fubon-neo 2.2.8 傳的 .../marketdata/v1.0 → Subscriber.start() 崩。
+# 2.4.1 是 hub 實證可用版本。fubon-neo 2.2.8 為手動 manylinux wheel,不在此 pip 安裝。
+fugle-marketdata==2.4.1
+websockets==16.1
+
