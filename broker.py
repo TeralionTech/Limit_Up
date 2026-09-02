@@ -532,9 +532,12 @@ class RealOrderClient:
                 "filled_qty": int(_attr(content, "filled_qty", "filledQty", default=0) or 0),
                 "error_message": str(_attr(content, "error_message", "errorMessage", default="") or ""),
                 "function_type": _attr(content, "function_type", "functionType", default=None),
+                # 富邦回報「最後異動時間」(毫秒,如 "10:44:05.796") — 新單接受回報 = 委託被接受時戳
+                "last_time": str(_attr(content, "last_time", "lastTime", default="") or ""),
             }
             logger.info(f"[broker] 委託回報 {rpt['symbol']} order={rpt['order_no']} "
-                        f"status={rpt['status']} err={rpt['error_message'] or '-'}")
+                        f"status={rpt['status']} last_time={rpt['last_time'] or '-'} "
+                        f"err={rpt['error_message'] or '-'}")
             if self.on_order:
                 self.on_order(rpt)
         except Exception as e:

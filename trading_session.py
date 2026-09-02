@@ -329,6 +329,7 @@ class TradingSession:
                 "status": "pending",       # pending / filled / cancelled / rejected
                 "filled_lots": 0,
                 "ts": datetime.now().isoformat(timespec="seconds"),
+                "last_time": "",           # 富邦委託回報「最後異動時間」(_on_order 收到回報時填)
             }
 
     def _mark_order(self, order_no: str, status: str):
@@ -1588,10 +1589,18 @@ class TradingSession:
                              name="budget-breach-cancel", daemon=True).start()
 
     def _on_order(self, rpt: dict):
-        """委託回報 — 交易所拒單時標 rejected (place_order 同步成功但交易所退)。"""
+        """委託回報 — 記富邦「最後異動時間」last_time (委託被接受/異動的富邦時戳,毫秒);
+        交易所拒單時標 rejected (place_order 同步成功但交易所退)。"""
+        order_no = rpt.get("order_no", "")
+        last_time = rpt.get("last_time", "")
+        if order_no and last_time:
+            with self._lock:
+                row = self.order_log.get(order_no)
+                if row is not None:
+                    row["last_time"] = last_time   # 新單接受回報 = 委託被接受時戳
         if not rpt.get("error_message"):
             return
-        self._mark_order(rpt.get("order_no", ""), "rejected")
+        self._mark_order(order_no, "rejected")
         with self._lock:
             st = self.trades.get(rpt.get("symbol", ""))
             if st is not None and st.order_no == rpt.get("order_no"):
