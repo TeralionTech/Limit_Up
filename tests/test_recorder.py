@@ -47,3 +47,21 @@ class TestRecorder:
         rec.record("books", {"a": 2})
         rec.record("books", {"a": 3})      # 滿 → 丟棄 + 計數,絕不能 raise / block
         assert rec._dropped == 1
+
+    def test_set_keep_filters_other_symbols(self, tmp_path):
+        f = tmp_path / "ticks.jsonl"
+        rec = TickRecorder(f)
+        rec.record("books", {"symbol": "2330"})          # 轉場前 keep=None → 全錄
+        rec.set_keep({"2330"})
+        rec.record("books", {"symbol": "2330"})
+        rec.record("books", {"symbol": "1101"})          # 不在 keep → 略過,不計入 count
+        rec.set_keep(set())                              # 零標記日:之後任何 symbol 都略過
+        rec.record("trades", {"symbol": "2330"})
+        rec.set_keep(None)                               # 解除 → 回到全錄
+        rec.record("trades", {"symbol": "1101"})
+        assert rec.count() == 3
+        assert rec._filtered == 2
+        rec.close()
+
+        rows = [json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines()]
+        assert [r["data"]["symbol"] for r in rows] == ["2330", "2330", "1101"]

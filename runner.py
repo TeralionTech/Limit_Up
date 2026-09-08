@@ -526,6 +526,10 @@ class Runner:
 
         # 9:00 轉場: 只留 marked + 隔日賣標的 — 其餘全退訂,並加訂 trades
         keep = watchlist + [s for s in overnight_syms if s not in watchlist]
+        # 09:00 後 recorder 只落檔 keep:零標記日 subscriber 不退訂 (留全母體給 UI 查) 但不再錄 —
+        # 否則 930 檔整天 books 一天 5GB (2026-09-03/04/08 把 hub 磁碟寫滿)。replay 只需 keep。
+        if self.recorder:
+            self.recorder.set_keep(keep)
         if keep:
             self.subscriber.keep_only(keep)
             self.subscriber.subscribe_trades_for(keep)

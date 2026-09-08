@@ -7,6 +7,7 @@
   觸發市價追的那筆 tick 要先等一次磁碟 I/O)。
 - 批次 flush: writer 每 drain 一批寫完 flush 一次 (最多 ~1s 延遲可 tail)。
 - 佇列滿 (磁碟跟不上) → 丟棄該筆 + 計數,不 block 行情線程。
+- set_keep(): 09:00 轉場後只錄 keep 標的 (marked + 隔日賣),其餘 symbol 直接略過。
 
 輸出檔: output/YYYY-MM-DD_ticks.jsonl
 """
@@ -34,6 +35,8 @@ class TickRecorder:
         self._queue: "queue.Queue[tuple]" = queue.Queue(maxsize=_QUEUE_MAX)
         self._count = 0            # 已收筆數 (GIL 下 += 足夠精確,顯示用)
         self._dropped = 0          # 佇列滿丟棄筆數
+        self._keep: frozenset[str] | None = None   # None = 全錄;set_keep() 後只錄集合內 symbol
+        self._filtered = 0         # 不在 keep 內而略過的筆數
         self._stop = threading.Event()
         self._file = open(output_path, "a", encoding="utf-8")
         self._writer_thread = threading.Thread(
@@ -41,8 +44,30 @@ class TickRecorder:
         self._writer_thread.start()
         logger.info(f"[recorder] 開始寫 {output_path} (背景批次寫檔,最壞延遲 ~1s)")
 
+    def set_keep(self, symbols) -> None:
+        """之後只錄這些 symbol;None = 全錄,空集合 = 之後全部略過。
+
+        09:00 轉場後由 runner 呼叫:零標記日 subscriber 不退訂 (留全母體給 UI 查 tick),
+        若不在這裡擋,930 檔整天 books 一天寫 5GB (2026-09-03/04/08 把 hub 磁碟寫滿);
+        replay 只需要 09:00 前的全母體 + 09:00 後的 keep。
+        單一 attribute 指派,行情 callback thread 讀到新舊任一值皆安全,不需鎖。
+        """
+        self._keep = None if symbols is None else frozenset(symbols)
+        if self._keep is None:
+            logger.info("[recorder] keep 解除 → 全錄")
+        elif not self._keep:
+            logger.info("[recorder] keep 為空集合 → 之後不再落檔")
+        else:
+            logger.info(f"[recorder] 之後只錄 {len(self._keep)} 檔")
+
     def record(self, channel: str, data):
         """存一筆 tick — **零 I/O 零序列化**,只入佇列 (行情 callback thread 安全)。"""
+        keep = self._keep
+        if keep is not None:
+            sym = data.get("symbol") if isinstance(data, dict) else getattr(data, "symbol", None)
+            if sym not in keep:
+                self._filtered += 1
+                return
         try:
             self._queue.put_nowait(
                 (channel, datetime.now().isoformat(timespec="microseconds"), data))
@@ -100,6 +125,8 @@ class TickRecorder:
         except Exception:
             pass
         msg = f"[recorder] 關檔，共收 {self._count} 筆 tick 到 {self.output_path}"
+        if self._filtered:
+            msg += f" (轉場後略過 {self._filtered} 筆)"
         if self._dropped:
             msg += f" (佇列滿丟棄 {self._dropped} 筆)"
         logger.info(msg)
