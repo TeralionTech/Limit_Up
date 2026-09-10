@@ -1,6 +1,27 @@
 import { ReactNode, useEffect, useRef, useState } from 'react'
 import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTrade, OrderRow, SpendingSummary } from '../api'
 
+// 撤單佇列可見性 (2026-09-09 node3「管線多送市價單未撤」事故 A5) — api.ts 型別不動,本檔以 local type 擴充:
+//   委託列: cancel_state ('' | queued | sent | unconfirmed) / cancel_attempts / cancel_reason / cancel_err
+//   status: n_cancel_unconfirmed / n_cancel_queued / n_inflight / cancel_worker_alive
+type OrderRowX = OrderRow & {
+  cancel_state?: '' | 'queued' | 'sent' | 'unconfirmed'
+  cancel_attempts?: number
+  cancel_reason?: string
+  cancel_err?: string
+}
+type TradingStatusX = TradingStatus & {
+  n_cancel_unconfirmed?: number
+  n_cancel_queued?: number
+  n_inflight?: number
+  cancel_worker_alive?: boolean
+}
+
+/** pending 且撤單中 (已入佇列 / 已送撤單 / 撤不到) — 券商尚未確認撤成,不可當「已撤」看 */
+function isCancelling(o: OrderRowX): boolean {
+  return o.status === 'pending' && ((o.cancel_attempts ?? 0) > 0 || !!o.cancel_state)
+}
+
 export default function SimPage() {
   const [sum, setSum] = useState<TraderSummary | null>(null)
 
@@ -277,7 +298,7 @@ function pullLabel(reason: string): string {
 // ─── 交易模式面板 (模擬/真實) ────────────────────────────────
 
 function TradingPanel() {
-  const [ts, setTs] = useState<TradingStatus | null>(null)
+  const [ts, setTs] = useState<TradingStatusX | null>(null)
   const [msg, setMsg] = useState('')
   // 連線表單
   const [acct, setAcct] = useState('')
@@ -291,8 +312,9 @@ function TradingPanel() {
   const [perBudget, setPerBudget] = useState('')
   const [fixedLots, setFixedLots] = useState('')
   // 委託總表 + 右鍵選單
-  const [orders, setOrders] = useState<OrderRow[]>([])
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; order: OrderRow } | null>(null)
+  const [orders, setOrders] = useState<OrderRowX[]>([])
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; order: OrderRowX } | null>(null)
+  const nCancelling = orders.filter(isCancelling).length
 
   useEffect(() => {
     let cancelled = false
@@ -392,12 +414,15 @@ function TradingPanel() {
     catch (e: any) { flash(`✗ ${e.message}`) }
   }
 
-  async function cancelOrder(o: OrderRow) {
+  async function cancelOrder(o: OrderRowX) {
     setCtxMenu(null)
-    if (!window.confirm(`刪單 ${o.order_no}?\n${o.symbol} ${o.action === 'buy' ? '買' : '賣'} ${o.lots} 張`)) return
+    const cancelling = isCancelling(o)
+    if (!window.confirm(
+      `${cancelling ? '再送撤單' : '刪單'} ${o.order_no}?\n${o.symbol} ${o.action === 'buy' ? '買' : '賣'} ${o.lots} 張` +
+      (cancelling ? `\n\n此單撤單中 (第 ${o.cancel_attempts ?? 0} 次未確認)${o.cancel_err ? `\n最近錯誤: ${o.cancel_err}` : ''}\n再送一次會立即重試;若仍撤不到請至券商端手動撤單。` : ''))) return
     try {
       await api.tradingCancelOrder(o.order_no)
-      flash(`✓ 已刪單 ${o.order_no}`)
+      flash(cancelling ? `✓ 已再送撤單 ${o.order_no} (等券商確認)` : `✓ 已送撤單 ${o.order_no} (等券商確認)`)
     } catch (e: any) { flash(`✗ ${e.message}`) }
   }
 
@@ -428,6 +453,15 @@ function TradingPanel() {
           : <Badge cls="bg-gray-100 text-gray-600">未連線</Badge>
         )}
         {ts?.armed && <Badge cls="bg-red-600 text-white animate-pulse">⚡ 交易中</Badge>}
+        {/* 撤單未確認 (查無/查詢失敗/撤單被拒,worker 重試中) — 券商端可能仍 live,不可當已撤 */}
+        {(ts?.n_cancel_unconfirmed ?? 0) > 0 && (
+          <Badge cls="bg-amber-100 text-amber-800 border border-amber-300">
+            ⚠ 撤單未確認 {ts!.n_cancel_unconfirmed}
+          </Badge>
+        )}
+        {isReal && ts?.connected && (ts.n_cancel_queued ?? 0) > 0 && ts.cancel_worker_alive === false && (
+          <Badge cls="bg-red-100 text-red-800" >撤單 worker 未執行 — 佇列 {ts.n_cancel_queued} 筆</Badge>
+        )}
         {msg && <span className="text-sm">{msg}</span>}
       </div>
 
@@ -529,6 +563,17 @@ function TradingPanel() {
             <div>
               <h3 className="text-sm font-semibold text-gray-700 mb-1">
                 📋 委託狀態 ({orders.length})
+                {nCancelling > 0 && (
+                  <span className="ml-2 font-normal text-xs text-amber-700"
+                        title="撤單已送出/佇列重試中,券商尚未確認撤成 — 仍可能成交;右鍵可再送一次">
+                    ⚠ 撤單中 {nCancelling}
+                  </span>
+                )}
+                {(ts?.n_inflight ?? 0) > 0 && (
+                  <span className="ml-2 font-normal text-xs text-gray-500" title="order_log 內 pending 的市價買 (在飛)">
+                    在飛市價買 {ts!.n_inflight}
+                  </span>
+                )}
                 <span className="ml-2 font-normal text-xs text-gray-400">在委託列上按右鍵可刪單</span>
               </h3>
               <div className="overflow-x-auto max-h-64 overflow-y-auto bg-white rounded border">
@@ -554,7 +599,7 @@ function TradingPanel() {
                             setCtxMenu({ x: e.clientX, y: e.clientY, order: o })
                           }}
                           className={`border-b last:border-b-0 cursor-context-menu ${
-                            o.status === 'pending' ? 'bg-blue-50/50' : ''}`}>
+                            isCancelling(o) ? 'bg-amber-50/70' : o.status === 'pending' ? 'bg-blue-50/50' : ''}`}>
                         <td className="py-1 px-2 text-gray-500">{o.ts.slice(11)}</td>
                         <td className="py-1 px-2 font-mono">{o.order_no}</td>
                         <td className="py-1 px-2 font-mono font-semibold">{o.symbol}</td>
@@ -568,7 +613,7 @@ function TradingPanel() {
                         </td>
                         <td className="py-1 px-2 text-right font-mono">{o.lots}</td>
                         <td className="py-1 px-2 text-right font-mono">{o.filled_lots}</td>
-                        <td className="py-1 px-2"><OrderStatusBadge status={o.status} /></td>
+                        <td className="py-1 px-2"><OrderStatusBadge order={o} /></td>
                       </tr>
                     ))}
                   </tbody>
@@ -593,7 +638,9 @@ function TradingPanel() {
               ctxMenu.order.status === 'pending'
                 ? 'text-red-600 hover:bg-red-50'
                 : 'text-gray-300 cursor-not-allowed'}`}>
-            🗑 刪單{ctxMenu.order.status !== 'pending' ? ` (${orderStatusText(ctxMenu.order.status)})` : ''}
+            {isCancelling(ctxMenu.order)
+              ? `🔁 再送撤單 (撤單中 ${ctxMenu.order.cancel_attempts ?? 0} 次未確認)`
+              : `🗑 刪單${ctxMenu.order.status !== 'pending' ? ` (${orderStatusText(ctxMenu.order.status)})` : ''}`}
           </button>
         </div>
       )}
@@ -618,7 +665,22 @@ function orderStatusText(s: string): string {
 }
 
 
-function OrderStatusBadge({ status }: { status: string }) {
+function OrderStatusBadge({ order }: { order: OrderRowX }) {
+  const status = order.status
+  // pending 且撤單中 → 琥珀色「撤單中(n)」;hover 顯示最近錯誤 (查無/流量控管/券商拒撤原文)。
+  // status 值域不變 (仍是 pending) — 券商確認前絕不顯示「已撤」(2026-09-09 事故: 誤標 cancelled → 隱形裸單)
+  if (isCancelling(order)) {
+    const n = order.cancel_attempts ?? 0
+    const stateText: Record<string, string> = { queued: '已排入撤單佇列', sent: '撤單已送出,等券商確認', unconfirmed: '撤不到/未確認,重試中' }
+    const tip = [stateText[order.cancel_state || ''] || '撤單中', order.cancel_reason ? `原因: ${order.cancel_reason}` : '',
+                 order.cancel_err ? `最近錯誤: ${order.cancel_err}` : ''].filter(Boolean).join('\n')
+    return (
+      <span className={`px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 ${n >= 6 ? 'font-semibold animate-pulse' : ''}`}
+            title={tip}>
+        撤單中({n})
+      </span>
+    )
+  }
   const cls: Record<string, string> = {
     pending: 'bg-blue-100 text-blue-700',
     filled: 'bg-green-100 text-green-700',

@@ -10,7 +10,8 @@ from broker import RealOrderClient
 
 
 class MapBroker(FakeBroker):
-    """get_filled_map 可設定 — 模擬券商權威成交量。"""
+    """get_filled_map 可設定 — 模擬券商權威成交量。
+    券商快照契約 (get_order_snapshot / cancel_by_obj / get_pending_orders) 由 FakeBroker 繼承而來。"""
 
     def __init__(self):
         super().__init__()

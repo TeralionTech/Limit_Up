@@ -23,6 +23,34 @@ logger = logging.getLogger(__name__)
 
 FUBON_TEST_URL = "wss://neoapitest.fbs.com.tw/TASP/XCPXWS"
 
+# 富邦「帳務查詢 5/秒」— 所有 get_order_results 一律過 broker 內部閘門 (最小間隔 ≥0.2 s)。
+# 超限**不是**例外,是 Result{is_success:False, message:"Login Error, 業務系統流量控管"}
+# (2026-09-09 node3 事故: 8 條撤單 thread 0.66 s 內打 8 次查詢 → 限流 → 被當成「查無」→ 標 cancelled)。
+# 0.2 s = 剛好 5/s 零餘裕;多留 10 ms 抗 sleep 喚醒/網路抖動 (任一 1 s 滑動窗 ≤5 次)。
+QUERY_MIN_INTERVAL_SEC = 0.21
+
+
+class OrderLookupError(RuntimeError):
+    """委託查詢失敗 — get_order_results 回 is_success 非 True、回空、或 SDK 例外。
+    str(e) 含富邦原文 (例「Login Error, 業務系統流量控管」)。**查詢失敗 ≠ 查無**。"""
+
+
+class OrderNotFound(RuntimeError):
+    """委託查詢成功但清單無此書號 (後檯快照延遲/逐筆亂序皆可能;**不等於已成交/已撤**)。"""
+
+
+class CancelRejected(RuntimeError):
+    """撤單被券商拒 (cancel_order 回 is_success=False;「成交單/部分成交單/取消單已不允許取消」等)。
+    帶上撤單當下手上委託物件的 filled_qty (股) 與 status — session 對「已成交」可立刻補成交,不必再查一次
+    (2026-09-09 A2「立刻用快照 filled_qty 補成交」;審查 #11)。⚠ 物件來自撤單前的快照,可能落後於券商實況
+    (replica 延遲) — session 端以訊息 / 委託量核實,不符就留佇列下一輪再看。
+    仍是 RuntimeError 子類、str(e) 格式「撤單失敗 <書號>: <富邦原文>」不變 (既有 isinstance / classify 契約)。"""
+
+    def __init__(self, msg: str, filled_qty=None, status: str = ""):
+        super().__init__(msg)
+        self.filled_qty = filled_qty
+        self.status = status
+
 
 def _fmt_price(price: float) -> str:
     """Order.price 是字串;整數去小數點 (66.0 → "66"),否則 %g。"""
@@ -51,9 +79,15 @@ class RealOrderClient:
       on_fill(dict)    — 成交回報 {symbol, action, price, lots, quantity, order_no,
                           filled_no, filled_time}
       on_order(dict)   — 委託回報 {order_no, symbol, status, filled_qty, error_message,
-                          function_type}
+                          function_type, last_time} (撤單失敗走 err 參數的回報也轉發,不吞)
       on_disconnect()  — 交易 WS 斷線 (event 300)
     """
+
+    # 查詢閘門的類別層預設 — 讓不經 __init__ 建的替身 (tests 用 RealOrderClient.__new__) 也走閘門;
+    # __init__ 會換成 instance 專屬鎖。
+    _query_lock = threading.Lock()
+    _query_next_ts = 0.0
+    query_min_interval = QUERY_MIN_INTERVAL_SEC
 
     def __init__(self, log_path: Path):
         self.sdk = None
@@ -67,6 +101,10 @@ class RealOrderClient:
         # 仍能唯一認領那筆剛送、還沒書號的 (2026-08-28: 管線化打破「每檔同時僅一張活躍委託」假設)
         self._claimed_order_nos: set = set()
         self._unknown_ctr = 0          # UNKNOWN 書號流水號 — 免同秒兩筆撞同 key 覆寫掉一筆 live 單
+        # 委託查詢閘門 (富邦帳務查詢 5/s) — 鎖內只預約時槽、鎖外 sleep;所有 get_order_results 過這裡
+        self._query_lock = threading.Lock()
+        self._query_next_ts = 0.0          # perf_counter;下一個可查詢時槽
+        self.query_min_interval = QUERY_MIN_INTERVAL_SEC
         # callbacks
         self.on_fill: Optional[Callable[[dict], None]] = None
         self.on_order: Optional[Callable[[dict], None]] = None
@@ -356,11 +394,8 @@ class RealOrderClient:
         都已 add 進 _claimed → 排除後只剩剛送、還沒書號的這一筆 → 仍唯一可認。
         """
         try:
-            result = self.sdk.stock.get_order_results(self.account)
-            if not result or not getattr(result, "is_success", False):
-                return ""
             candidates = []
-            for o in (result.data or []):
+            for o in self._query_order_results():   # 過 5/s 閘門;查詢失敗 raise → 下方 except 回 ""
                 if str(_attr(o, "user_def", "userDef", default="") or "") != "hitlimit":
                     continue
                 if str(_attr(o, "stock_no", "symbol", default="")) != symbol:
@@ -381,34 +416,146 @@ class RealOrderClient:
             logger.error(f"[broker] {symbol} 書號反查失敗: {e}")
             return ""
 
+    # ─── 委託查詢 (所有 get_order_results 的唯一入口) ─────────────
+
+    def _query_order_results(self) -> list:
+        """呼叫 sdk.stock.get_order_results 的**唯一入口** — 過 5/s 閘門 + 每次一行 log。
+
+        閘門: 鎖內只預約下一個時槽 (算等待),**鎖外 sleep** — 多條 thread 同時查是排隊而非
+        互相卡鎖;8 條撤單 thread 同瞬間進來會被攤成 ≥0.2 s 一筆 (≤5/s)。
+        成功回 list (result.data 或 [])。失敗 (is_success 非 True / result 回空 / SDK 例外)
+        raise OrderLookupError,訊息含富邦原文 — caller **絕不可**把它當「查無」。"""
+        # 時鐘用 perf_counter (Windows 3.10 的 monotonic 只有 ~15.6 ms 解析度;Linux 兩者皆 ns)
+        with self._query_lock:
+            now = time.perf_counter()
+            slot = max(now, self._query_next_ts)
+            self._query_next_ts = slot + self.query_min_interval
+        wait = slot - time.perf_counter()
+        while wait > 0:                  # sleep 到時槽為止 (sleep 可能提早醒 → 迴圈保證不早於時槽)
+            time.sleep(wait)
+            wait = slot - time.perf_counter()
+        t0 = time.perf_counter()
+        try:
+            result = self.sdk.stock.get_order_results(self.account)
+        except Exception as e:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.info(f"[broker] order_results ok=False n=0 ms={ms} msg=例外: {e}")
+            raise OrderLookupError(f"get_order_results 例外: {e}") from e
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        ok = bool(result) and getattr(result, "is_success", None) is True
+        data = list(getattr(result, "data", None) or []) if ok else []
+        msg = str(getattr(result, "message", None) or "") if result else "result 回空"
+        logger.info(f"[broker] order_results ok={ok} n={len(data)} ms={ms} msg={msg or '-'}")
+        if not ok:
+            # 例「Login Error, 業務系統流量控管」(5/s 超限) — 是查詢失敗,不是清單為空
+            raise OrderLookupError(msg or "get_order_results 回 is_success=False")
+        return data
+
+    @staticmethod
+    def _order_row(o) -> dict:
+        """SDK 委託物件 → dict (snapshot / pending 共用;欄位 snake/camel 容錯;數量皆股數)。"""
+        after_qty = _attr(o, "after_qty", "afterQty", default=None)
+        try:
+            after_qty = int(after_qty) if after_qty is not None else None
+        except (TypeError, ValueError):
+            after_qty = None
+        status = _attr(o, "status", default=None)
+        return {
+            "order_no": str(getattr(o, "order_no", "") or ""),
+            "symbol": str(_attr(o, "stock_no", "symbol", default="") or ""),
+            "buy_sell": _norm_enum(getattr(o, "buy_sell", "") or ""),
+            "quantity": int(_attr(o, "quantity", default=0) or 0),
+            "filled_qty": int(_attr(o, "filled_qty", "filledQty", default=0) or 0),
+            "after_qty": after_qty,              # 改量後委託股數;缺欄回 None (caller 視同「未知」)
+            "status": "" if status is None else str(status),
+            "user_def": str(_attr(o, "user_def", "userDef", default="") or ""),
+            "_obj": o,                           # 原始 SDK 物件 — cancel_by_obj 免再查
+        }
+
+    def get_order_snapshot(self) -> list:
+        """一次查回券商**全部**委託 (撤單 worker / 券商權威掃單 / 同步撤單試一次共用)。
+
+        每項 {order_no, symbol, buy_sell, quantity, filled_qty, after_qty, status, user_def, _obj}。
+        失敗 raise OrderLookupError (含未連線/不健康 — 一律「查不到 ≠ 沒有」)。"""
+        try:
+            self._require_ready()
+        except RuntimeError as e:
+            raise OrderLookupError(str(e)) from e
+        return [self._order_row(o) for o in self._query_order_results()]
+
+    def _find_order_obj(self, order_no: str) -> tuple:
+        """回 (obj|None, snapshot_ok, message)。
+        snapshot_ok False = 查詢失敗 (message 含富邦原文,例「Login Error, 業務系統流量控管」);
+        snapshot_ok True 且 obj None = 清單無此書號 (message "NOT_FOUND")。"""
+        try:
+            data = self._query_order_results()
+        except OrderLookupError as e:
+            return None, False, str(e)
+        for o in data:
+            if str(getattr(o, "order_no", "") or "") == str(order_no):
+                return o, True, ""
+        return None, True, "NOT_FOUND"
+
     # ─── 撤單 ──────────────────────────────────────────────
 
-    def cancel(self, order_no: str, symbol: str = "", reason: str = ""):
-        """撤單 — 先 get_order_results 找 order object (踩雷點 #6)。
-        查無此委託 (已成交/已撤) → log 後靜默返回,不 raise。"""
+    def cancel_by_obj(self, order_obj, order_no: str, symbol: str = "",
+                      reason: str = "") -> None:
+        """用已拿到的委託物件直接撤 (worker 一次快照 → 多筆撤,免每筆再查)。
+        成功寫 CSV CANCEL 列 (extra=reason);失敗寫 extra=FAIL:<msg> 並
+        raise CancelRejected("撤單失敗 <書號>: <富邦原文>", filled_qty=, status=) — 原文供 session
+        classify_cancel_error 分類 (成交單/部分成交單/取消單已不允許取消),filled_qty/status 供立刻補成交。
+        SDK 例外 (傳輸層) 仍 raise 純 RuntimeError。CSV latency = 撤單 REST 往返 (不含查詢)。"""
         self._require_ready()
         ts_sent = time.time()
-        obj = self._find_order_obj(order_no)
-        if obj is None:
-            logger.warning(f"[broker] cancel {order_no}: 查無委託 (可能已成交/已撤)")
-            return
-        result = self.sdk.stock.cancel_order(self.account, obj)
+        try:
+            result = self.sdk.stock.cancel_order(self.account, order_obj)
+        except Exception as e:
+            msg = f"例外: {e}"
+            self._write_row(order_no, ts_sent, time.time(), "CANCEL", symbol, 0, "-",
+                            f"FAIL:{msg[:60]}")
+            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 例外: {e}")
+            raise RuntimeError(f"撤單失敗 {order_no}: {msg}") from e
         ts_accepted = time.time()
         # 與下單一致用 is True 判斷 (原 is not False 會把 None/缺失誤判為成功)
         ok = bool(result) and getattr(result, "is_success", None) is True
-        self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-",
-                        reason if ok else f"FAIL:{getattr(result, 'message', '?')}")
         if not ok:
-            raise RuntimeError(f"撤單失敗 {order_no}: {getattr(result, 'message', '?')}")
+            msg = str((getattr(result, "message", None) if result else None) or "cancel_order 回空")
+            self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-",
+                            f"FAIL:{msg[:60]}")
+            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 失敗: {msg}")
+            # 帶上手上物件的 filled_qty/status (撤單前快照值) — session 對「已成交」立刻補成交
+            try:
+                fq = int(_attr(order_obj, "filled_qty", "filledQty", default=0) or 0)
+            except (TypeError, ValueError):
+                fq = None
+            stt = _attr(order_obj, "status", default=None)
+            raise CancelRejected(f"撤單失敗 {order_no}: {msg}", filled_qty=fq,
+                                 status="" if stt is None else str(stt))
+        self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-", reason)
         logger.info(f"[broker] CANCEL {order_no} ({symbol}) reason={reason}")
 
-    def _find_order_obj(self, order_no: str):
-        result = self.sdk.stock.get_order_results(self.account)
-        if result and getattr(result, "is_success", False):
-            for o in (result.data or []):
-                if str(getattr(o, "order_no", "")) == str(order_no):
-                    return o
-        return None
+    def cancel(self, order_no: str, symbol: str = "", reason: str = "") -> None:
+        """撤單 facade: 快照找 order object (踩雷點 #6) → cancel_by_obj。**絕不靜默返回、絕不回 None 當成功**:
+          查詢失敗 (限流/斷線/例外) → CSV 列 FAIL:QUERY:<msg> + raise OrderLookupError
+          查詢成功但清單無此書號   → CSV 列 FAIL:NOT_FOUND     + raise OrderNotFound
+          撤單被券商拒            → CSV 列 FAIL:<msg>         + raise RuntimeError (cancel_by_obj)
+        2026-09-09 node3: 舊版對 None 只 log「查無委託」不 raise → 上層標 cancelled → 4 筆隱形裸單。
+        「查無」可能是後檯快照延遲或 5/s 限流,**不等於已成交/已撤** — 由 session 撤單佇列重試。"""
+        self._require_ready()
+        ts_sent = time.time()
+        obj, snapshot_ok, msg = self._find_order_obj(order_no)
+        if not snapshot_ok:
+            self._write_row(order_no, ts_sent, time.time(), "CANCEL", symbol, 0, "-",
+                            f"FAIL:QUERY:{msg[:60]}")
+            logger.error(f"[broker] cancel {order_no} ({symbol}): 委託查詢失敗 — {msg} (未送撤單)")
+            raise OrderLookupError(msg)
+        if obj is None:
+            self._write_row(order_no, ts_sent, time.time(), "CANCEL", symbol, 0, "-",
+                            "FAIL:NOT_FOUND")
+            logger.warning(f"[broker] cancel {order_no} ({symbol}): 快照查無此書號 "
+                           f"(≠ 已成交/已撤;可能後檯延遲,交由佇列重試)")
+            raise OrderNotFound(f"查無委託 {order_no} (快照內無此書號)")
+        self.cancel_by_obj(obj, order_no, symbol, reason)
 
     def get_inventories(self) -> list:
         """查庫存 (隔日賣標的用 — 隔天以券商庫存為準對帳)。
@@ -446,44 +593,35 @@ class RealOrderClient:
         return out
 
     def get_order_filled_lots(self, order_no: str) -> int:
-        """向券商查該委託的權威已成交張數。查無此單回 -1 (caller 保守處理)。
+        """向券商查該委託的權威已成交張數。查無此單**或查詢失敗**回 -1 (caller 保守處理)。
         用途: 撤預掛後、市價追差額前,防「fill 回報晚到 → 差額算全額 → 雙倍買」競態。"""
         self._require_ready()
-        obj = self._find_order_obj(order_no)
+        obj, snapshot_ok, msg = self._find_order_obj(order_no)
         if obj is None:
+            if not snapshot_ok:
+                logger.error(f"[broker] get_order_filled_lots {order_no}: 查詢失敗 — {msg} → 回 -1")
             return -1
         filled_qty = int(_attr(obj, "filled_qty", "filledQty", default=0) or 0)
         return filled_qty // 1000
 
     def get_filled_map(self) -> dict:
         """一次查回**所有**委託的權威已成交張數 {order_no: lots} — 斷線補收對帳用
-        (一次 REST 拿全部,不逐單查)。查詢失敗 raise,caller 處理。"""
+        (一次 REST 拿全部,不逐單查)。查詢失敗 raise OrderLookupError,caller 處理
+        (不再對 is_success=False 靜默回空 map — 空 map 會被當「補收 0 筆」)。"""
         self._require_ready()
-        result = self.sdk.stock.get_order_results(self.account)
         out = {}
-        if result and getattr(result, "is_success", False):
-            for o in (result.data or []):
-                no = str(getattr(o, "order_no", ""))
-                if no:
-                    out[no] = int(_attr(o, "filled_qty", "filledQty", default=0) or 0) // 1000
+        for o in self._query_order_results():
+            no = str(getattr(o, "order_no", "") or "")
+            if no:
+                out[no] = int(_attr(o, "filled_qty", "filledQty", default=0) or 0) // 1000
         return out
 
     def get_pending_orders(self) -> list:
-        """回當前委託清單 (重連/重啟重建 pending 用)。每項 dict。"""
-        self._require_ready()
-        result = self.sdk.stock.get_order_results(self.account)
-        out = []
-        if result and getattr(result, "is_success", False):
-            for o in (result.data or []):
-                out.append({
-                    "order_no": str(getattr(o, "order_no", "")),
-                    "symbol": str(_attr(o, "stock_no", "symbol", default="")),
-                    "buy_sell": _norm_enum(getattr(o, "buy_sell", "")),
-                    "quantity": int(_attr(o, "quantity", default=0) or 0),
-                    "filled_qty": int(_attr(o, "filled_qty", "filledQty", default=0) or 0),
-                    "status": str(getattr(o, "status", "")),
-                })
-        return out
+        """回當前委託清單 (重連/重啟重建 pending 用)。每項 dict = get_order_snapshot 去 _obj
+        (含 user_def / after_qty)。查詢失敗 raise OrderLookupError — 不再靜默回 []
+        (空清單會被當「沒有 pending」)。"""
+        return [{k: v for k, v in row.items() if k != "_obj"}
+                for row in self.get_order_snapshot()]
 
     # ─── SDK 回報 handlers (SDK thread 進來) ────────────────
 
@@ -518,26 +656,36 @@ class RealOrderClient:
             logger.exception(f"[broker] filled handler 例外: {e}")
 
     def _handle_order(self, err, content):
-        if err:
-            logger.error(f"[broker] order 回報 err: {err}")
-            return
+        """委託/改撤單回報 (SDK thread)。**err 分支照樣轉發、不 return** — 撤單失敗
+        (ft=30 status=39,「取消單已不允許取消」等) 是走 err 參數進來的,舊版直接 return →
+        session 永遠看不到撤單失敗 (2026-09-09)。status 39 的 content 多數欄位 None,取值全容錯;
+        function_type 保留原值 (int/str/None),由 session 轉 str 比較。"""
         try:
-            acct = str(_attr(content, "account", default=""))
+            acct = str(_attr(content, "account", default="") or "")
             if acct and self.account_no and acct != self.account_no:
                 return
+            status = _attr(content, "status", default=None)
             rpt = {
-                "order_no": str(_attr(content, "order_no", "orderNo", default="")),
-                "symbol": str(_attr(content, "stock_no", "symbol", default="")),
-                "status": str(getattr(content, "status", "")),
+                "order_no": str(_attr(content, "order_no", "orderNo", default="") or ""),
+                "symbol": str(_attr(content, "stock_no", "symbol", default="") or ""),
+                "status": "" if status is None else str(status),
                 "filled_qty": int(_attr(content, "filled_qty", "filledQty", default=0) or 0),
                 "error_message": str(_attr(content, "error_message", "errorMessage", default="") or ""),
                 "function_type": _attr(content, "function_type", "functionType", default=None),
                 # 富邦回報「最後異動時間」(毫秒,如 "10:44:05.796") — 新單接受回報 = 委託被接受時戳
                 "last_time": str(_attr(content, "last_time", "lastTime", default="") or ""),
             }
-            logger.info(f"[broker] 委託回報 {rpt['symbol']} order={rpt['order_no']} "
-                        f"status={rpt['status']} last_time={rpt['last_time'] or '-'} "
-                        f"err={rpt['error_message'] or '-'}")
+            if err:
+                # err 原文例 "[115]證券委託目前狀態取消單已不允許取消交易";content.error_message 通常同文
+                if not rpt["error_message"]:
+                    rpt["error_message"] = str(err)
+                logger.error(f"[broker] 委託回報 err={err} order={rpt['order_no'] or '-'} "
+                             f"{rpt['symbol'] or '-'} ft={rpt['function_type']} "
+                             f"status={rpt['status'] or '-'} msg={rpt['error_message']}")
+            else:
+                logger.info(f"[broker] 委託回報 {rpt['symbol']} order={rpt['order_no']} "
+                            f"ft={rpt['function_type']} status={rpt['status']} "
+                            f"last_time={rpt['last_time'] or '-'} err={rpt['error_message'] or '-'}")
             if self.on_order:
                 self.on_order(rpt)
         except Exception as e:

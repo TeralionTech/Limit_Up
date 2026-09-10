@@ -10,26 +10,17 @@ import time
 from datetime import time as dtime
 
 from test_session_money import make_session
+from fakes_cancel import FakeSnapshotBroker
 
 
-class RejectBroker:
-    """reject-forever: 記 (symbol, monotonic ts),送出即以非致命拒單 → cadence 續送,量純節拍。"""
-    connected = True
-    healthy = True
+class RejectBroker(FakeSnapshotBroker):
+    """reject-forever: 記 (symbol, monotonic ts),送出即以非致命拒單 → cadence 續送,量純節拍。
+    其餘 (預掛/撤單/快照 get_order_snapshot / cancel_by_obj / get_pending_orders) 沿用 FakeSnapshotBroker。"""
 
     def __init__(self, lat=0.0):
+        super().__init__(default_status="", user_def="hitlimit", lenient_cancel=True)
         self.lat = lat
         self.ev = []                       # [(symbol, ts)]
-        self._lk = threading.Lock()
-        self._n = 0
-
-    def _no(self):
-        with self._lk:
-            self._n += 1
-            return f"O{self._n}"
-
-    def place_limit_buy(self, *a):
-        return self._no()
 
     def place_market_buy(self, sym, lots):
         with self._lk:
@@ -38,27 +29,8 @@ class RejectBroker:
             time.sleep(self.lat)
         raise Exception("集合競價時段不可輸入市價委託")   # 非致命 → 續送
 
-    def place_market_sell(self, *a, **k):
-        return self._no()
-
-    def place_limit_sell(self, *a, **k):
-        return self._no()
-
-    def cancel(self, *a, **k):
-        pass
-
     def get_order_filled_lots(self, o):
         return 0
-
-    def get_inventories(self):
-        return []
-
-    def get_filled_map(self):
-        return {}
-
-    def status(self):
-        return {"connected": True, "healthy": True, "account_masked": "x",
-                "is_test": True, "error": ""}
 
 
 def _run(nsym, dur=1.0, lat=0.0):

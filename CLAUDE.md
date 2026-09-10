@@ -53,7 +53,7 @@ sdk.accounting.bank_remain(account)
 sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 ```
 
-## 八個易踩雷點
+## 十一個易踩雷點
 
 1. `Order.price` 是**字串**;市價 = `None`/`"0"` + `PriceType.Market`
 2. `Order.quantity` 是**股數**(張 × 1000);`modify_quantity` 也收股數
@@ -63,6 +63,25 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 6. 撤/改單要先 `get_order_results` 找 order object
 7. `pfx_password` 空字串 → `sdk.login` 只能傳 3 個參數
 8. 失敗有兩種:raise 例外 或 `result.is_success == False`(都要接)
+9. **`get_order_results` 是後檯快照且受「帳務查詢 5/秒」流量控管**:超限回
+   `Result{is_success:False, message:"Login Error, 業務系統流量控管"}`(**非例外**);剛 ack 的委託也可能
+   延遲數百 ms、逐筆亂序才出現在快照。本專案所有 `get_order_results` 一律走 `broker._query_order_results`
+   (5/s 閘門,最小間隔 `QUERY_MIN_INTERVAL_SEC`;鎖內排時槽、鎖外 sleep),查詢失敗 raise `OrderLookupError`
+   (含富邦原文)、清單無此書號 raise `OrderNotFound` — **兩者都不是「已成交/已撤」**,絕不可靜默當成功
+   (2026-09-09 node3:8 條撤單 thread 0.66 s 內 8 次查詢 → 限流被當「查無」→ 誤標 cancelled → 4 筆隱形裸單)
+10. **查無 ≠ 已成交/已撤**:快照含當日**所有**委託(已撤 status 30、全成 50 都還在清單裡),所以撤單前
+    「找不到」只代表快照還沒同步/查詢失敗。`order_log` 的 `cancelled` 只能由券商確認寫入
+    (`cancel_by_obj` 成功 / 委託回報 ft=30 status 30|40 / 訊息「取消單已不允許取消」);
+    撤不到的單留 `pending` + `cancel_state=queued|sent|unconfirmed` 交 `trading_session` 撤單佇列 worker
+    重試(退避 0.3→5 s,WARNING@3、CRITICAL@6,trading_end+10 分放棄仍 CRITICAL 點名),
+    13:23 收盤另做**券商權威掃單**(快照中 `user_def=="hitlimit"` 且 Buy 且 status ∈ {0,4,8,10} 且
+    `after_qty>filled_qty` 者,不看本地標成什麼,一律撤)。盤後可用 `scripts/post_close_check.py` 唯讀核對
+11. **撤單回報 `function_type=30`**:第一筆 `status=4` 是撤單請求的**回聲**(不是撤成),`status 30|40`
+    才是券商確認撤單;`status 39`/撤單失敗回報是走 **callback 的 `err` 參數**進來的(content 多數欄位
+    None),`set_on_order` handler 在 err 分支不可直接 return(舊版就是這樣漏掉所有撤單失敗)。
+    撤單失敗原文分類:「成交單/部分成交單已不允許取消」= 已成交(用快照 filled_qty 補成交,不標 cancelled)、
+    「取消單已不允許取消」= 早已撤(冪等標 cancelled)、其他 = 重試。新單拒單(ft 0/10,例集合競價 9049)
+    的 `order_no` 可能是 None/不在 order_log → 只 log、不動任何 st
 
 ## 台股市場規則 (影響判斷邏輯)
 
@@ -73,8 +92,11 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - **交易 API 速率上限**(llms-full.txt 明定):**下單 50/秒**、批次下單 10/秒、
   帳務查詢 5/秒、連線數 10。本專案送單全過 session 的 `SendRateLimiter`
   **爆發式滑動窗口**(`ORDER_MAX_PER_SEC=45`/秒,一秒最前面可全部送出,非均勻間隔;
-  進場/出場/撤單共用額度)。帳務查詢另走 `_query_gate` 5/秒;
+  進場/出場/撤單共用額度)。帳務/委託查詢的 5/秒閘門**在 broker 層**(`_query_order_results`,
+  所有 `get_order_results` 唯一入口;撤單 worker 一輪只查一次快照再扇出撤單);
   `ORDER_MIN_INTERVAL_SEC=0.2` 只作市價追**失敗後**的單檔退避
+- **已接受風險(2026-09-09 定案)**:市價盲送管線化下,同檔最多 `CHASE_MAX_INFLIGHT`×lots 張在飛,
+  第一筆成功後其餘「多送的 M」靠撤單佇列在 ≤1.5 s 內收掉(收不掉 = 超買,由出場全量賣;絕不變隱形裸單)
 
 ## 本專案架構速覽
 
@@ -82,7 +104,10 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - `runner.py` 主流程 singleton:login → universe → 抓漲停價(節流+重試到 08:28)→ subscribe → 篩選 → trader
 - `filter.py` 8:30–9:00 mark/unmark 邏輯(漲停鎖死=只有委買+買一=漲停)
 - `trader.py` 9:00 後追蹤(第一盤檢查 → 盤中追蹤);監控與下單分離
-- `broker.py` 富邦真單 client;`trading_session.py` 模式/連線/預算/kill switch
+- `broker.py` 富邦真單 client(`get_order_snapshot`/`cancel_by_obj`/`cancel` facade;`OrderLookupError` vs
+  `OrderNotFound`);`trading_session.py` 模式/連線/預算/kill switch + **撤單佇列 worker**
+  (`request_cancel` → `_cancel_worker_run_once`;`cancel_all_pending` 含券商權威掃單 + 同步 drain;
+  盤中 09:05–13:20 每 60 s `intraday_reconcile_once`,`INTRADAY_SWEEP_DRY_RUN` 預設 true 只 log)
 - `state.py` marked/discarded/開盤即鎖 (thread-safe);`subscriber.py` 多帳號多 socket WS
 - 前端 React+Vite 在 `frontend/`(dist 不進 git,本機 build 後 scp 上 VPS)
 

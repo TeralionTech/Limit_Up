@@ -6,48 +6,20 @@ FakeBroker 滿足 _broker_ready (connected/healthy) — 不需要富邦 SDK。
 import pytest
 
 from trading_session import TradingSession
+from fakes_cancel import FakeSnapshotBroker
 
 
-class FakeBroker:
+class FakeBroker(FakeSnapshotBroker):
+    """舊測試用假 broker — 記錄 placed / cancelled / calls (格式不變),外加券商快照契約
+    (get_order_snapshot / cancel_by_obj / get_pending_orders;2026-09-09 事故 A7):
+      - cancel() facade = 快照找 obj → cancel_by_obj;**lenient**: 測試直接 _log_order 灌進 session、
+        fake 沒下過的書號視為存在 (只有 snapshot_missing 才算查無 → OrderNotFound)
+      - 快照 status 預設 "" (未知): 這個 fake 看不到測試直接餵 session 的成交/拒單 (_on_fill/_on_order),
+        若預設 "10" (live),cancel_all_pending 的券商權威掃單會把本地已 filled/rejected 的單當
+        「券商仍 live」補撤 → 既有「只撤 pending」斷言破功。要驗掃單/分類請設 snapshot_status[no]。"""
+
     def __init__(self):
-        self.connected = True
-        self.healthy = True
-        self.placed = []          # (kind, symbol, price, lots)
-        self.cancelled = []       # (order_no, symbol, reason)
-        self.calls = []           # 依序記錄 (kind, ref) — 驗證「市價單先於撤單」
-        self._n = 0
-
-    def _next(self):
-        self._n += 1
-        return f"O{self._n}"
-
-    def place_limit_buy(self, symbol, price, lots):
-        no = self._next()
-        self.placed.append(("limit_buy", symbol, price, lots))
-        self.calls.append(("limit_buy", symbol))
-        return no
-
-    def place_market_buy(self, symbol, lots):
-        no = self._next()
-        self.placed.append(("market_buy", symbol, None, lots))
-        self.calls.append(("market_buy", symbol))
-        return no
-
-    def place_market_sell(self, symbol, lots, reason=""):
-        no = self._next()
-        self.placed.append(("market_sell", symbol, None, lots))
-        self.calls.append(("market_sell", symbol))
-        return no
-
-    def place_limit_sell(self, symbol, price, lots, reason=""):
-        no = self._next()
-        self.placed.append(("limit_sell", symbol, price, lots))
-        self.calls.append(("limit_sell", symbol))
-        return no
-
-    def cancel(self, order_no, symbol, reason=""):
-        self.cancelled.append((order_no, symbol, reason))
-        self.calls.append(("cancel", order_no))
+        super().__init__(default_status="", user_def="hitlimit", lenient_cancel=True)
 
     def get_order_filled_lots(self, order_no):
         # 2026-08-03 定案: 首筆成交快路徑不再查權威成交量 (速度優先) — 有人呼叫就是退化
@@ -68,9 +40,11 @@ class FakeBroker:
 def make_session(total=1_000_000, per_symbol=200_000,
                  sizing_mode="budget", fixed_lots=0):
     s = TradingSession()
+    s.auto_cancel_worker = False    # 撤單 worker 不自動起 thread — 測試以 _cancel_worker_run_once() 同步驅動
     s.roll_day("2026-08-03")
     s.set_mode("real")
     s.broker = FakeBroker()
+    s.broker.mirror_session = s     # 測試直接 _log_order 灌的孤兒單也進券商快照 (見 FakeSnapshotBroker 說明)
     s.set_params(total_budget=total, per_symbol_budget=per_symbol,
                  sizing_mode=sizing_mode, fixed_lots=fixed_lots)
     s.set_armed(True)

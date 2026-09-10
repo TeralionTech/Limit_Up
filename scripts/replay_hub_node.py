@@ -34,7 +34,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.replay_day import (FrozenDatetime, _set_clock, ReplayBroker,  # noqa: E402,F401
-                                _pick, _load_json, run as run_standalone)
+                                _pick, _load_json, run as run_standalone,
+                                run_cancel_worker_once)
 import trading_session as ts_mod     # noqa: E402
 from state import State              # noqa: E402
 from filter import make_on_book_handler  # noqa: E402
@@ -49,6 +50,7 @@ OPEN_TIME = dtime(9, 0, 0)
 def _mk_session(args):
     """node 端 session — 與 replay_day.run() 的 session 設定完全同款 (公平 A/B)。"""
     s = TradingSession()
+    s.auto_cancel_worker = False   # 撤單佇列 worker 不自起 thread — 每步後同步 run_once (2026-09-09)
     s.roll_day(args.date)
     s.set_mode("real")
     s.broker = ReplayBroker()
@@ -197,6 +199,8 @@ def run_hub_node(args):
                                 if bp is not None and abs(float(bp) - lu) < 0.001:
                                     ctx["node_bid_at_limit"][symbol] = int(_pick(b, "size") or 0)
                                     break
+                # 撤單佇列 worker 同步跑一輪 (unmark → 撤單若查無/查詢失敗會入佇列;每步驅動)
+                run_cancel_worker_once(node_session)
 
         # 檔案在 09:00 前就結束 (不完整資料) 的保護
         if ctx["phase"] == "hub":
@@ -204,6 +208,7 @@ def run_hub_node(args):
             ctx["phase"] = "node_window"
         if ctx["phase"] == "node_window":
             do_node_pre_order()
+        run_cancel_worker_once(node_session)
     finally:
         ts_mod.time = orig_time_mod
 

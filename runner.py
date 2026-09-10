@@ -255,6 +255,24 @@ class Runner:
         self.session.set_untradable(t30_set)                # T30 全額交割禁單 (08-12 事故防線)
         return marked
 
+    def _reset_daily_state(self):
+        """每輪 runner 啟動都清掉上一輪的盤前參考資料 (2026-09-10 node4 事故)。
+
+        Runner 是 process 常駐 singleton。standalone/hub 每天在 _run_all_phases 重建 limit_ups
+        (_load_or_fetch_limit_ups),但 **node 路徑不會** — limit_ups/limit_downs/dispositions/
+        day_tradable 只被 _apply_marked_snapshot 與 _query_limit_up 就地 mutate、從不清空:
+        昨日快照種進來的「5386 漲停 283 / 昨日跌停價」活到今天 → _prepare_overnight 拿到快取就跳過補查
+        → 隔日賣「委買一 ≥ 283 = 鎖著續抱」永遠成立、漲停打開也不賣;賣價用昨日跌停價還會被交易所退。
+        這些資料每天都可重抓,一律清空 (同日手動重啟也清 — 重抓成本可忽略)。"""
+        self.universe = []
+        self.limit_ups = {}
+        self.limit_downs = {}
+        self.dispositions = {}
+        self.day_tradable = {}
+        self._node_bid_vol_fallback = {}
+        self._marked_frozen = False
+        self._limit_up_progress = {"done": 0, "total": 0, "ok": 0, "fail": 0}
+
     def _prepare_overnight(self, output_dir) -> list:
         """載入隔日賣清單 (昨天買到未出場的持倉) + 補查今日漲停/跌停價 → 交給 session。
         standalone 與 node 共用 (避免兩路徑漂移)。回 overnight_syms。
@@ -262,31 +280,64 @@ class Runner:
         出場=跌停價限價賣;漲停價=鎖漲停續抱判斷 (隔日賣標的可能不在今日 limit_ups 抓取範圍)。
         查無漲停價 → 該檔續抱功能停用退回開盤即賣。
         ⚠ 漲停價收進獨立 _overnight_ups 傳 session,**絕不寫 self.limit_ups** — filter handler closure
-        捕獲該 dict,混入會讓 8:30 篩選把昨日持倉當新標的 mark → 預掛買單加碼!"""
+        捕獲該 dict,混入會讓 8:30 篩選把昨日持倉當新標的 mark → 預掛買單加碼!
+        2026-09-10: **一律重查、不信任 self.limit_ups 快取** (node 的快取曾是昨日殘值);
+        node 另在 08:30 與 08:59:50 用 _refresh_overnight_prices 再查 (require_today)。"""
         self._load_overnight_file(output_dir)
         overnight_syms = self.session.overnight_symbols()
+        ups = self._query_overnight_prices(overnight_syms, attempts=3, sleep_sec=1.0)
+        self._push_overnight_prices(ups)
+        return overnight_syms
+
+    def _query_overnight_prices(self, syms: list, attempts: int = 3, sleep_sec: float = 1.0,
+                                require_today: bool = False) -> dict:
+        """逐檔 REST 補查隔日賣標的的今日漲停價 (副作用: _query_limit_up 順便寫 limit_downs/
+        dispositions/day_tradable)。回 {sym: limit_up};查無的檔不在回傳裡 (由 caller 決定 fallback)。
+        require_today=True → 回應 date 非今日視為尚未換日 (第二道防線)。"""
+        if not syms:
+            return {}
         _stock = self.sdk.marketdata.rest_client.stock
-        _overnight_ups: dict = {}
-        for _s in overnight_syms:
-            up = self.limit_ups.get(_s)            # universe 抓過的直接複用 (node 為空 → 走補查)
-            if up is None or _s not in self.limit_downs:
-                for _try in range(3):              # 小重試 (原本單次靜默失敗)
-                    got = self._query_limit_up(_stock, _s)   # 副作用寫 dispositions/limit_downs
-                    if got:
-                        up = up or got
-                        break
-                    time.sleep(1)
+        ups: dict = {}
+        for _s in syms:
+            up = None
+            for _try in range(attempts):
+                up = (self._query_limit_up(_stock, _s, require_today=True) if require_today
+                      else self._query_limit_up(_stock, _s))
+                if up:
+                    break
+                if _try < attempts - 1:
+                    time.sleep(sleep_sec)
             if up:
-                _overnight_ups[_s] = float(up)
+                ups[_s] = float(up)
             else:
                 logger.warning(f"[runner] 隔日賣 {_s} 查無今日漲停價 → "
                                f"鎖漲停判斷停用 (無市價列時開盤即賣)")
-        # 跌停價/處置股/隔日賣漲停價交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)
+        return ups
+
+    def _push_overnight_prices(self, ups: dict):
+        """把補查結果交給交易會話 (出場=跌停價限價賣,2026-08-12 定案)。
+        漲停價用「合併」— 重查失敗的檔保留先前值,不會把已知值洗掉。"""
         self.session.set_limit_downs(self.limit_downs)
         self.session.set_dispositions(self.dispositions)   # 補查後含隔日賣標的的處置股資訊
         self.session.set_day_tradable(self.day_tradable)   # 補查後含隔日賣標的的禁現沖資訊
-        self.session.set_overnight_limit_ups(_overnight_ups)
-        return overnight_syms
+        merged = dict(getattr(self.session, "overnight_limit_ups", {}) or {})
+        merged.update(ups)
+        self.session.set_overnight_limit_ups(merged)
+
+    def _refresh_overnight_prices(self, attempts: int = 1, sleep_sec: float = 0.0,
+                                  label: str = "") -> dict:
+        """再查一次隔日賣標的的今日漲停/跌停價並覆寫 session (require_today)。
+        node 在 08:30 與 08:59:50 (拉快照前) 各叫一次 — 08:00 查到的可能還是昨日值,
+        且 UI 盤中新增的隔日賣標的也在此補到價格。"""
+        syms = self.session.overnight_symbols()
+        if not syms:
+            return {}
+        ups = self._query_overnight_prices(syms, attempts=attempts, sleep_sec=sleep_sec,
+                                           require_today=True)
+        self._push_overnight_prices(ups)
+        logger.info(f"[runner] 隔日賣價格重查 ({label or 'refresh'}): 漲停 {ups} / "
+                    f"跌停 { {s: self.limit_downs.get(s) for s in syms} }")
+        return ups
 
     def _run_node_phases(self):
         """ROLE=node: 略過 universe/limit_ups/filter;等到 HUB_FREEZE_TIME 向 Hub 拉 marked 快照 →
@@ -310,9 +361,15 @@ class Runner:
         overnight_syms = self._prepare_overnight(output_dir)
         if overnight_syms:
             logger.info(f"[node] 隔日賣標的 {len(overnight_syms)} 檔 → 一併訂閱、9:00 開盤賣")
+            # 2026-09-10 node4 事故: 08:00 查到的漲停/跌停價可能是昨日值 → 08:30 再查一次
+            # (要求回應 date == 今日),08:59:50 拉快照前最後再確認一次 (下面)。
+            self._wait_until_clock("08:30:00")
+            self._refresh_overnight_prices(attempts=3, sleep_sec=1.0, label="08:30")
 
         # 等到 Hub 凍結時點才拉 (免 08:00–08:59:50 空輪詢);死線 = 預掛前 1 秒 (08:59:57)
         self._wait_until_clock(self.cfg.hub_freeze_time)
+        if overnight_syms:
+            self._refresh_overnight_prices(attempts=1, sleep_sec=0.0, label="freeze")
         pre_t = self._parse_time_hhmm(self.cfg.pre_order_time) or dtime(8, 59, 58)
         now = datetime.now()
         deadline_ts = now.replace(hour=pre_t.hour, minute=pre_t.minute,
@@ -403,6 +460,8 @@ class Runner:
         # 每日重置交易 state (新交易日 → 清前日 trades/委託表/預算 + armed=False;
         # 同日手動重啟 → 保留當日 state。連線不動。)
         self.session.roll_day(datetime.now().strftime("%Y-%m-%d"))
+        # 盤前參考資料 (漲停/跌停/處置/現沖/母體) 每輪清空重抓 — 2026-09-10 node4 事故
+        self._reset_daily_state()
 
         # 交易會話策略參數 (500 上限 / 送單間隔 / 13:23 撤單時點)
         self.session.configure(
@@ -582,6 +641,9 @@ class Runner:
         )
         # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
         self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
+        # 收盤後才確認的撤單/成交 (撤單佇列晚結案) → 重寫隔日賣清單 (2026-09-09 A4b)
+        if hasattr(self.session, "on_late_confirm"):
+            self.session.on_late_confirm = self._write_overnight_file
         self.trader.start()
 
         # 種子化首筆成交 — 開盤撮合 trade 可能在 handler 掛上前就到了
@@ -1130,13 +1192,20 @@ class Runner:
         self._limit_up_progress["fail"] = total - len(result)
         return result
 
-    def _query_limit_up(self, stock, sym: str):
+    def _query_limit_up(self, stock, sym: str, require_today: bool = False):
         """查單檔漲停價 — 回 float 或 None (空值/例外都回 None，交給重試補)。
         順便記 isDisposition (處置股,下單機制用) 與 limitDownPrice (跌停價,
-        出場跌停限價賣用,2026-08-12 — 同一個回應,零額外 REST 成本)。"""
+        出場跌停限價賣用,2026-08-12 — 同一個回應,零額外 REST 成本)。
+        require_today=True: 富邦 ticker 回應的必填 `date` 欄 != 今日 → 視為尚未換日,回 None
+        且不寫任何副作用 (2026-09-10 隔日賣重查用;hub 全母體迴圈不啟用,只交給截止重試)。"""
         try:
             resp = stock.intraday.ticker(symbol=sym)
             up = resp.get("limitUpPrice") or resp.get("limit_up")
+            resp_date = str(resp.get("date") or "")
+            if require_today and resp_date and resp_date != datetime.now().strftime("%Y-%m-%d"):
+                logger.warning(f"[runner] {sym} ticker date={resp_date} 非今日 → 視為尚未換日"
+                               f" (limitUp={up} 不採用)")
+                return None
             if up:
                 self.dispositions[sym] = bool(resp.get("isDisposition"))
                 # canDayTrade=False = 禁現沖 → 下單減半 (風控①,官方 key 是 canDayTrade)

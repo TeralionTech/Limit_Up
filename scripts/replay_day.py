@@ -77,8 +77,24 @@ def _set_clock(dt):
 CHASE_SEND_INTERVAL = 0.05   # replay 模型的管線送單節奏 (production 是 45/s≈22ms;此處夠覆蓋開盤轉換)
 
 
+# 撤單查詢例外 (2026-09-09 事故 A1): 優先用 broker 的類;session 端以類名判斷,同名備援亦通
+try:
+    from broker import OrderLookupError, OrderNotFound   # noqa: E402
+except Exception:                                        # pragma: no cover
+    class OrderLookupError(RuntimeError):
+        """查詢失敗 — 與 broker.OrderLookupError 同名備援。"""
+
+    class OrderNotFound(RuntimeError):
+        """查詢成功但清單無此書號 — 與 broker.OrderNotFound 同名備援。"""
+
+
 # ─── ReplayBroker: 仿 tests FakeBroker,只記錄,不打真 API ───
 class ReplayBroker:
+    """含券商「委託快照」契約 (2026-09-09 事故 A7): get_order_snapshot 預設回所有已下且未取消的單;
+    cancel() facade = 快照找 obj → cancel_by_obj (查無 raise OrderNotFound、查詢失敗 raise OrderLookupError)。
+    旋鈕: snapshot_missing / snapshot_status / snapshot_filled / cancel_fail_msg / fail_snapshot_times /
+    snapshot_calls (與 tests/fakes_cancel.FakeSnapshotBroker 同義;replay 平時全空 = 券商即時同步)。"""
+
     def __init__(self):
         self.connected = True
         self.healthy = True
@@ -88,13 +104,28 @@ class ReplayBroker:
         self._decision = {}       # symbol → "accept"/"reject" (driver 於送出當下決定)
         self.opened = set()       # 已開盤 (無 driver 決定時的 fallback)
         self._n = 0
+        # 券商端委託簿 (快照來源)
+        self.book = {}            # order_no → {order_no, symbol, buy_sell, quantity, filled_qty, after_qty, status, user_def}
+        self.cancelled_nos = set()
+        self.snapshot_missing = set()
+        self.snapshot_status = {}
+        self.snapshot_filled = {}
+        self.cancel_fail_msg = {}
+        self.fail_snapshot_times = 0
+        self.snapshot_calls = 0
 
     def _next(self):
         self._n += 1
         return f"R{self._n}"
 
+    def _register(self, no, symbol, buy, lots):
+        self.book[no] = {"order_no": no, "symbol": symbol, "buy_sell": "Buy" if buy else "Sell",
+                         "quantity": lots * 1000, "filled_qty": 0, "after_qty": lots * 1000,
+                         "status": "10", "user_def": "hitlimit"}
+
     def place_limit_buy(self, symbol, price, lots):
         no = self._next()
+        self._register(no, symbol, True, lots)
         self.placed.append(("limit_buy", symbol, price, lots))
         return no
 
@@ -106,21 +137,64 @@ class ReplayBroker:
             self.rejected.append((symbol, lots))
             raise RuntimeError(f"下單被拒 {symbol}: {CALL_AUCTION_REJECT}")
         no = self._next()
+        self._register(no, symbol, True, lots)
         self.placed.append(("market_buy", symbol, None, lots))
         return no
 
     def place_market_sell(self, symbol, lots, reason=""):
         no = self._next()
+        self._register(no, symbol, False, lots)
         self.placed.append(("market_sell", symbol, None, lots))
         return no
 
     def place_limit_sell(self, symbol, price, lots, reason=""):
         no = self._next()
+        self._register(no, symbol, False, lots)
         self.placed.append(("limit_sell", symbol, price, lots))
         return no
 
-    def cancel(self, order_no, symbol, reason=""):
+    # ── 券商快照契約 ──
+    def _snapshot_row(self, no, row):
+        status = self.snapshot_status.get(no, "30" if no in self.cancelled_nos else row["status"])
+        fields = {**row, "status": str(status),
+                  "filled_qty": int(self.snapshot_filled.get(no, row["filled_qty"]))}
+        return {**fields, "_obj": SimpleNamespace(stock_no=row["symbol"], **fields)}
+
+    def get_order_snapshot(self):
+        self.snapshot_calls += 1
+        if self.fail_snapshot_times > 0:
+            self.fail_snapshot_times -= 1
+            raise OrderLookupError("Login Error, 業務系統流量控管")
+        return [self._snapshot_row(no, row) for no, row in self.book.items()
+                if no not in self.snapshot_missing and no not in self.cancelled_nos]
+
+    def get_pending_orders(self):
+        return [{k: v for k, v in r.items() if k != "_obj"} for r in self.get_order_snapshot()]
+
+    def cancel_by_obj(self, order_obj, order_no, symbol="", reason=""):
+        msg = self.cancel_fail_msg.get(order_no)
+        if msg is not None:
+            raise RuntimeError(f"撤單失敗 {order_no}: {msg}")
+        if order_no in self.cancelled_nos:
+            raise RuntimeError(f"撤單失敗 {order_no}: [115]證券委託目前狀態取消單已不允許取消交易")
+        self.cancelled_nos.add(order_no)
+        if order_no in self.book:
+            self.book[order_no]["status"] = "30"
         self.cancelled.append((order_no, symbol, reason))
+
+    def cancel(self, order_no, symbol="", reason=""):
+        entry = next((r for r in self.get_order_snapshot() if r["order_no"] == order_no), None)
+        if entry is None:
+            if order_no in self.cancelled_nos and order_no not in self.snapshot_missing:
+                raise RuntimeError(f"撤單失敗 {order_no}: [115]證券委託目前狀態取消單已不允許取消交易")
+            raise OrderNotFound(f"查無委託 {order_no} (快照內無此書號)")
+        self.cancel_by_obj(entry["_obj"], order_no, symbol, reason)
+
+    def get_order_filled_lots(self, order_no):
+        for r in self.get_order_snapshot():
+            if r["order_no"] == order_no:
+                return r["filled_qty"] // 1000
+        return -1
 
     def get_inventories(self):
         return []
@@ -131,6 +205,15 @@ class ReplayBroker:
     def status(self):
         return {"connected": True, "healthy": True,
                 "account_masked": "replay", "is_test": True, "error": ""}
+
+
+def run_cancel_worker_once(session):
+    """每步之後同步驅動撤單佇列 worker 一輪 (session 有此方法才呼叫;舊碼無 → no-op)。
+    replay 單執行緒:session.auto_cancel_worker=False 讓 worker 不自起 daemon thread。"""
+    fn = getattr(session, "_cancel_worker_run_once", None)
+    if fn is None:
+        return None
+    return fn()
 
 
 def _pick(d, *keys):
@@ -190,6 +273,7 @@ def run(args):
     # ── 建 State + Session (ReplayBroker) ──
     state = State(bid_drop_ratio=args.bid_drop_ratio)
     session = TradingSession()
+    session.auto_cancel_worker = False   # 撤單佇列 worker 不自起 thread — 每步後同步 run_once (2026-09-09)
     session.roll_day(args.date)
     session.set_mode("real")
     broker = ReplayBroker()
@@ -406,6 +490,8 @@ def run(args):
 
                 # 市價追: 先結算到 dt 為止已回來的送單結果 (worker thread 與行情 thread 並行)
                 run_due_chase(dt)
+                # 撤單佇列 worker 同步跑一輪 (production 是 daemon thread;replay 每步驅動,確定性)
+                run_cancel_worker_once(session)
 
                 symbol = _pick(data, "symbol")
                 if not symbol:
@@ -451,6 +537,7 @@ def run(args):
             if c["done"] is None:
                 c["done"] = "eof"
                 _fake_fill(sym)
+        run_cancel_worker_once(session)     # 收尾: 佇列裡的撤單再跑一輪
     finally:
         ts_mod.time = orig_time_mod
 
