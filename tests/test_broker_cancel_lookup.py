@@ -176,15 +176,33 @@ class TestCancelLookup:
 # ═══ 查詢閘門 5/s ═══════════════════════════════════════════════
 
 class TestQueryGate:
-    def test_eight_threads_never_exceed_five_per_second(self, client):
-        # 09-09 node3: 8 條撤單 thread 0.66 s 內 8 次查詢 (≈12/s) → 流量控管。閘門下任一 1 s 滑動窗 ≤5。
+    def test_eight_threads_single_flight_and_never_exceed_five_per_second(self, client):
+        # 09-09 node3: 8 條撤單 thread 0.66 s 內 8 次查詢 (≈12/s) → 流量控管。
+        # 2026-09-15 single-flight (09-14 node1 清單 3.4 萬筆、每次查詢 ≈540 MB、重疊 → 當機):
+        #   (a) 8 條同時查 → SDK 只被呼叫 1 次、8 條共用同一份結果
+        #   (b) 各自要求新查詢 (fresh_after) 時仍過 5/s 閘門: 相鄰 ≥0.2 s、任一 1 s 滑動窗 ≤5、SDK 同時最多 1 個在飛
         sdk = FakeSDK([_res(True, [_order("K1")])])
+        inflight = {"now": 0, "max": 0}
+        lk = threading.Lock()
+        orig_get = sdk._get
+
+        def slow_get(account):
+            with lk:
+                inflight["now"] += 1
+                inflight["max"] = max(inflight["max"], inflight["now"])
+            try:
+                time.sleep(0.3)                    # 大清單查詢耗時 → 其餘 thread 必定撞上在飛那次
+                return orig_get(account)
+            finally:
+                with lk:
+                    inflight["now"] -= 1
+        sdk.stock.get_order_results = slow_get
         client.sdk = sdk
-        errors = []
+        errors, results = [], []
 
         def _q():
             try:
-                client.get_order_snapshot()
+                results.append(client.get_order_snapshot())
             except Exception as e:      # noqa: BLE001
                 errors.append(e)
         ths = [threading.Thread(target=_q, daemon=True) for _ in range(8)]
@@ -193,8 +211,31 @@ class TestQueryGate:
         for t in ths:
             t.join(timeout=10)
         assert not any(t.is_alive() for t in ths) and errors == []
+        assert len(sdk.query_ts) == 1                                   # (a) single-flight
+        assert len(results) == 8 and all([r["order_no"] for r in res] == ["K1"] for res in results)
+
+        # (b) 每條都要新查詢 → 排隊一個一個查,仍守 5/s
+        sdk.query_ts.clear()
+        errors.clear()
+
+        def _fresh():
+            try:
+                client._query_order_results(fresh_after=client.query_clock())
+            except Exception as e:      # noqa: BLE001
+                errors.append(e)
+        # 仍用慢查詢 (0.3 s > 閘門間隔 0.21 s) → 8 條 fresh 呼叫端必定撞上在飛那次;計數器歸零只量 (b)
+        # (審查 T1: 舊版 (b) 換回零延遲 SDK 且沿用 (a) 的計數 → 並行打 SDK 的回歸抓不到)
+        with lk:
+            inflight.update(now=0, max=0)
+        ths = [threading.Thread(target=_fresh, daemon=True) for _ in range(8)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in ths) and errors == []
         ts = sorted(sdk.query_ts)
-        assert len(ts) == 8
+        assert 2 <= len(ts) <= 8
+        assert inflight["max"] == 1                                     # (b) SDK 同時最多 1 個在飛
         gaps = [ts[i] - ts[i - 1] for i in range(1, len(ts))]
         # 0.18 (非 0.21): sleep 喚醒抖動 + 鎖內預約到實際呼叫的時差;主斷言是下方「任一 1 s 滑動窗 ≤5 次」
         assert min(gaps) >= 0.18, f"相鄰查詢間隔應 ≥0.2 s,實得 {min(gaps):.3f}"

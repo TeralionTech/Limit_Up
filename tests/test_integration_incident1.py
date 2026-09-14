@@ -166,6 +166,9 @@ class TestWorkerStartsOnConnect:
                 return []
 
         monkeypatch.setattr(broker_mod, "RealOrderClient", _FakeClient)
+        # 帳號防呆 (test_account_guard.py): 本測試驗「.env 未設 FUBON_ACCOUNT_ID」的原行為;
+        # 有真 .env 的 checkout 在 import config 時會把它載進 os.environ → 明確移除,免登入 "A" 被擋
+        monkeypatch.delenv("FUBON_ACCOUNT_ID", raising=False)
         s = ts_mod.TradingSession(auto_cancel_worker=False)   # 不真的起 thread,只驗有被叫到
         s.set_mode("real")
         calls = []

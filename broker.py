@@ -29,6 +29,37 @@ FUBON_TEST_URL = "wss://neoapitest.fbs.com.tw/TASP/XCPXWS"
 # 0.2 s = 剛好 5/s 零餘裕;多留 10 ms 抗 sleep 喚醒/網路抖動 (任一 1 s 滑動窗 ≤5 次)。
 QUERY_MIN_INTERVAL_SEC = 0.21
 
+# 全清單委託查詢 single-flight (2026-09-14 node1: 同登入的第三方程式狂送 28k 單 → 委託清單 33,940 筆,
+# 一次 get_order_results ≈540 MB RSS 且不歸還,兩個重疊 ≈1.09 GB → 主機 RAM+swap 耗盡當機)。
+# 全 process 同時最多一個 get_order_results 在飛;其他呼叫者共用它的結果 (唯讀),完成後不快取。
+QUERY_JOIN_MAX_WAIT_SEC = 30.0    # 等別人在飛查詢的上限 (含 fresh_after 等前一個結束) — 逾時 raise OrderLookupError
+QUERY_FLIGHT_STALE_SEC = 90.0     # 在飛超過此秒數視為卡死 → 不再讓人排隊等它,允許另起一個 (免單一卡死查詢鎖死全部)
+
+
+class _QueryFlight:
+    """一個在飛的全清單 get_order_results (single-flight 共用單位)。時間皆 time.perf_counter()。"""
+
+    __slots__ = ("client", "sdk", "account", "created", "started", "done", "data", "error")
+
+    def __init__(self, client, sdk, account, created: float):
+        self.client = client
+        self.sdk = sdk
+        self.account = account
+        self.created = created           # 登記為在飛的時刻 (卡死判斷)
+        self.started = None              # 實際呼叫 SDK 前一刻 (新鮮度判斷);None = 還在等 5/s 時槽 (之後才開始)
+        self.done = threading.Event()
+        self.data = None                 # 成功: list (共用、唯讀 — 各呼叫者拿淺拷貝)
+        self.error = None                # 失敗: str (富邦原文)
+
+
+class _OrderQuerySingleFlight:
+    """全 process 共用的委託查詢 single-flight 狀態 (RealOrderClient 類別層持有;鎖內只改指標,絕不呼叫 SDK)。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.flight: Optional[_QueryFlight] = None
+        self.last_rows: Optional[int] = None     # 最近一次**成功**全清單查詢的筆數 (盤中對帳調頻用)
+
 
 class OrderLookupError(RuntimeError):
     """委託查詢失敗 — get_order_results 回 is_success 非 True、回空、或 SDK 例外。
@@ -88,6 +119,14 @@ class RealOrderClient:
     _query_lock = threading.Lock()
     _query_next_ts = 0.0
     query_min_interval = QUERY_MIN_INTERVAL_SEC
+    # 全清單查詢 single-flight — **刻意只在類別層** (不在 __init__ 覆寫): 全 process 同時最多一個
+    # get_order_results 在飛 (換 client / 重連期間新舊 client 也不重疊)。__new__ 建的替身同樣適用。
+    _order_query_sf = _OrderQuerySingleFlight()
+    query_join_max_wait = QUERY_JOIN_MAX_WAIT_SEC
+    query_flight_stale = QUERY_FLIGHT_STALE_SEC
+    _claimed_order_nos: set = frozenset()      # __new__ 替身的預設 (真 client 在 __init__ 換成 set)
+    # session 掛的判斷 hook: rpt → True = 確定「非本策略委託」的拒單回報 → 略過逐筆 ERROR (session 彙總)
+    is_foreign_order_report: Optional[Callable[[dict], bool]] = None
 
     def __init__(self, log_path: Path):
         self.sdk = None
@@ -110,6 +149,7 @@ class RealOrderClient:
         self.on_order: Optional[Callable[[dict], None]] = None
         self.on_disconnect: Optional[Callable[[], None]] = None
         self.on_reconnected: Optional[Callable[[], None]] = None   # 重連成功 → session 補收
+        self.is_foreign_order_report = None   # session connect_async 掛 (非本策略拒單回報不逐筆 ERROR)
         # 自動重連 (2026-08-05 實盤事故: 交易 WS 盤中斷線 → 回報遺失+撤單全失敗,
         # v1「不自動重連」決策廢除)。憑證存記憶體供重登入。
         self._account_id = ""
@@ -392,10 +432,14 @@ class RealOrderClient:
         **且尚未被認領** (不在 self._claimed_order_nos)。**恰好 1 筆才認領** — 0 或多筆一律回 ""。
         2026-08-28 管線化: 同標同量可有多筆在飛 (打破「每檔僅一張活躍委託」),但先前那 N-1 筆的書號
         都已 add 進 _claimed → 排除後只剩剛送、還沒書號的這一筆 → 仍唯一可認。
+        2026-09-15 single-flight: 要求**本函式開始之後才開始**的查詢 (fresh_after) — 不共用委託送出前就
+        在飛的舊查詢 (那份清單不會有剛送的這筆 → 誤判 0 候選落 UNKNOWN)。
         """
+        fresh_after = time.perf_counter()
         try:
             candidates = []
-            for o in self._query_order_results():   # 過 5/s 閘門;查詢失敗 raise → 下方 except 回 ""
+            # 過 5/s 閘門 + single-flight;查詢失敗 raise → 下方 except 回 ""
+            for o in self._query_order_results(fresh_after=fresh_after):
                 if str(_attr(o, "user_def", "userDef", default="") or "") != "hitlimit":
                     continue
                 if str(_attr(o, "stock_no", "symbol", default="")) != symbol:
@@ -418,13 +462,9 @@ class RealOrderClient:
 
     # ─── 委託查詢 (所有 get_order_results 的唯一入口) ─────────────
 
-    def _query_order_results(self) -> list:
-        """呼叫 sdk.stock.get_order_results 的**唯一入口** — 過 5/s 閘門 + 每次一行 log。
-
-        閘門: 鎖內只預約下一個時槽 (算等待),**鎖外 sleep** — 多條 thread 同時查是排隊而非
-        互相卡鎖;8 條撤單 thread 同瞬間進來會被攤成 ≥0.2 s 一筆 (≤5/s)。
-        成功回 list (result.data 或 [])。失敗 (is_success 非 True / result 回空 / SDK 例外)
-        raise OrderLookupError,訊息含富邦原文 — caller **絕不可**把它當「查無」。"""
+    def _await_query_slot(self):
+        """富邦「帳務查詢 5/秒」閘門 — get_order_results 與 inventories (get_sellable_lots) **共用同一額度**。
+        鎖內只預約下一個時槽 (算等待),**鎖外 sleep** — 多條 thread 同時查是排隊而非互相卡鎖。"""
         # 時鐘用 perf_counter (Windows 3.10 的 monotonic 只有 ~15.6 ms 解析度;Linux 兩者皆 ns)
         with self._query_lock:
             now = time.perf_counter()
@@ -434,22 +474,120 @@ class RealOrderClient:
         while wait > 0:                  # sleep 到時槽為止 (sleep 可能提早醒 → 迴圈保證不早於時槽)
             time.sleep(wait)
             wait = slot - time.perf_counter()
-        t0 = time.perf_counter()
+
+    @staticmethod
+    def query_clock() -> float:
+        """single-flight 新鮮度用的時鐘 (與 _QueryFlight.started 同源) — caller 取「此刻」當 fresh_after。"""
+        return time.perf_counter()
+
+    def _query_order_results(self, fresh_after: Optional[float] = None) -> list:
+        """呼叫 sdk.stock.get_order_results 的**唯一入口** — 過 5/s 閘門 + single-flight + 每次 SDK 呼叫一行 log。
+
+        閘門: 鎖內只預約下一個時槽 (算等待),**鎖外 sleep** — 多條 thread 同時查是排隊而非
+        互相卡鎖;8 條撤單 thread 同瞬間進來會被攤成 ≥0.2 s 一筆 (≤5/s)。
+        single-flight (2026-09-14 node1 清單 33,940 筆、每次查詢 ≈540 MB): 全 process 同時最多一個 SDK 查詢在飛;
+        同 client 的呼叫者**共用**在飛那次的結果 (淺拷貝 list,SDK 物件唯讀共用),完成後不快取 (下一個呼叫者重查)。
+          - fresh_after (query_clock() 值): 只接受**在此之後才開始**的查詢 — 在飛那次開始得更早 → 等它結束再自己查
+          - 不同 client / 不同 sdk 物件 (重連換 SDK) 的在飛查詢不共用,等它結束再查 (仍不重疊)
+          - 等待有上限 query_join_max_wait → raise OrderLookupError (結果未知 ≠ 查無)
+          - 在飛超過 query_flight_stale 視為卡死 → 不再等它,另起新查詢
+        成功回 list (result.data 或 [])。失敗 (is_success 非 True / result 回空 / SDK 例外 / 等待逾時)
+        raise OrderLookupError,訊息含富邦原文 — caller **絕不可**把它當「查無」。"""
+        sf = self._order_query_sf
+        max_wait = float(self.query_join_max_wait)
+        deadline = time.perf_counter() + max_wait
+        abandoned_age = None
+        while True:
+            with sf.lock:
+                now = time.perf_counter()
+                f = sf.flight
+                if f is not None and f.done.is_set():
+                    sf.flight = f = None                      # 防禦: 已完成卻未清 (正常路徑先清再 set)
+                if f is not None and now - f.created > float(self.query_flight_stale):
+                    abandoned_age = now - f.created
+                    sf.flight = f = None                      # 卡死 → 放棄等它 (它結束時不會清掉新 flight)
+                if (f is not None and f.client is self
+                        and (f.sdk is not self.sdk or f.account is not self.account)):
+                    # 2026-09-15 審查: 同 client 已重連換 SDK/帳戶 (re_login atomic swap) → 舊 SDK 上的在飛查詢
+                    # 視為放棄、不等它 (舊連線斷網卡住時,等 30 s 逾時會讓重連補收 reconcile_orders 失敗且不重試)。
+                    # 舊 flight 結束時 `sf.flight is f` 不成立 → 不會誤清新 flight;卡住的舊查詢沒收到資料,並行風險可接受
+                    abandoned_age = now - f.created
+                    sf.flight = f = None
+                if f is None:
+                    mine = _QueryFlight(self, self.sdk, self.account, now)
+                    sf.flight = mine
+                    break
+                begun = f.started if f.started is not None else now   # 未開始 = 之後才會開始
+                joinable = (f.client is self and f.sdk is self.sdk and f.account is self.account
+                            and (fresh_after is None or begun >= fresh_after))
+            # ── 鎖外等在飛那次 (有上限) ──
+            if not f.done.wait(max(0.0, deadline - time.perf_counter())):
+                logger.warning(f"[broker] order_results 等待進行中的查詢逾時 ({max_wait:g}s) — 查詢結果未知")
+                raise OrderLookupError(f"等待進行中的 get_order_results 逾時 ({max_wait:g}s) — 查詢結果未知 (≠ 查無)")
+            if joinable:
+                if f.error is not None:
+                    raise OrderLookupError(f.error)           # 每位呼叫者各自一個例外物件 (不跨 thread 共用)
+                logger.debug(f"[broker] order_results 共用進行中查詢 n={len(f.data or [])}")
+                return list(f.data or [])
+            # 不可共用 (不夠新 / 別的 client) → 它已結束,回迴圈自己查
+        if abandoned_age is not None:
+            logger.warning(f"[broker] ⚠ 前一個 get_order_results 已在飛 {abandoned_age:.1f}s 視為卡死"
+                           f" (> {self.query_flight_stale:g}s) 或屬於重連前的舊 SDK — 另起新查詢")
+        return self._run_query_flight(mine)
+
+    def _run_query_flight(self, f: _QueryFlight) -> list:
+        """single-flight 的領頭者: 過 5/s 時槽 → 呼叫 SDK → 結果/錯誤寫進 flight → 清指標 → 喚醒共用者。"""
+        sf = self._order_query_sf
         try:
-            result = self.sdk.stock.get_order_results(self.account)
-        except Exception as e:
+            self._await_query_slot()
+            with sf.lock:
+                f.started = time.perf_counter()
+            t0 = f.started
+            try:
+                result = f.sdk.stock.get_order_results(f.account)
+            except Exception as e:
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                logger.info(f"[broker] order_results ok=False n=0 ms={ms} msg=例外: {e}")
+                f.error = f"get_order_results 例外: {e}"
+                raise OrderLookupError(f.error) from e
             ms = round((time.perf_counter() - t0) * 1000, 1)
-            logger.info(f"[broker] order_results ok=False n=0 ms={ms} msg=例外: {e}")
-            raise OrderLookupError(f"get_order_results 例外: {e}") from e
-        ms = round((time.perf_counter() - t0) * 1000, 1)
-        ok = bool(result) and getattr(result, "is_success", None) is True
-        data = list(getattr(result, "data", None) or []) if ok else []
-        msg = str(getattr(result, "message", None) or "") if result else "result 回空"
-        logger.info(f"[broker] order_results ok={ok} n={len(data)} ms={ms} msg={msg or '-'}")
-        if not ok:
-            # 例「Login Error, 業務系統流量控管」(5/s 超限) — 是查詢失敗,不是清單為空
-            raise OrderLookupError(msg or "get_order_results 回 is_success=False")
-        return data
+            ok = bool(result) and getattr(result, "is_success", None) is True
+            data = list(getattr(result, "data", None) or []) if ok else []
+            msg = str(getattr(result, "message", None) or "") if result else "result 回空"
+            logger.info(f"[broker] order_results ok={ok} n={len(data)} ms={ms} msg={msg or '-'}")
+            if not ok:
+                # 例「Login Error, 業務系統流量控管」(5/s 超限) — 是查詢失敗,不是清單為空
+                f.error = msg or "get_order_results 回 is_success=False"
+                raise OrderLookupError(f.error)
+            f.data = data
+            with sf.lock:
+                sf.last_rows = len(data)
+            return list(data)
+        finally:
+            if f.data is None and f.error is None:
+                f.error = "get_order_results 未完成 (查詢中斷)"
+            with sf.lock:
+                if sf.flight is f:
+                    sf.flight = None
+            f.done.set()
+
+    def order_query_in_flight(self) -> bool:
+        """目前是否有全清單 get_order_results 在飛 (全 process;卡死超過 query_flight_stale 的不算)。"""
+        sf = self._order_query_sf
+        with sf.lock:
+            f = sf.flight
+            return bool(f is not None and not f.done.is_set()
+                        and time.perf_counter() - f.created <= float(self.query_flight_stale))
+
+    def last_order_query_rows(self) -> Optional[int]:
+        """最近一次成功全清單查詢的筆數 (尚未成功查過 → None)。"""
+        sf = self._order_query_sf
+        with sf.lock:
+            return sf.last_rows
+
+    def is_claimed_order_no(self, order_no) -> bool:
+        """此書號是否為本 client 下單成功回傳/認領過的 (session 判斷「非本策略拒單回報」用)。"""
+        return bool(order_no) and str(order_no) in self._claimed_order_nos
 
     @staticmethod
     def _order_row(o) -> dict:
@@ -472,16 +610,17 @@ class RealOrderClient:
             "_obj": o,                           # 原始 SDK 物件 — cancel_by_obj 免再查
         }
 
-    def get_order_snapshot(self) -> list:
+    def get_order_snapshot(self, fresh_after: Optional[float] = None) -> list:
         """一次查回券商**全部**委託 (撤單 worker / 券商權威掃單 / 同步撤單試一次共用)。
 
         每項 {order_no, symbol, buy_sell, quantity, filled_qty, after_qty, status, user_def, _obj}。
+        fresh_after (query_clock() 值) → 只用在此之後才開始的查詢 (收盤掃單用;見 _query_order_results)。
         失敗 raise OrderLookupError (含未連線/不健康 — 一律「查不到 ≠ 沒有」)。"""
         try:
             self._require_ready()
         except RuntimeError as e:
             raise OrderLookupError(str(e)) from e
-        return [self._order_row(o) for o in self._query_order_results()]
+        return [self._order_row(o) for o in self._query_order_results(fresh_after=fresh_after)]
 
     def _find_order_obj(self, order_no: str) -> tuple:
         """回 (obj|None, snapshot_ok, message)。
@@ -592,6 +731,84 @@ class RealOrderClient:
         logger.info(f"[broker] get_inventories → {out}")
         return out
 
+    def get_sellable_lots(self, symbol: str) -> int:
+        """**嚴格版**可賣張數查詢 (出場賣單被拒「可賣不足/超過庫存」後重算張數用;2026-09-14 node3/node4)。
+
+        與 get_inventories 的差別 (get_inventories 行為不變,隔日賣對帳照用):
+          - 過帳務查詢 5/s 閘門 (_await_query_slot,與 get_order_results 共用額度)
+          - 失敗**一律 raise OrderLookupError** (含富邦原文): 未連線/不健康、SDK 例外、result 回空、
+            is_success 非 True、data 為 None、該檔庫存列缺 tradable_qty 或無法解析 —
+            **查詢失敗 ≠ 可賣 0**,caller 必須當「未知」處理
+          - 只看 tradable_qty (可委託整股庫存數),**不退回 lastday_qty**;跳過 Short/Margin/SBL 列
+        查詢成功且庫存無此檔 → 0 (券商權威: 目前沒有可賣股數)。回張數 (股 // 1000)。"""
+        return self._query_sellable(symbol, need_balance=False)["tradable"]
+
+    def get_sellable_position(self, symbol: str) -> dict:
+        """同 get_sellable_lots (同一次 inventories 查詢、同閘門、同失敗語意),另回整股餘額:
+        {"tradable": tradable_qty 張 (可委託), "balance": today_qty 張 (整股餘額)}。
+        2026-09-15 審查: tradable 0 有歧義 — 禁現沖/當沖資格不符的今日買進、或被其他賣單佔用時 tradable 也是 0,
+        但帳上仍有股 (today_qty>0)。session 只有「tradable 0 **且** 餘額 0」才可判定部位已不在。
+        該檔庫存列缺 today_qty 或無法解析 → raise OrderLookupError (無從判斷)。"""
+        return self._query_sellable(symbol, need_balance=True)
+
+    def _query_sellable(self, symbol: str, need_balance: bool) -> dict:
+        try:
+            self._require_ready()
+        except RuntimeError as e:
+            raise OrderLookupError(str(e)) from e
+        self._await_query_slot()
+        t0 = time.perf_counter()
+        try:
+            result = self.sdk.accounting.inventories(self.account)
+        except Exception as e:
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.info(f"[broker] sellable {symbol} ok=False ms={ms} msg=例外: {e}")
+            raise OrderLookupError(f"inventories 例外: {e}") from e
+        ms = round((time.perf_counter() - t0) * 1000, 1)
+        ok = bool(result) and getattr(result, "is_success", None) is True
+        msg = str(getattr(result, "message", None) or "") if result else "result 回空"
+        if not ok:
+            logger.info(f"[broker] sellable {symbol} ok=False ms={ms} msg={msg or '-'}")
+            raise OrderLookupError(msg or "inventories 回 is_success=False")
+        data = getattr(result, "data", None)
+        if data is None:
+            # 成功卻無 data — 無從區分「沒庫存」與「回傳異常」→ 當查詢失敗 (免誤判可賣 0 而停止出場)
+            logger.info(f"[broker] sellable {symbol} ok=False ms={ms} msg=data None")
+            raise OrderLookupError("inventories 回 is_success=True 但 data 為 None")
+        shares = 0
+        balance = 0
+        rows = 0
+        try:
+            for inv in data:
+                if str(_attr(inv, "stock_no", "symbol", default="") or "") != symbol:
+                    continue
+                otype = _norm_enum(getattr(inv, "order_type", "") or "")
+                if otype in ("Short", "Margin", "SBL"):
+                    continue                          # 私人融資融券借券部位 — 現股賣單賣不到
+                raw = _attr(inv, "tradable_qty", "tradableQty", default=None)
+                if raw is None:
+                    raise OrderLookupError(f"{symbol} 庫存列缺 tradable_qty (無從判斷可賣張數)")
+                shares += max(0, int(raw))
+                if need_balance:
+                    raw_bal = _attr(inv, "today_qty", "todayQty", default=None)
+                    if raw_bal is None:
+                        raise OrderLookupError(f"{symbol} 庫存列缺 today_qty (無從判斷整股餘額)")
+                    balance += max(0, int(raw_bal))
+                rows += 1
+        except OrderLookupError:
+            raise
+        except Exception as e:
+            raise OrderLookupError(f"{symbol} 庫存列解析失敗: {e}") from e
+        lots = shares // 1000
+        out = {"tradable": lots}
+        extra = ""
+        if need_balance:
+            out["balance"] = balance // 1000
+            extra = f" 整股餘額={balance} 股 → {balance // 1000} 張"
+        logger.info(f"[broker] sellable {symbol} ok=True ms={ms} tradable={shares} 股 → {lots} 張{extra} "
+                    f"(庫存列 {rows})")
+        return out
+
     def get_order_filled_lots(self, order_no: str) -> int:
         """向券商查該委託的權威已成交張數。查無此單**或查詢失敗**回 -1 (caller 保守處理)。
         用途: 撤預掛後、市價追差額前,防「fill 回報晚到 → 差額算全額 → 雙倍買」競態。"""
@@ -604,13 +821,14 @@ class RealOrderClient:
         filled_qty = int(_attr(obj, "filled_qty", "filledQty", default=0) or 0)
         return filled_qty // 1000
 
-    def get_filled_map(self) -> dict:
+    def get_filled_map(self, fresh_after: Optional[float] = None) -> dict:
         """一次查回**所有**委託的權威已成交張數 {order_no: lots} — 斷線補收對帳用
         (一次 REST 拿全部,不逐單查)。查詢失敗 raise OrderLookupError,caller 處理
-        (不再對 is_success=False 靜默回空 map — 空 map 會被當「補收 0 筆」)。"""
+        (不再對 is_success=False 靜默回空 map — 空 map 會被當「補收 0 筆」)。
+        fresh_after → 只用在此之後才開始的查詢 (重連補收: 不共用重連前就在飛的舊查詢)。"""
         self._require_ready()
         out = {}
-        for o in self._query_order_results():
+        for o in self._query_order_results(fresh_after=fresh_after):
             no = str(getattr(o, "order_no", "") or "")
             if no:
                 out[no] = int(_attr(o, "filled_qty", "filledQty", default=0) or 0) // 1000
@@ -674,14 +892,19 @@ class RealOrderClient:
                 "function_type": _attr(content, "function_type", "functionType", default=None),
                 # 富邦回報「最後異動時間」(毫秒,如 "10:44:05.796") — 新單接受回報 = 委託被接受時戳
                 "last_time": str(_attr(content, "last_time", "lastTime", default="") or ""),
+                # 委託自訂欄位 (本策略下單帶 "hitlimit") — session 據此絕不把本策略委託的拒單當第三方單折疊
+                "user_def": str(_attr(content, "user_def", "userDef", default="") or ""),
             }
             if err:
                 # err 原文例 "[115]證券委託目前狀態取消單已不允許取消交易";content.error_message 通常同文
                 if not rpt["error_message"]:
                     rpt["error_message"] = str(err)
-                logger.error(f"[broker] 委託回報 err={err} order={rpt['order_no'] or '-'} "
-                             f"{rpt['symbol'] or '-'} ft={rpt['function_type']} "
-                             f"status={rpt['status'] or '-'} msg={rpt['error_message']}")
+                # session 判定「確定非本策略委託」的拒單回報 → 不逐筆 ERROR (session 首見文案 log + 定期彙總;
+                # 2026-09-14 node1 第三方程式 28k 拒單 → 3 分鐘 15k 行 ERROR)。其他一律照舊逐筆 ERROR。
+                if not self._report_is_foreign(rpt):
+                    logger.error(f"[broker] 委託回報 err={err} order={rpt['order_no'] or '-'} "
+                                 f"{rpt['symbol'] or '-'} ft={rpt['function_type']} "
+                                 f"status={rpt['status'] or '-'} msg={rpt['error_message']}")
             else:
                 logger.info(f"[broker] 委託回報 {rpt['symbol']} order={rpt['order_no']} "
                             f"ft={rpt['function_type']} status={rpt['status']} "
@@ -690,6 +913,16 @@ class RealOrderClient:
                 self.on_order(rpt)
         except Exception as e:
             logger.exception(f"[broker] order handler 例外: {e}")
+
+    def _report_is_foreign(self, rpt: dict) -> bool:
+        """is_foreign_order_report hook 明確回 True 才算;沒掛 / 例外 / 非 True → False (照舊逐筆 ERROR)。"""
+        hook = self.is_foreign_order_report
+        if hook is None:
+            return False
+        try:
+            return hook(rpt) is True
+        except Exception:
+            return False
 
     def _handle_event(self, code, content):
         logger.warning(f"[broker] 事件 code={code}: {content}")
