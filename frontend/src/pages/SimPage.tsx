@@ -4,6 +4,8 @@ import { api, TraderSummary, FirstStageRow, TrackingRow, TradingStatus, SymbolTr
 // 撤單佇列可見性 (2026-09-09 node3「管線多送市價單未撤」事故 A5) — api.ts 型別不動,本檔以 local type 擴充:
 //   委託列: cancel_state ('' | queued | sent | unconfirmed) / cancel_attempts / cancel_reason / cancel_err
 //   status: n_cancel_unconfirmed / n_cancel_queued / n_inflight / cancel_worker_alive
+//   status: node_login_masked (2026-09-15 本節點帳號顯示;.env FUBON_ACCOUNT_ID 前 3 + … + 後 3,'' = 未設或 hub)
+//           node_role ('hub' | 'node' | 'standalone';hub 不交易 → 不顯示 ID 片段)
 type OrderRowX = OrderRow & {
   cancel_state?: '' | 'queued' | 'sent' | 'unconfirmed'
   cancel_attempts?: number
@@ -15,6 +17,8 @@ type TradingStatusX = TradingStatus & {
   n_cancel_queued?: number
   n_inflight?: number
   cancel_worker_alive?: boolean
+  node_login_masked?: string   // undefined = 後端舊版未提供 (不顯示);'' = 本節點未設 FUBON_ACCOUNT_ID (或 hub)
+  node_role?: string           // env ROLE;undefined = 後端舊版未提供
 }
 
 /** pending 且撤單中 (已入佇列 / 已送撤單 / 撤不到) — 券商尚未確認撤成,不可當「已撤」看 */
@@ -446,7 +450,15 @@ function TradingPanel() {
           ts.connecting ? <Badge cls="bg-yellow-100 text-yellow-800">連線中…</Badge>
           : ts.connected && ts.healthy ? (
             <Badge cls="bg-green-100 text-green-800">
-              ✓ 已連線 {ts.account_masked}{ts.is_test ? ' (測試環境)' : ''}
+              ✓ 已連線 {ts.account_masked}{ts.is_test ? '（測試環境）' : ''}
+              {/* 連線後也附本節點登入 ID,方便比對 (account_masked 是券商帳號,這裡比對的是登入身分證 ID;
+                  後端舊版未提供此欄位時不顯示;hub 不交易 → 不顯示 ID 片段) */}
+              {ts.node_role === 'hub' ? '（hub 不交易）'
+                : ts.node_login_masked !== undefined && (
+                  ts.node_login_masked
+                    ? <>（本節點登入 ID <span className="font-mono">{ts.node_login_masked}</span>）</>
+                    : '（本節點登入 ID 未設定）'
+                )}
             </Badge>
           )
           : ts.connected ? <Badge cls="bg-red-100 text-red-800">⚠ 連線不健康 — 請重連</Badge>
@@ -478,8 +490,11 @@ function TradingPanel() {
           {!ts?.connected && !ts?.connecting && (
             <div className="flex items-end gap-2 flex-wrap text-sm">
               <Field label="券商帳號">
-                <input value={acct} onChange={e => setAcct(e.target.value)}
-                       className="border rounded px-2 py-1.5 w-36 font-mono" placeholder="身分證字號" />
+                <div className="flex items-center gap-2 flex-wrap">
+                  <input value={acct} onChange={e => setAcct(e.target.value)}
+                         className="border rounded px-2 py-1.5 w-36 font-mono" placeholder="身分證字號" />
+                  <NodeLoginHint masked={ts?.node_login_masked} role={ts?.node_role} />
+                </div>
               </Field>
               <Field label="密碼">
                 <input type="password" value={pwd} onChange={e => setPwd(e.target.value)}
@@ -707,6 +722,35 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       {children}
     </div>
   )
+}
+
+/** 連線表單旁「本節點帳號 Z90…999」(2026-09-15) — 本節點 .env FUBON_ACCOUNT_ID 遮罩 (前 3 + … + 後 3),
+ *  防止拿別台節點的帳號連線 (09-14 node3/node4 互填事故;後端也會拒絕不符的登入)。
+ *  role 'hub' → 「hub 不交易」(後端也不回 ID 片段);undefined = 後端舊版未提供此欄位 → 不顯示;
+ *  '' = 本節點未設定 → 灰字 (此時後端連線防呆跳過,tooltip 須講清楚不會把關)。 */
+function NodeLoginHint({ masked, role }: { masked?: string; role?: string }) {
+  if (role === 'hub') {
+    return (
+      <span className="text-xs text-gray-400 whitespace-nowrap"
+            title="本機 ROLE=hub:只篩選/分發 marked,不交易 — 請到各 node 連線交易">
+        hub 不交易
+      </span>
+    )
+  }
+  if (masked === undefined) return null
+  return masked
+    ? (
+      <span className="text-xs text-gray-700 whitespace-nowrap"
+            title="本節點 .env FUBON_ACCOUNT_ID (前 3 碼…後 3 碼);登入帳號須與此相符,否則後端拒絕連線">
+        本節點帳號 <span className="font-mono font-semibold">{masked}</span>
+      </span>
+    )
+    : (
+      <span className="text-xs text-gray-400 whitespace-nowrap"
+            title="本節點 .env 未設 FUBON_ACCOUNT_ID — 後端不會檢查登入帳號,請自行確認">
+        本節點帳號未設定
+      </span>
+    )
 }
 
 

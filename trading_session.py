@@ -165,6 +165,26 @@ def _node_login_id() -> str:
     return _norm_login_id(os.environ.get("FUBON_ACCOUNT_ID", ""))
 
 
+def _node_login_masked() -> str:
+    """UI「本節點帳號」顯示用遮罩 (2026-09-15): .env FUBON_ACCOUNT_ID 前 3 碼 + … + 後 3 碼 (例 Z90…999)。
+
+    讓操作員在連線表單旁一眼比對,不要拿別台節點的帳號連線。每次呼叫現讀 os.environ
+    (.env 於服務啟動時載入;改 .env 需 systemctl restart 才生效);
+    正規化同 _norm_login_id (去空白、轉大寫,與連線防呆比對一致)。未設/空白 → "";
+    長度 < 7 → 只給前 3 碼 + … (前後 3 碼會重疊,等於露出全部)。完整 ID 絕不出現在回傳值。"""
+    s = _node_login_id()
+    if not s:
+        return ""
+    if len(s) < 7:
+        return f"{s[:3]}…"
+    return f"{s[:3]}…{s[-3:]}"
+
+
+def _node_role() -> str:
+    """本機角色 = env ROLE (同 config.load_config 正規化: strip + lower,預設 standalone;每次現讀 os.environ)。"""
+    return os.environ.get("ROLE", "standalone").strip().lower()
+
+
 def _call_with_timeout(fn, timeout: float, name: str):
     """在 daemon thread 跑 fn(),最多等 timeout 秒;逾時 raise TimeoutError (thread 留在背景自然結束)。
     SDK 呼叫卡死不能拖垮撤單 worker (A1b: 逾時 = 未確認、不計 attempts)。"""
@@ -3460,6 +3480,7 @@ class TradingSession:
             }
 
     def status(self) -> dict:
+        node_role = _node_role()
         with self._lock:
             b = self.broker.status() if self.broker else {
                 "connected": False, "healthy": False, "account_masked": "",
@@ -3470,6 +3491,12 @@ class TradingSession:
                 "connecting": self.connecting,
                 "connect_error": self.connect_error,
                 **b,
+                # 2026-09-15 本節點帳號顯示 (連線表單旁 / 已連線列): .env FUBON_ACCOUNT_ID 遮罩,
+                # 連線與否都帶;"" = 未設 (或 hub)。放在 **b 之後 → broker.status() 不可能蓋掉。
+                # hub 不交易 (runner: role==hub 不預掛/不進 trader) → 不回 ID 片段 (hub 的 FUBON_ACCOUNT_ID
+                # 是行情帳號,UI 不公開),前端依 node_role 顯示「hub 不交易」
+                "node_role": node_role,
+                "node_login_masked": "" if node_role == "hub" else _node_login_masked(),
                 "params": {
                     "sizing_mode": self.sizing_mode,
                     "fixed_lots": self.fixed_lots,
