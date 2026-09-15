@@ -48,7 +48,7 @@ class TestMasking:
         (NODE_ID, NODE_DISPLAY),                        # 一般 10 碼
         ("  " + NODE_ID + "\t\n", NODE_DISPLAY),        # 前後空白 (.env 手滑)
         (NODE_ID.lower(), NODE_DISPLAY),                # 小寫 → 轉大寫 (同 _mask_login_id / 連線防呆比對)
-        (" z90Test042 ", NODE_DISPLAY),                 # 大小寫混雜 + 空白
+        (" z90Test999 ", NODE_DISPLAY),                 # 大小寫混雜 + 空白
         ("ABCDEFG", "ABC…EFG"),                         # 剛好 7 碼 → 前 3 + 後 3
         ("ABCDEF", "ABC…"),                             # 6 碼 → 只給前 3 碼
         ("AB", "AB…"),                                  # 極短
