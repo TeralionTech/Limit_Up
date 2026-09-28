@@ -86,8 +86,10 @@ def main():
                     help="驗證模式: 連線+arm 煙霧+歸零+斷線 (不留連線)")
     args = ap.parse_args()
 
+    # enabled=false (搬遷中還沒上線的新機) 與 limitup=false (只跑當沖、沒有 hit_limit_up 的主機)
+    # 一律跳過 — 否則早上會對這些機器跑連線流程,把真正的失敗埋在一堆 FAIL 雜訊裡 (2026-09-28 搬遷審查)
     specs = [s for s in json.loads(Path(args.hosts).read_text(encoding="utf-8"))
-             if s.get("role") != "hub"]
+             if s.get("role") != "hub" and s.get("enabled", True) and s.get("limitup", True)]
     mode = "test" if args.test else "morning"
     results = {}
     for s in specs:

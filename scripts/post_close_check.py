@@ -194,8 +194,9 @@ def main():
               f"是正常的;要硬跑加 --force){RST}")
         sys.exit(3)
 
+    # 同 connect_real_nodes.py: 跳過 enabled=false (搬遷中的新機) 與 limitup=false (純當沖主機)
     specs = [s for s in json.loads(Path(args.hosts).read_text(encoding="utf-8"))
-             if s.get("role") != "hub"]
+             if s.get("role") != "hub" and s.get("enabled", True) and s.get("limitup", True)]
     if args.only:
         specs = [s for s in specs if s.get("name") == args.only]
         if not specs:

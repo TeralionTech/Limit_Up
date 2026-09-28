@@ -137,9 +137,16 @@ def main():
     ap.add_argument("--once", action="store_true", help="只跑一輪 (連線測試)")
     args = ap.parse_args()
 
-    specs = json.loads(Path(args.hosts).read_text(encoding="utf-8"))
+    # 跳過 enabled=false (搬遷中還沒上線的新機) 與 limitup=false (只跑當沖的主機);
+    # hub 必須恰好一台 — 否則 next() 可能挑到已停機的舊 hub,整個 GO/NO-GO 基準就錯了 (2026-09-28 搬遷審查)
+    specs = [s for s in json.loads(Path(args.hosts).read_text(encoding="utf-8"))
+             if s.get("enabled", True) and s.get("limitup", True)]
     hosts = [Host(s) for s in specs]
-    hub = next((h for h in hosts if h.role == "hub"), None)
+    hubs = [h for h in hosts if h.role == "hub"]
+    if len(hubs) != 1:
+        print(f"hosts 檔裡有 {len(hubs)} 台 role=hub (應恰好 1 台) — 先修 monitor_hosts.json 再跑")
+        sys.exit(2)
+    hub = hubs[0]
     nodes = [h for h in hosts if h.role != "hub"]
 
     print(f"監控 {len(hosts)} 台 (hub={hub.host if hub else '無'} + {len(nodes)} node)。Ctrl+C 停。")
