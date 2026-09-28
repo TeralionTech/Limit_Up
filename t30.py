@@ -65,3 +65,22 @@ def load_untradable(t30_dir) -> tuple:
                 logger.error(f"[t30] 解析 {name} 失敗: {e}")
         files_meta[name] = info
     return untradable, {"files": files_meta, "missing_all": not any_ok}
+
+
+def files_state(t30_dir) -> dict:
+    """只看「檔案在不在 / mtime 是不是今天」,**不解析內容** — 給 runner 的等待迴圈用。
+
+    load_untradable 每次要解析約 4.7MB (兩檔 ~71000 筆定長記錄),每 5 秒輪詢一次太浪費;
+    等待階段只需要知道「今日檔到了沒」。回 {檔名: {exists, mtime_date, today}}。
+    """
+    t30_dir = Path(t30_dir)
+    today = datetime.now().strftime("%Y-%m-%d")
+    out = {}
+    for name in ("T30V.TSE", "T30V.OTC"):
+        p = t30_dir / name
+        if p.is_file():
+            d = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d")
+            out[name] = {"exists": True, "mtime_date": d, "today": d == today}
+        else:
+            out[name] = {"exists": False, "mtime_date": None, "today": False}
+    return out

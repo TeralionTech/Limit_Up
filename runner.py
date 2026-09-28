@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 _LIMIT_UP_RETRY_SLEEP_SEC = 20
 
 
+def _t30_module():
+    """延後 import(與原本 `import t30 as _t30` 同樣理由:t30 只在 hub/standalone 路徑用到),
+    測試可 monkeypatch 這支換成假模組。"""
+    import t30
+    return t30
+
+
 class Phase(str, Enum):
     IDLE = "idle"                    # 未啟動
     LOGIN = "login"                  # 登入中
@@ -502,8 +509,10 @@ class Runner:
 
         # T30 禁單名單 (全額交割/每筆需 100% 預收) — API 下單必被拒,預掛/市價追
         # 一律跳過 (2026-08-12 全額交割股狂送單事故)。取檔由 fetch_t30 timer 08:05 負責
-        # (券商 08:00 更新檔,留 5 分鐘餘裕);漲停價要抓 ~8 分鐘以上,
-        # 走到這裡新檔已就位,單次載入即可。
+        # (券商 08:00 更新檔,留 5 分鐘餘裕)。
+        # 2026-09-28: 不再假設「走到這裡新檔已就位」— 漲停價抓取在月均量篩選後只要 ~4 分鐘,
+        # 每天都比 08:05 取檔早,結果天天讀到前一交易日的名單。改成在這裡等今日檔
+        # (最晚 T30_WAIT_UNTIL,預設 08:10),等不到就照用舊檔 + CRITICAL 並排背景重讀。
         self._load_t30_untradable()
 
         # Phase 4: Subscribe
@@ -867,12 +876,58 @@ class Runner:
                     f"檔內 {meta['count']} 檔有量資料)")
         self.universe = kept
 
-    def _load_t30_untradable(self):
-        """載入 T30 禁單名單 → session (漲停價抓完後單次載入 — 正常流程此時已晚於
-        timer 08:05 取檔)。檔案是舊的 → 照用 + CRITICAL;全缺 → 空名單無保護 +
-        CRITICAL (使用者定案 2026-08-12)。"""
-        import t30 as _t30
-        t30_dir = os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
+    def _t30_dir(self) -> str:
+        return os.environ.get("T30_DIR", str(Path(__file__).parent / "input" / "t30"))
+
+    def _wait_t30_today(self, t30_dir: str, wait_until: str, poll_sec: float) -> bool:
+        """等到 T30 兩個檔的 mtime 都是今天,最晚等到 wait_until。回傳「是否等到今日檔」。
+
+        2026-09-28 事故背景: 走到這裡的時間取決於漲停價抓取耗時(月均量篩選後母體 911 檔
+        → 約 08:04:55;母體再小會更早),而取檔 timer 是固定 08:05 → **每天**都讀到前一
+        交易日的名單(journal 自 09-15 起天天 CRITICAL,無一例外)。光把 timer 提前不安全:
+        fetch_t30.sh 自己註明「太早取會拿到昨日內容」,而新舊判斷只看 mtime → 會變成
+        安靜地用舊資料。所以改成在這裡等今日檔,順序由等待保證、不靠時間差假設。
+        """
+        deadline_t = self._parse_time_hhmm(wait_until)
+        if deadline_t is None:
+            return all(v["today"] for v in _t30_module().files_state(t30_dir).values())
+        now = datetime.now()
+        deadline = now.replace(hour=deadline_t.hour, minute=deadline_t.minute,
+                               second=deadline_t.second, microsecond=0)
+        t0 = time.time()
+        logged_wait = False
+        while not self._stop_event.is_set():
+            st = _t30_module().files_state(t30_dir)
+            if all(v["today"] for v in st.values()):
+                if logged_wait:
+                    logger.info(f"[runner] T30 今日檔已就位 (等了 {time.time() - t0:.0f}s)")
+                return True
+            if datetime.now() >= deadline:
+                logger.critical(
+                    f"[runner] ⚠ 等到 {wait_until} 仍無今日 T30 檔 "
+                    f"({ {n: i['mtime_date'] for n, i in st.items()} }) — 不再等,"
+                    f"先用現有檔往下跑;fetch_t30.sh 會重試到 08:25,屆時自動重讀")
+                return False
+            if not logged_wait:
+                logger.warning(
+                    f"[runner] T30 還不是今日檔 "
+                    f"({ {n: i['mtime_date'] for n, i in st.items()} }) — 等取檔 timer,"
+                    f"最晚等到 {wait_until}")
+                logged_wait = True
+            self._stop_event.wait(poll_sec)
+        return False
+
+    def _load_t30_untradable(self, wait_until: str = "", poll_sec: float = 5.0):
+        """載入 T30 禁單名單 → session。
+
+        先等今日檔(見 _wait_t30_today),等不到就照舊「舊檔照用 + CRITICAL」不卡主流程;
+        全缺 → 空名單無保護 + CRITICAL (使用者定案 2026-08-12)。
+        第一次載入拿到的是舊檔時,另外排一次背景重讀(fetch_t30.sh 會重試到 08:25),
+        趕在 08:30 開始篩選前把名單補正。"""
+        _t30 = _t30_module()
+        t30_dir = self._t30_dir()
+        wait_until = wait_until or os.environ.get("T30_WAIT_UNTIL", "08:10").strip()
+        got_today = self._wait_t30_today(t30_dir, wait_until, poll_sec)
         untradable, t30_meta = _t30.load_untradable(t30_dir)
         self._t30_meta = t30_meta        # /api/t30 顯示用 (檔案 ok/stale/missing)
         if t30_meta["missing_all"]:
@@ -885,6 +940,35 @@ class Runner:
                                 f"全額交割名單可能過時 (照用,請檢查取檔 timer)")
             logger.info(f"[runner] T30 禁單名單: {len(untradable)} 檔 (全額交割/需預收)")
         self.session.set_untradable(untradable)
+        if not got_today and not self._stop_event.is_set():
+            self._start_t30_recheck(t30_dir)
+
+    def _start_t30_recheck(self, t30_dir: str, at_time: str = "",
+                           poll_sec: float = 0.0) -> None:
+        """第一次載入是舊檔 → 背景等到 fetch_t30.sh 的重試死線之後再讀一次。
+
+        set_untradable 是整組 rebind(與 marked_snapshot 的讀法相容),所以盤前替換安全;
+        08:30 篩選開始前補正完畢。等不到今日檔就維持原名單(已經叫過 CRITICAL)。"""
+        at_time = at_time or os.environ.get("T30_RECHECK_AT", "08:26").strip()
+        poll_sec = poll_sec or float(os.environ.get("T30_RECHECK_POLL_SEC", "30"))
+
+        def _run():
+            try:
+                _t30 = _t30_module()
+                if not self._wait_t30_today(t30_dir, at_time, poll_sec):
+                    return
+                untradable, meta = _t30.load_untradable(t30_dir)
+                before = set(self.session.untradable or ())
+                self._t30_meta = meta
+                self.session.set_untradable(untradable)
+                added = sorted(set(untradable) - before)
+                removed = sorted(before - set(untradable))
+                logger.warning(f"[runner] T30 重讀成功 → {len(untradable)} 檔 "
+                               f"(新增 {len(added)}: {added[:10]};移除 {len(removed)}: {removed[:10]})")
+            except Exception as e:
+                logger.error(f"[runner] T30 重讀失敗: {e}")
+
+        threading.Thread(target=_run, name="t30-recheck", daemon=True).start()
 
     def abandon_symbol(self, symbol: str) -> bool:
         """前端「取消追蹤」(2026-08-12) — 停止該檔一切自動化 (含出場),使用者自負。
