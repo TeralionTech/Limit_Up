@@ -94,6 +94,8 @@ class Runner:
         self._timer_threads: list = []
         # overnight_holdings.json 檔案鎖 — 13:24 主流程與前端 add/remove API 都會寫
         self._overnight_file_lock = threading.Lock()
+        # 隔日賣價格重查鎖 — 主流程 (08:30 / 08:59:50) 與手動加入的背景 thread 都會重查
+        self._overnight_price_lock = threading.Lock()
         # 逐筆撮合開始時間 (= cfg.end_time,_run_all_phases 覆寫) — 此前的 trades
         # 都是試撮,不可觸發任何下單 (2026-08-10 2491 事故)
         self._trade_start_time = dtime(9, 0)
@@ -331,20 +333,37 @@ class Runner:
         merged.update(ups)
         self.session.set_overnight_limit_ups(merged)
 
+    def _overnight_now(self) -> list:
+        """隔日賣標的的**即時**清單 (以 session 為準)。
+
+        2026-09-30 node1/node4 事故: runner 在 08:00 把清單讀進區域變數後,整個早上都用那份
+        快照。IDC 系統前一天買的 2030 不在我們的清單檔裡,使用者照 log 提示在 08:33 手動加入,
+        但 09:00 轉場拿 08:00 的空快照判斷「無隔日賣」→ 直接收工、行情停掉 → 開盤後漲停
+        打開也沒賣。同源的洞還有 08:59:50 的訂閱與價格重查的閘門。
+        凡是問「現在有哪些隔日賣標的」都呼叫這支,不要再用早上的快照。"""
+        return list(self.session.overnight_symbols())
+
+    def _with_overnight(self, base) -> list:
+        """base (marked / watchlist) + 即時隔日賣清單,保序去重 — 訂閱與 09:00 保留清單共用。"""
+        base = list(base)
+        return base + [s for s in self._overnight_now() if s not in base]
+
     def _refresh_overnight_prices(self, attempts: int = 1, sleep_sec: float = 0.0,
                                   label: str = "") -> dict:
         """再查一次隔日賣標的的今日漲停/跌停價並覆寫 session (require_today)。
         node 在 08:30 與 08:59:50 (拉快照前) 各叫一次 — 08:00 查到的可能還是昨日值,
-        且 UI 盤中新增的隔日賣標的也在此補到價格。"""
-        syms = self.session.overnight_symbols()
-        if not syms:
-            return {}
-        ups = self._query_overnight_prices(syms, attempts=attempts, sleep_sec=sleep_sec,
-                                           require_today=True)
-        self._push_overnight_prices(ups)
-        logger.info(f"[runner] 隔日賣價格重查 ({label or 'refresh'}): 漲停 {ups} / "
-                    f"跌停 { {s: self.limit_downs.get(s) for s in syms} }")
-        return ups
+        且 UI 盤中新增的隔日賣標的也在此補到價格 (track_overnight 加入當下也會叫一次)。
+        主流程與手動加入的背景 thread 都會進來 → 整段上鎖,避免兩邊交錯寫 limit_downs。"""
+        with self._overnight_price_lock:
+            syms = self._overnight_now()
+            if not syms:
+                return {}
+            ups = self._query_overnight_prices(syms, attempts=attempts, sleep_sec=sleep_sec,
+                                               require_today=True)
+            self._push_overnight_prices(ups)
+            logger.info(f"[runner] 隔日賣價格重查 ({label or 'refresh'}): 漲停 {ups} / "
+                        f"跌停 { {s: self.limit_downs.get(s) for s in syms} }")
+            return ups
 
     def _run_node_phases(self):
         """ROLE=node: 略過 universe/limit_ups/filter;等到 HUB_FREEZE_TIME 向 Hub 拉 marked 快照 →
@@ -368,15 +387,17 @@ class Runner:
         overnight_syms = self._prepare_overnight(output_dir)
         if overnight_syms:
             logger.info(f"[node] 隔日賣標的 {len(overnight_syms)} 檔 → 一併訂閱、9:00 開盤賣")
-            # 2026-09-10 node4 事故: 08:00 查到的漲停/跌停價可能是昨日值 → 08:30 再查一次
-            # (要求回應 date == 今日),08:59:50 拉快照前最後再確認一次 (下面)。
-            self._wait_until_clock("08:30:00")
-            self._refresh_overnight_prices(attempts=3, sleep_sec=1.0, label="08:30")
+        # 2026-09-10 node4 事故: 08:00 查到的漲停/跌停價可能是昨日值 → 08:30 再查一次
+        # (要求回應 date == 今日),08:59:50 拉快照前最後再確認一次 (下面)。
+        # 2026-09-30: 兩次重查**不再以 08:00 的清單當閘門** — 08:00 清單是空的、使用者稍後
+        # 才在 UI 手動加入時,兩次都被跳過,該檔整天沒有漲停/跌停價。重查函式讀的是即時
+        # 清單,空的會自己跳過;這裡之後一律用 _overnight_now(),overnight_syms 只供上面那行 log。
+        self._wait_until_clock("08:30:00")
+        self._refresh_overnight_prices(attempts=3, sleep_sec=1.0, label="08:30")
 
         # 等到 Hub 凍結時點才拉 (免 08:00–08:59:50 空輪詢);死線 = 預掛前 1 秒 (08:59:57)
         self._wait_until_clock(self.cfg.hub_freeze_time)
-        if overnight_syms:
-            self._refresh_overnight_prices(attempts=1, sleep_sec=0.0, label="freeze")
+        self._refresh_overnight_prices(attempts=1, sleep_sec=0.0, label="freeze")
         pre_t = self._parse_time_hhmm(self.cfg.pre_order_time) or dtime(8, 59, 58)
         now = datetime.now()
         deadline_ts = now.replace(hour=pre_t.hour, minute=pre_t.minute,
@@ -398,7 +419,8 @@ class Runner:
         unsub_ref = {"fn": None}
         on_book = make_on_book_handler(self.state, self.limit_ups, self.cfg, unsub_ref)
         # 訂閱 = marked + 隔日賣標的 (隔日賣標的無 limit_up → filter handler 不會 mark;09:00 由 trader 賣出)
-        sub_syms = list(marked) + [s for s in overnight_syms if s not in marked]
+        # 用即時清單: 08:00 之後才手動加入的標的也要訂 (09-30 那天 2030 只是剛好也在 marked 裡才有訂到)
+        sub_syms = self._with_overnight(marked)
         self.subscriber = Subscriber(
             sdk=self.sdk, universe=sub_syms, on_book=on_book, login_cfg=self.cfg,
             recorder=self.recorder, batch_size=self.cfg.batch_size,
@@ -428,8 +450,9 @@ class Runner:
         # 等到收盤 → 交易 (共用 _trade_phase);watchlist = 量減半後存活的 marked
         wait_until_end_time(self.state, self.cfg)
         watchlist = self.state.get_marked_list()
-        logger.info(f"[node] 轉場交易,watchlist {len(watchlist)} 檔 (量減半後) + 隔日賣 {len(overnight_syms)} 檔")
-        self._trade_phase(watchlist, overnight_syms)
+        overnight_live = self._overnight_now()      # 即時清單,不是 08:00 的快照 (2026-09-30 事故)
+        logger.info(f"[node] 轉場交易,watchlist {len(watchlist)} 檔 (量減半後) + 隔日賣 {len(overnight_live)} 檔")
+        self._trade_phase(watchlist, overnight_live)
 
     def get_status(self) -> dict:
         """給 API /api/status 用的整體狀態 snapshot."""
@@ -592,8 +615,10 @@ class Runner:
         watchlist = [row["symbol"] for row in self.state.snapshot()]
         logger.info(f"[runner] 篩選階段結束，watchlist {len(watchlist)} 檔")
 
-        # 9:00 轉場: 只留 marked + 隔日賣標的 — 其餘全退訂,並加訂 trades
-        keep = watchlist + [s for s in overnight_syms if s not in watchlist]
+        # 9:00 轉場: 只留 marked + 隔日賣標的 — 其餘全退訂,並加訂 trades。
+        # 隔日賣用即時清單: 拿 08:00 的快照會把之後手動加入的標的在這裡 keep_only 退訂掉
+        overnight_live = self._overnight_now()
+        keep = self._with_overnight(watchlist)
         # 09:00 後 recorder 只落檔 keep:零標記日 subscriber 不退訂 (留全母體給 UI 查) 但不再錄 —
         # 否則 930 檔整天 books 一天 5GB (2026-09-03/04/08 把 hub 磁碟寫滿)。replay 只需 keep。
         if self.recorder:
@@ -622,11 +647,14 @@ class Runner:
             logger.info("[runner] LIVE_SUBSCRIBE 結束")
             return
 
-        self._trade_phase(watchlist, overnight_syms)
+        self._trade_phase(watchlist, overnight_live)
 
     def _trade_phase(self, watchlist, overnight_syms):
         """9:00 起交易 (建 Trader + 首筆種子化 + 等到 13:24) + 收盤 (撤單/存隔日賣/收檔) —
         standalone 與 node 共用同一段,避免兩條路徑漂移。"""
+        # 「有沒有隔日賣要顧」一律問 session (即時清單),不信呼叫端傳進來的 list —
+        # 那可能是 08:00 的快照 (2026-09-30: 手動加入的 2030 被當成不存在 → 這裡直接收工)。
+        overnight_syms = self._overnight_now()
         if not watchlist and not overnight_syms:
             logger.info("[runner] 篩選結果空 + 無隔日賣 + SKIP_TRADER=false → 直接 finished")
             self.subscriber.stop()
@@ -824,9 +852,14 @@ class Runner:
             logger.warning(f"[runner] 寫持倉歷史失敗: {e}")
 
     def track_overnight(self, symbol: str) -> bool:
-        """前端手動加入一檔隔日賣標的: 加清單 + 盤中即時訂閱 + 立即寫回檔案 (持久化)。
+        """前端手動加入一檔隔日賣標的: 加清單 + 盤中即時訂閱 + 立即寫回檔案 (持久化)
+        + 背景補查今日漲停/跌停價。
 
         回 True=新加入、False=已在清單。
+        今天已無主流程在收行情 (見 _auto_sell_unavailable_reason) → 照樣加入並存檔,
+        但 raise RuntimeError 明講「今天不會自動賣」— 絕不靜默接受一個不會被執行的請求。
+        典型用途: 同帳號的 IDC 系統買到、我們的清單不知道的持倉,使用者連線後照
+        「券商庫存有但隔日賣清單沒有」的提示手動補進來 (2026-09-30)。
         """
         added = self.session.add_overnight(symbol)
         if self.subscriber:
@@ -835,7 +868,52 @@ class Runner:
             except Exception as e:
                 logger.warning(f"[runner] 手動加訂 {symbol} 失敗: {e}")
         self._write_overnight_file()   # 立即持久化,重啟仍在
+        # 加入當下就補查今日漲停/跌停價 (背景),UI 立刻看得到,不用等 08:30 / 08:59:50 的重查
+        self._refresh_overnight_prices_async("manual-add")
+        # 今天已經沒有主流程在收行情 → 這檔今天不會自動賣。清單照樣存檔 (明天 08:00 會載入),
+        # 但一定要讓使用者知道 — 丟 RuntimeError 讓 API 回 400,前端會以 ✗ 訊息顯示。
+        why = self._auto_sell_unavailable_reason()
+        if why:
+            logger.critical(f"[runner] ⚠ 手動加入隔日賣 {symbol},但{why} — 今天**不會自動賣出**,"
+                            f"請手動處理;清單已存檔,下個交易日 08:00 會載入")
+            raise RuntimeError(f"{symbol} 已加入清單並存檔,但{why} — 今天不會自動賣出,請手動賣;"
+                               f"清單會保留到下個交易日")
         return added
+
+    def _refresh_overnight_prices_async(self, label: str) -> None:
+        """背景補查隔日賣標的的今日漲停/跌停價 (REST,不卡 API thread)。
+        runner 沒在跑或尚未登入行情 → 略過 (08:00 的 _prepare_overnight 會查)。"""
+        if not self.is_running() or self.sdk is None:
+            return
+
+        def _run():
+            try:
+                self._refresh_overnight_prices(attempts=2, sleep_sec=1.0, label=label)
+            except Exception as e:
+                logger.warning(f"[runner] 補查隔日賣價格失敗 ({label}): {e}")
+
+        threading.Thread(target=_run, name="overnight-price-refresh", daemon=True).start()
+
+    def _auto_sell_unavailable_reason(self) -> str:
+        """現在手動加入的隔日賣標的,今天還賣不賣得掉?回空字串 = 可以 (或不在今日交易時段內)。
+
+        只在「平日 08:00 ~ 收盤」這段時間判斷: 08:00 前加入 → 當天 08:00 會正常載入;
+        收盤後/假日加入 → 是替下個交易日加的,不用警告。
+        這段時間內主流程若沒在跑 (09:00 當下沒有任何標的而提早收工、出錯、或服務在
+        08:00 之後才重啟所以今天根本沒啟動),就沒有人收行情、賣出規則不會被觸發。"""
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return ""
+        end_t = self._parse_time_hhmm(self.cfg.trading_end_time if self.cfg else "13:24:00") or dtime(13, 24)
+        if not (dtime(8, 0) <= now.time() < end_t):
+            return ""
+        if self.phase == Phase.FINISHED:
+            return "今日主流程已在 09:00 收工 (當時沒有任何標的)、行情已停"
+        if self.phase == Phase.ERROR:
+            return "今日主流程出錯已停止"
+        if not self.is_running():
+            return "今日主流程沒有在執行"
+        return ""
 
     def untrack_overnight(self, symbol: str) -> bool:
         """前端移除一檔隔日賣標的 + 立即寫回檔案。回 True=有移除。"""
