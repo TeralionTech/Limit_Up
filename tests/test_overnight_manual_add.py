@@ -169,6 +169,9 @@ def _node_runner(monkeypatch, marked, add_at):
     monkeypatch.setattr("filter.wait_until_end_time", lambda state, cfg: None)
     monkeypatch.setattr("node_client.pull_marked_snapshot",
                         lambda url, deadline: {"final": True, "symbols": []})
+    # 凍結後補收迴圈 (2026-10-06 修正) 用真實時鐘輪詢到「今天 08:59:57」— 本測試不關心它,換成 no-op
+    monkeypatch.setattr("node_client.poll_marked_snapshot_until",
+                        lambda *a, **k: {"polls": 0, "snapshots": 0, "errors": 0, "last_error": None})
     r._prepare_overnight = lambda output_dir: []                       # 08:00 清單是空的
     r._apply_marked_snapshot = lambda snap: list(marked)
     r._start_pre_order_timer = lambda: None

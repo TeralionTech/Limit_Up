@@ -77,6 +77,14 @@ class Subscriber:
         # symbol → universe 位置 (O(1) 路由;原本 list.index O(n),9:00 keep_only
         # 退訂 ~1900 檔 × 線性掃描會在開盤那一秒燒 CPU)
         self._symbol_idx: dict = {}
+        # 盤中補訂的檔 (add_symbol: 隔日賣手動加入 / 凍結後補收的 marked) — socket loop 每輪
+        # 只 re-subscribe 開機算好的 batches,補訂的檔也要跟著每輪重訂,否則 socket 重連後就漏掉
+        self._extra_symbols: set = set()
+        self._extra_lock = threading.Lock()
+        # socket 已可收訂閱 (socket loop thread 起跑時 set — fugle 2.4.1 的 connect() 是同步到認證完成);
+        # runner 的凍結後補收 (2026-10-06) 等這個 event 才 add_symbol,免得送進還沒連上的 socket
+        self._ready = threading.Event()
+        self._connect_grace_sec = 2.0        # 開機批次送出前的保守等待 (舊行為;測試可調短)
 
     # ─── 對外 API ────────────────────────────────────────────
 
@@ -202,15 +210,30 @@ class Subscriber:
         ws = self._socket_for(symbol)
         if ws is None:
             return False
+        with self._extra_lock:
+            self._extra_symbols.add(symbol)      # 之後 socket loop 每輪一起重訂 (重連後不漏)
         ok = True
+        sent = []
         for ch in ("books", "trades"):
+            if self.has_ack(ch, symbol):
+                continue        # 已訂到 (例: 隔日賣標的又被補收) → 不重複訂 (舊 id 會丟失、tick 雙份)
             try:
                 ws.subscribe({"channel": ch, "symbol": symbol})
+                sent.append(ch)
             except Exception as e:
                 ok = False
                 logger.warning(f"[subscriber] add_symbol {symbol} {ch} 失敗: {str(e)[:150]}")
-        logger.warning(f"[subscriber] 手動加訂 {symbol} (books+trades) ok={ok}")
+        logger.warning(f"[subscriber] 手動加訂 {symbol} 送出 {sent or '無 (已訂)'} ok={ok}")
         return ok
+
+    def is_ready(self) -> bool:
+        """socket 已連線並認證完成 (socket loop thread 已起跑) — 此後 add_symbol 的訂閱伺服器才收。"""
+        return self._ready.is_set()
+
+    def has_ack(self, channel: str, symbol: str) -> bool:
+        """伺服器是否已回 event=subscribed (帶 subscription id) — 補訂成功的真正依據。"""
+        with self._sub_ids_lock:
+            return (channel, symbol) in self._sub_ids
 
     def request_unsubscribe(self, symbol: str):
         """單檔退訂 (unmark 淘汰時呼叫) — thread-safe，可在 message handler 內呼叫。
@@ -463,7 +486,18 @@ class Subscriber:
 
         # 給 broker 一點時間完成 handshake (跟 Alex 一致 — connect 後不等就 subscribe，
         # 但至少 sleep 2s 給 TLS + auth 時間)
-        self._stop.wait(2)
+        # fugle-marketdata 2.4.1 (pin) 的 ws.connect() 是同步的: 忙等到 auth_status 為
+        # AUTHENTICATED/UNAUTHENTICATED 才返回 (失敗 raise) — 進到這裡 socket 已完成認證,
+        # add_symbol 的補訂現在就送得進去;下面的 grace 只是開機批次的保守等待 (維持舊行為)
+        self._ready.set()
+        self._stop.wait(self._connect_grace_sec)
+        if not batches:
+            # 開機母體空 (node 首份快照 0 檔且無隔日賣 — 2026-10-06 六台即此) → 以一個空批常駐:
+            # 每輪只重訂 add_symbol 補進來的 extras 然後 wait。舊版 for 迴圈體從不執行、沒有任何
+            # wait → 100% CPU 忙轉到收盤,跟補收/預掛/行情 callback 搶 GIL
+            batches = [[]]
+            logger.info(f"[socket#{socket_idx}] 開機母體空 — 常駐等待 add_symbol 補訂 "
+                        f"(每 {self.batch_rotate_sec}s 重訂 extras)")
 
         round_num = 0
         while not self._stop.is_set():
@@ -478,7 +512,14 @@ class Subscriber:
                 first_err_sample = None
                 with self._removed_lock:
                     removed_snapshot = set(self._removed)
-                for sym in batch:
+                # 盤中補訂的檔 (add_symbol) 歸這條 socket 的也一起重訂 (每輪一次,跟著第 1 批) —
+                # 否則 socket 重連後漏掉 (開機 batches 是固定的)
+                extras: list = []
+                if i == 1:
+                    with self._extra_lock:
+                        extras = [s for s in sorted(self._extra_symbols)
+                                  if s not in batch and self._socket_for(s) is ws]
+                for sym in list(batch) + extras:
                     if sym in removed_snapshot:
                         continue
                     try:
@@ -495,7 +536,8 @@ class Subscriber:
 
                 if len(batches) == 1:
                     # 只有 1 批 → 常駐，不必輪播
-                    logger.info(f"[socket#{socket_idx}] round {round_num} 訂 {len(batch)} 檔 (常駐)")
+                    logger.info(f"[socket#{socket_idx}] round {round_num} 訂 {len(batch)} 檔"
+                                f"{f' + 補訂 {len(extras)} 檔' if extras else ''} (常駐)")
                     self._stop.wait(self.batch_rotate_sec)
                     continue
 

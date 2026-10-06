@@ -103,6 +103,12 @@ class State:
         08:59:58 預掛也不會下這檔。回 True=有移除、False=不在標記清單。"""
         return self._unmark(symbol, "manual_remove", {})
 
+    def unmark_hub_dropped(self, symbol: str, detail: str = "") -> bool:
+        """node 凍結後補收的檔,Hub 之後的 final 快照又把它拿掉 (Hub 端淘汰) → 跟著淘汰。
+        只用於補收視窗 (08:59:50–57) 內才新增、本機行情剛訂閱、未必看得到那筆鎖破的檔
+        (2026-10-07;首份快照的檔仍由 node 自己的 book handler 決定)。"""
+        return self._unmark(symbol, "hub_dropped", {"detail": detail})
+
     def _unmark(self, symbol: str, reason: str, extra: dict) -> bool:
         with self._lock:
             if symbol not in self.marked:

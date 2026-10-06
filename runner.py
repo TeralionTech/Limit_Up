@@ -228,41 +228,238 @@ class Runner:
         marked: list = []
         t30_set: set = set()
         self._node_bid_vol_fallback = {}     # sym → Hub 最後已知漲停層委買量 (20% cap 兜底)
+        self._node_known_syms = set()        # 首份快照見過的檔 (凍結後補收只處理不在這裡的)
         if snap and snap.get("symbols"):
             for s in snap["symbols"]:
-                sym = s["symbol"]
-                lu = float(s.get("limit_up") or 0.0)
-                self.limit_ups[sym] = lu
-                self.dispositions[sym] = bool(s.get("is_disposition"))
-                down = float(s.get("limit_down") or 0.0)
-                if down > 0:
-                    self.limit_downs[sym] = down
-                self.day_tradable[sym] = bool(s.get("day_tradable", True))
-                if s.get("is_t30"):
-                    t30_set.add(sym)
-                # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
-                max_vol = int(s.get("max_bid_vol") or 0)
-                self.state.mark(sym, lu, max_vol, lu,
-                                first_tick=bool(s.get("first_tick")))
-                last_vol = s.get("last_bid_vol")
-                self.state.update_max_bid(sym, max_vol if last_vol is None else int(last_vol))
-                # 20% 風控②母數兜底: node 08:59:58 若 subscriber 還沒有該檔 book
-                # (8 秒內零 tick、訂閱 snapshot 也沒到),退用 Hub 最後已知漲停層委買量
-                # → 有 cap 總比無 cap 好 (無 cap = 純預算算張,可能超過隊伍 20%)
-                self._node_bid_vol_fallback[sym] = int(
-                    max_vol if last_vol is None else int(last_vol))
+                sym = s.get("symbol") if isinstance(s, dict) else None
+                try:
+                    self._node_known_syms.add(self._seed_marked_entry(s, t30_set))
+                except Exception as e:
+                    # 一檔資料壞掉只跳過那一檔 (seed 是先解析後寫入,不留半套狀態),不讓整天 ERROR
+                    logger.error(f"[node] Hub 快照 {sym} 資料壞掉 → 跳過: {e} ({s})")
+                    if sym:
+                        self._node_known_syms.add(sym)
             marked = self.state.get_marked_prioritized()
             logger.info(f"[node] 由 Hub 快照建 marked {len(marked)} 檔 (hub ts={snap.get('ts')}; "
                         f"T30 {len(t30_set)} 檔, 跌停價 {len(self.limit_downs)} 檔)")
         else:
-            logger.warning("[node] 無 marked 快照 → 今日不交易 (仍常駐收 tick 供查詢)")
+            logger.warning("[node] 首份 marked 快照無標的 (0 檔或拉不到) → 08:59:57 前持續向 Hub 補收 "
+                           "(2026-10-06 4716);仍無則今日不交易 (仍常駐收 tick 供查詢)")
 
         # 風控資料交給交易會話 (與 standalone runner 的 set 流程對齊)
+        self._node_t30_set = t30_set
         self.session.set_dispositions(self.dispositions)
         self.session.set_limit_downs(self.limit_downs)      # 出場=跌停價限價賣 (處置股必要)
         self.session.set_day_tradable(self.day_tradable)    # 禁現沖 → 部位減半 (風控①)
         self.session.set_untradable(t30_set)                # T30 全額交割禁單 (08-12 事故防線)
         return marked
+
+    def _seed_marked_entry(self, s: dict, t30_set: set) -> str:
+        """把 Hub 快照裡的**一檔**灌進本地: limit_ups / 處置 / 跌停價 / 禁現沖 / T30 + state 兩步 seed
+        + 20% 兜底量。首份快照 (_apply_marked_snapshot) 與凍結後補收 (_catch_up_late_marks) 共用,
+        兩條路徑語意完全相同。回 symbol。
+
+        **先解析、後寫入**: 任何欄位壞掉在解析階段就 raise,尚未動到任何狀態 (不留「已 mark 但沒
+        跌停價/T30/兜底量」的半套檔);無漲停價 (<=0) 視為壞資料 — 否則會以 0 價 mark、永遠 unmark
+        不掉、還進市價盲送 (2026-10-07 審查)。寫入順序 state 先、limit_ups 後: 該檔若已在訂閱中
+        (隔日賣標的),filter handler 看到 limit_ups 才會自己 mark,先寫 state 才保得住 Hub 峰值。"""
+        # ── 純解析 (不碰 self.* / state) ──
+        sym = str(s["symbol"] or "").strip()
+        if not sym:
+            raise ValueError("symbol 空")
+        lu = float(s.get("limit_up") or 0.0)
+        if lu <= 0:
+            raise ValueError(f"{sym} 無漲停價 (limit_up={s.get('limit_up')!r})")
+        down = float(s.get("limit_down") or 0.0)
+        is_dispo = bool(s.get("is_disposition"))
+        day_tr = bool(s.get("day_tradable", True))
+        is_t30 = bool(s.get("is_t30"))
+        first_tick = bool(s.get("first_tick"))
+        max_vol = int(float(s.get("max_bid_vol") or 0))
+        last_raw = s.get("last_bid_vol")
+        last_vol = max_vol if last_raw is None else int(float(last_raw))
+        # ── 寫入 ──
+        # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
+        self.state.mark(sym, lu, max_vol, lu, first_tick=first_tick)
+        self.state.update_max_bid(sym, last_vol)
+        self.limit_ups[sym] = lu
+        self.dispositions[sym] = is_dispo
+        if down > 0:
+            self.limit_downs[sym] = down
+        self.day_tradable[sym] = day_tr
+        if is_t30:
+            t30_set.add(sym)
+        # 20% 風控②母數兜底: node 08:59:58 若 subscriber 還沒有該檔 book
+        # (8 秒內零 tick、訂閱 snapshot 也沒到),退用 Hub 最後已知漲停層委買量
+        # → 有 cap 總比無 cap 好 (無 cap = 純預算算張,可能超過隊伍 20%)
+        self._node_bid_vol_fallback[sym] = last_vol
+        return sym
+
+    def _catch_up_late_marks(self, deadline_ts: float, time_fn=None, sleep_fn=None,
+                             urlopen=None, poll_interval: float = 0.5, timeout: float = 0.7,
+                             resend_after: float = 1.0, max_sends: int = 3) -> dict:
+        """08:59:50 拿到首份快照後,**繼續問 Hub 到 deadline_ts (08:59:57)**:凍結後才鎖上的檔
+        補灌狀態 + 補訂閱。08:59:58 的預掛計時器讀的是當下的 marked 清單,所以會一併預掛。
+
+        2026-10-06 事故: Hub 的「凍結」只是旗標、名單還是活的 — 4716 在 08:59:54 才鎖上並被 Hub
+        標記 (買一 20.95 × 165 張、無賣單),但 node 08:59:50 拿到首份 final 快照 (0 檔) 就不再問,
+        六台整天沒下單;IDC 系統有下,4716 整天鎖死。
+
+        安全邊界 (2026-10-07 審查後定案):
+        (1) **首份快照的檔只「加」不「減」** — Hub 之後拿掉它,由 node 自己的 book handler 決定
+            (本機已有 ≥8 秒行情)。**補收的檔**本機行情才剛訂 (盤前試撮簿每 5 秒才廣播一次,
+            訂閱後 3~6 秒才有第一筆),未必看得到 Hub 看到的那筆鎖破 → Hub 之後的 final 快照沒有它
+            = 跟著淘汰 (state.unmark_hub_dropped + 退訂 + 撤單)。
+        (2) node 自己已淘汰 (discarded) 的檔不復活 (state.mark 本來就拒絕,這裡也先跳過不訂閱)。
+        (3) 補訂閱以**券商 ack** 為準 (subscriber.has_ack): socket 就緒 (is_ready) 才送;送出成功
+            但沒 ack → 每 resend_after 秒再送、最多 max_sends 次;送出失敗 (例外) → 下份快照再試;
+            迴圈結束前對仍沒 ack 的檔再補送一次。到死線仍沒 ack → WARNING 點名 — 預掛仍會做
+            (20% 母數退用 Hub 兜底量),books 之後由 socket loop 每輪重訂 extras 續補,
+            trades 由預掛計時器的 subscribe_trades_for 補。
+        (4) 一檔資料壞掉只跳過那一檔 (seed 先解析後寫入,不留半套),同份快照其他檔照常。
+        (5) 請求含逾時都在死線前結束、晚於死線的回應丟棄 (見 node_client.poll_marked_snapshot_until);
+            整段任何例外只記 log,不影響主流程 (最壞 = 回到沒有補收的舊行為)。"""
+        import time as _time
+        from node_client import poll_marked_snapshot_until
+        _now = time_fn or _time.time
+        known = set(getattr(self, "_node_known_syms", None) or set())
+        t30_set = set(getattr(self, "_node_t30_set", None) or set())
+        added: list = []
+        dropped: list = []
+        failed: list = []
+        pending: dict = {}          # sym → {"sends": 成功送出次數, "last": 上次送出時刻, "ok": 曾送出成功}
+        sub = self.subscriber
+
+        def _ready() -> bool:
+            fn = getattr(sub, "is_ready", None)
+            return True if fn is None else bool(fn())
+
+        def _acked(sym: str) -> bool:
+            fn = getattr(sub, "has_ack", None)
+            if fn is None:                      # 沒有 ack 機制的 subscriber: 送出成功即視為訂到
+                return bool(pending.get(sym, {}).get("ok"))
+            return bool(fn("books", sym))
+
+        def _try_subscribe(force: bool = False):
+            if sub is None:
+                return
+            now = _now()
+            for sym in list(pending):
+                if _acked(sym):
+                    pending.pop(sym, None)
+                    continue
+                if not _ready():
+                    continue
+                p = pending[sym]
+                if p["sends"] and not force:
+                    if p["sends"] >= max_sends or (now - p["last"]) < resend_after:
+                        continue
+                ok = False
+                try:
+                    ok = bool(sub.add_symbol(sym))
+                except Exception as e:
+                    logger.warning(f"[node] 補訂閱 {sym} 例外: {e}")
+                p["last"] = now
+                if ok:
+                    p["sends"] += 1
+                    p["ok"] = True
+                if _acked(sym):
+                    pending.pop(sym, None)
+
+        def _on_snapshot(snap):
+            present: set = set()
+            new_entries: list = []
+            try:
+                for s in snap.get("symbols") or []:
+                    sym = s.get("symbol") if isinstance(s, dict) else None
+                    if not sym:
+                        continue
+                    present.add(sym)
+                    if sym in known:
+                        continue
+                    if self.state.is_discarded(sym):
+                        known.add(sym)
+                        logger.info(f"[node] 凍結後 Hub 新增 {sym},但本機已淘汰 → 不復活")
+                        continue
+                    try:
+                        self._seed_marked_entry(s, t30_set)
+                    except Exception as e:
+                        known.add(sym)          # 同一份壞資料不必每 0.5 秒重試 (Hub 不會自己修好)
+                        failed.append(sym)
+                        logger.error(f"[node] 凍結後補收 {sym} 資料壞掉 → 跳過: {e} ({s})")
+                        continue
+                    known.add(sym)
+                    new_entries.append(sym)
+                    logger.warning(f"[node] 凍結後補收 marked: {sym} @ {s.get('limit_up')} "
+                                   f"(Hub 峰值 {s.get('max_bid_vol')} / 最後 {s.get('last_bid_vol')} 張,"
+                                   f" hub ts={snap.get('ts')}) → 補訂閱 + seed")
+            finally:
+                if new_entries:
+                    added.extend(new_entries)
+                    for sym in new_entries:
+                        pending[sym] = {"sends": 0, "last": 0.0, "ok": False}
+                    # 風控資料整組 rebind 給交易會話 — 與首份快照同一套 setter
+                    self.session.set_dispositions(self.dispositions)
+                    self.session.set_limit_downs(self.limit_downs)
+                    self.session.set_day_tradable(self.day_tradable)
+                    self.session.set_untradable(t30_set)
+            # 補收的檔 Hub 之後又拿掉 (Hub 端淘汰) → 跟著淘汰 (安全邊界 (1))
+            for sym in list(added):
+                if sym in present or sym in dropped or not self.state.is_marked(sym):
+                    continue
+                if self.state.unmark_hub_dropped(sym, f"hub ts={snap.get('ts')}"):
+                    dropped.append(sym)
+                    pending.pop(sym, None)
+                    logger.warning(f"[node] ✗ 凍結後補收的 {sym} 又被 Hub 拿掉 → 淘汰 + 退訂 + 撤單")
+                    self._node_drop_symbol(sym)
+            if pending:
+                _try_subscribe()
+
+        stats: dict = {}
+        try:
+            if not self.cfg or not self.cfg.hub_url:
+                return {"added": [], "dropped": [], "failed": [], "unsubscribed": [], "stats": stats}
+            stats = poll_marked_snapshot_until(
+                self.cfg.hub_url, deadline_ts, _on_snapshot, poll_interval=poll_interval,
+                timeout=timeout, time_fn=_now, sleep_fn=sleep_fn or _time.sleep, urlopen=urlopen,
+                stop_fn=self._stop_event.is_set)
+            if pending:
+                _try_subscribe(force=True)      # 迴圈結束前對還沒 ack 的檔再送一次
+        except Exception as e:
+            logger.exception(f"[node] 凍結後補收迴圈例外 (退回原行為): {e}")
+        self._node_known_syms = known
+        self._node_t30_set = t30_set
+        unsubscribed = sorted(pending)
+        summary = (f"輪詢 {stats.get('polls')} 次, final {stats.get('snapshots')} 份, "
+                   f"非 final {stats.get('non_final')} 份, 晚到丟棄 {stats.get('late_drops')} 份, "
+                   f"錯誤 {stats.get('errors')} 次, 視窗結束 {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+        if added or dropped or failed:
+            logger.warning(f"[node] 凍結後補收 {len(added)} 檔: {added}"
+                           + (f";Hub 又拿掉 → 淘汰: {dropped}" if dropped else "")
+                           + (f";資料壞掉跳過: {failed}" if failed else "")
+                           + (f";到死線仍未訂閱到 (books 無 ack): {unsubscribed}" if unsubscribed else "")
+                           + f" ({summary})")
+        elif not stats.get("snapshots") or stats.get("errors"):
+            logger.warning(f"[node] 凍結後補收: 無新增,但輪詢不順 — {summary}; "
+                           f"最後錯誤: {stats.get('last_error')!r}")
+        else:
+            logger.info(f"[node] 凍結後補收: 無新增 ({summary})")
+        return {"added": added, "dropped": dropped, "failed": failed,
+                "unsubscribed": unsubscribed, "stats": stats}
+
+    def _node_drop_symbol(self, sym: str):
+        """補收後被 Hub 拿掉的檔: 退訂 (隔日賣標的除外) + 撤該檔預掛/pending (未 armed 為 no-op)。
+        用 _run_node_phases 綁好的 _unsub_and_cancel (與 book handler 淘汰同一條路徑)。"""
+        fn = getattr(self, "_node_unsub_and_cancel", None)
+        try:
+            if fn is not None:
+                fn(sym)
+                return
+            if self.subscriber is not None:
+                self._unsub_symbol(sym)
+            self.session.cancel_symbol_orders_async(sym, "hub_dropped")
+        except Exception as e:
+            logger.warning(f"[node] 淘汰 {sym} 的退訂/撤單失敗: {e}")
 
     def _reset_daily_state(self):
         """每輪 runner 啟動都清掉上一輪的盤前參考資料 (2026-09-10 node4 事故)。
@@ -279,6 +476,9 @@ class Runner:
         self.dispositions = {}
         self.day_tradable = {}
         self._node_bid_vol_fallback = {}
+        self._node_known_syms = set()
+        self._node_t30_set = set()
+        self._node_unsub_and_cancel = None
         self._marked_frozen = False
         self._limit_up_progress = {"done": 0, "total": 0, "ok": 0, "fail": 0}
 
@@ -442,10 +642,19 @@ class Runner:
             except Exception as e:
                 logger.warning(f"[node] 撤 {symbol} 委託失敗: {e}")
         unsub_ref["fn"] = _unsub_and_cancel
+        self._node_unsub_and_cancel = _unsub_and_cancel     # 凍結後補收的檔被 Hub 拿掉時走同一條淘汰路徑
 
         # 08:59:58 預掛 (量減半 final_check_all 用 seed 峰值 + node 當前) + 13:23 撤單
         self._start_pre_order_timer()
         self._start_cancel_pending_timer()
+
+        # 凍結後補收 (2026-10-06 4716 事故): 首份快照之後繼續問 Hub 到 08:59:57,
+        # 凍結後才鎖上的檔補灌狀態 + 補訂閱;預掛計時器讀的是當下 marked 清單,會一併預掛。
+        # 整段失敗只記 log → 退回「只拉一次」的舊行為。
+        try:
+            self._catch_up_late_marks(deadline_ts)
+        except Exception as e:
+            logger.exception(f"[node] 凍結後補收失敗 (退回原行為): {e}")
 
         # 等到收盤 → 交易 (共用 _trade_phase);watchlist = 量減半後存活的 marked
         wait_until_end_time(self.state, self.cfg)
@@ -1070,6 +1279,14 @@ class Runner:
         stop_event = self._stop_event
 
         def _timer():
+            # 最外層兜底: 任何未預期例外都進 app log (threading.excepthook 只到 stderr,
+            # 盤後 journal 看不到 timer 為何沒預掛)
+            try:
+                _timer_body()
+            except Exception as e:
+                logger.exception(f"[runner] pre-order-timer 例外 — 預掛/盲送可能未執行: {e}")
+
+        def _timer_body():
             try:
                 hh, mm, ss = map(int, self.cfg.pre_order_time.split(":"))
                 target = _time_cls(hh, mm, ss)
@@ -1121,18 +1338,24 @@ class Runner:
                 logger.warning(f"[runner] 預掛時掛 on_trade 失敗: {e}")
             # 風控②母數: 08:59:58 當下「漲停價那一檔」的委託量快照 (張) → 20% 上限
             bid_vols = {}
-            for _s in marked:
-                _up = float(self.limit_ups.get(_s) or 0)
-                _snap = self.subscriber.get_latest_snapshot(_s) if self.subscriber else None
-                for _lv in ((_snap or {}).get("books") or {}).get("bids", []):
-                    if _up and abs(float(_pick(_lv, "price") or 0) - _up) < 0.001:
-                        bid_vols[_s] = int(_pick(_lv, "size") or 0)
-                        break
-            # node 兜底 (2026-09-01): subscriber 沒該檔 book (訂閱後零 tick) → 退用
-            # Hub 快照最後已知量,20% cap 不失效 (standalone 此 dict 恆空 → 零行為變化)
-            for _s, _v in getattr(self, "_node_bid_vol_fallback", {}).items():
-                if _s not in bid_vols and _s in marked and _v > 0:
-                    bid_vols[_s] = _v
+            try:
+                for _s in marked:
+                    _up = float(self.limit_ups.get(_s) or 0)
+                    _snap = self.subscriber.get_latest_snapshot(_s) if self.subscriber else None
+                    for _lv in ((_snap or {}).get("books") or {}).get("bids", []):
+                        if _up and abs(float(_pick(_lv, "price") or 0) - _up) < 0.001:
+                            bid_vols[_s] = int(_pick(_lv, "size") or 0)
+                            break
+                # node 兜底 (2026-09-01): subscriber 沒該檔 book (訂閱後零 tick) → 退用
+                # Hub 快照最後已知量,20% cap 不失效 (standalone 此 dict 恆空 → 零行為變化)。
+                # 主執行緒的凍結後補收 (08:59:50–57) 會就地插入這個 dict → 用 list() 快照迭代
+                # (dict 複製在 C 層一次完成,不會撞 "dictionary changed size during iteration")
+                for _s, _v in list(getattr(self, "_node_bid_vol_fallback", {}).items()):
+                    if _s not in bid_vols and _s in marked and _v > 0:
+                        bid_vols[_s] = _v
+            except Exception as e:
+                # 母數算壞不能讓整批預掛消失 — 以已算出的部分繼續 (沒 cap 的檔走純預算算張)
+                logger.exception(f"[runner] 預掛 20% 母數計算例外 (以已算出的部分繼續): {e}")
             try:
                 self.session.place_pre_orders(marked, self.limit_ups, stop_event,
                                               limit_up_bid_vols=bid_vols)
