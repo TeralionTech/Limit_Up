@@ -221,8 +221,11 @@ class CentralNotifier:
         vps_id: Optional[int] = int(self.vps_id) if self.vps_id.isdigit() else None
         payload = {"vps_id": vps_id, "fallback_source": self.label or self.node_name or "LimitUp",
                    "level": level, "message": text, "system": "limitup"}
+        # Cloudflare 會擋 urllib 預設的 User-Agent（Python-urllib/3.x → 403 error 1010），一定要自己給一個
         req = urllib.request.Request(f"{self.url}/api/central/notify", data=json.dumps(payload).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "hit-limit-up-notifier/1.0", "Accept": "application/json"},
+                                     method="POST")
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return 200 <= r.status < 300

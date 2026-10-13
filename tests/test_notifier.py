@@ -224,16 +224,18 @@ class TestQueueAndThrottle:
                 pass
 
         def fake_urlopen(req, timeout):
-            calls.append((req.full_url, json.loads(req.data.decode("utf-8")), req.get_header("Content-type"), timeout))
+            calls.append((req.full_url, json.loads(req.data.decode("utf-8")), req.get_header("Content-type"),
+                          req.get_header("User-agent"), timeout))
             return R()
         monkeypatch.setattr(N.urllib.request, "urlopen", fake_urlopen)
         n = CentralNotifier(url="https://central.example/", vps_id="21", label="kled")
         assert n._http_send("warning", "hello") is True
-        url, payload, ctype, timeout = calls[0]
+        url, payload, ctype, ua, timeout = calls[0]
         assert url == "https://central.example/api/central/notify"
         assert payload == {"vps_id": 21, "fallback_source": "kled", "level": "warning",
                            "message": "hello", "system": "limitup"}
         assert ctype == "application/json"
+        assert ua == "hit-limit-up-notifier/1.0"          # Cloudflare 擋 Python-urllib 預設 UA（實機 403 error 1010）
         assert timeout == 10
 
     def test_http_error_returns_false(self, monkeypatch):
