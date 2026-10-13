@@ -645,3 +645,55 @@ class TestSubscriberLateSubscribe:
         sub, ws = _subscriber()
         assert not sub.is_ready()
         assert sub.add_symbol("4716") is True               # 送得出去,但 runner 端會等 is_ready 才送
+
+
+# ─────────────────────────── hub 的「行情過期」名單 (stale_excluded) ───────────────────────────
+def _snap_stale(*entries, stale=()):
+    s = _snap(*entries)
+    s["stale_excluded"] = list(stale)
+    return s
+
+
+class TestHubStaleListOnNode:
+    """hub 的行情連線在 08:59:50 首份名單**之後**才被判定斷線: hub 之後的快照把那些檔移到 stale_excluded。
+    首份名單的檔 node 不會跟著拿掉 (那條規則是為了「hub 看到鎖破」設計的),所以 node 要自己記住這份名單,
+    08:59:58 預掛前排除「hub 說過期、本機也還沒收到五檔」的檔。"""
+
+    def test_first_snapshot_symbol_later_declared_stale_is_remembered_not_discarded(self):
+        r = _node(_entry("8227"), _entry("4716"))
+        res = _catch(r, [_snap_stale(_entry("8227"), _entry("4716")),
+                         _snap_stale(_entry("8227"), stale=["4716"])])
+        assert r._node_hub_stale == {"4716"}
+        assert r.state.is_marked("4716") and res["dropped"] == [], "只是不預掛,不淘汰"
+
+    def test_symbol_the_hub_sees_fresh_again_is_cleared(self):
+        r = _node(_entry("8227"), _entry("4716"))
+        _catch(r, [_snap_stale(_entry("8227"), stale=["4716"]),
+                   _snap_stale(_entry("8227"), _entry("4716"))])
+        assert r._node_hub_stale == set()
+
+    def test_late_added_symbol_that_is_only_temporarily_stale_is_not_discarded(self):
+        """hub 只是暫時看不到它 (連線閃斷) ≠ hub 看到它打開。永久淘汰的話 hub 把它放回來 node 也不會再收。"""
+        r = _node(_entry("8227"))
+        res = _catch(r, [_snap_stale(_entry("8227"), _entry("4716")),
+                         _snap_stale(_entry("8227"), stale=["4716"]),
+                         _snap_stale(_entry("8227"), _entry("4716"))])
+        assert res["added"] == ["4716"] and res["dropped"] == []
+        assert r.state.is_marked("4716") and r._node_hub_stale == set()
+
+    def test_late_added_symbol_really_removed_by_hub_is_still_discarded(self):
+        r = _node(_entry("8227"))
+        res = _catch(r, [_snap_stale(_entry("8227"), _entry("4716")), _snap_stale(_entry("8227"))])
+        assert res["dropped"] == ["4716"] and r.state.is_discarded("4716")
+
+    def test_old_hub_without_the_field_means_nothing_is_stale(self):
+        r = _node(_entry("8227"))
+        r._node_hub_stale = {"9999"}
+        _catch(r, [_snap(_entry("8227"))])
+        assert r._node_hub_stale == set()
+
+    def test_first_snapshot_resets_the_list_each_day(self):
+        r = _node(_entry("8227"))
+        r._node_hub_stale = {"9999"}
+        r._apply_marked_snapshot(_snap_stale(_entry("8227"), stale=["4716"]))
+        assert r._node_hub_stale == {"4716"}

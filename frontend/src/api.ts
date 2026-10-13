@@ -63,8 +63,13 @@ export const api = {
   tradingParams: (p: { total_budget?: number; per_symbol_budget?: number;
                         sizing_mode?: 'budget' | 'fixed_lots'; fixed_lots?: number }) =>
     req<{ ok: boolean }>('/api/trading/params', { method: 'POST', body: JSON.stringify(p) }),
-  tradingArm: (armed: boolean) =>
-    req<{ ok: boolean }>('/api/trading/arm', { method: 'POST', body: JSON.stringify({ armed }) }),
+  // overnightOnly: true = 「開始隔日賣」(arm 但不搶今天的單: 不預掛 / 不盲送 / 不市價追,只做隔日賣與既有部位出場);
+  // false = 明確改為正常搶單;undefined = 舊語意 (後端不會把隔日賣模式悄悄升級成搶單,回 unchanged:true)。
+  // 後端回 overnight_only:true 才代表隔日賣模式真的開了 — 舊後端會忽略這個欄位並以正常模式 arm,呼叫端必須檢查。
+  tradingArm: (armed: boolean, overnightOnly?: boolean) =>
+    req<{ ok: boolean; armed: boolean; overnight_only?: boolean; unchanged?: boolean }>('/api/trading/arm', {
+      method: 'POST',
+      body: JSON.stringify(overnightOnly === undefined ? { armed } : { armed, overnight_only: overnightOnly }) }),
   tradingCloseAll: () =>
     req<{ ok: boolean; sold_symbols: number }>('/api/trading/close_all', { method: 'POST' }),
   tradingOvernight: () => req<{ overnight: OvernightRow[] }>('/api/trading/overnight'),
@@ -258,6 +263,8 @@ export interface TrackingRow {
 export interface TradingStatus {
   mode: 'sim' | 'real'
   armed: boolean
+  entry_enabled?: boolean                         // false = 隔日賣模式 (armed 但不搶新單)
+  arm_mode?: 'off' | 'trade' | 'overnight_only'
   connecting: boolean
   connect_error: string
   connected: boolean

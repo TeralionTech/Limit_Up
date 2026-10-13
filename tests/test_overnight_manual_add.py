@@ -124,6 +124,36 @@ class TestTradePhaseUsesLiveList:
         assert events == ["subscriber.stop", "recorder.close"]
         assert "直接 finished" in caplog.text
 
+    def test_day_with_entries_does_not_finish_early(self, monkeypatch, tmp_path, caplog):
+        """2026-10-12 的 6872: 名單在 08:59:59 全被淘汰、撤單確認只比開盤早 0.45 s。若預掛 P 來不及撤、或
+        淘汰當下已經在券商那邊的市價單在開盤後成交,提早收工就沒有人把那筆部位寫進隔日賣清單 —
+        今天沒人賣、明天的隔日賣也不知道它。今天下過單 → 走 Trader 路徑到 13:24 (不送任何新單)。"""
+        s = make_session()
+        s.place_pre_orders(["6872"], {"6872": 23.95})
+        p = s.trades["6872"].pre_order_no
+        s.cancel_symbol_orders("6872", "unmarked")           # 08:59:59 淘汰 → 撤單
+        r, events = _trade_runner(tmp_path, s)
+
+        def _late_fill(end_time, trader, cfg):               # 取代「等到 13:24」: 開盤後才回來的成交
+            events.append("wait")
+            st = s.trades["6872"]
+            st.filled_lots, st.avg_price = 6, 23.8           # 在途的單成交了 (回報晚到)
+        monkeypatch.setattr("filter._wait_until", _late_fill)
+        with caplog.at_level(logging.WARNING):
+            r._trade_phase([], [])
+        assert "wait" in events and r.trader is not None, "不可以 09:00 就收工"
+        assert "今天下過單" in caplog.text and p
+        import json
+        saved = json.loads((tmp_path / "overnight_holdings.json").read_text(encoding="utf-8"))
+        assert [(h["symbol"], h["lots"]) for h in saved["holdings"]] == [("6872", 6)], \
+            "13:24 要把這筆部位寫進隔日賣清單"
+
+    def test_has_entries_today(self):
+        s = make_session()
+        assert s.has_entries_today() is False
+        s.place_pre_orders(["6872"], {"6872": 23.95})
+        assert s.has_entries_today() is True
+
     def test_caller_list_is_not_trusted(self, tmp_path):
         """呼叫端傳進來的清單裡有 session 已經沒有的標的 (被移除/庫存 0 被清掉) → 以 session 為準。"""
         r, events = _trade_runner(tmp_path, make_session())

@@ -35,6 +35,52 @@ QUERY_MIN_INTERVAL_SEC = 0.21
 QUERY_JOIN_MAX_WAIT_SEC = 30.0    # 等別人在飛查詢的上限 (含 fresh_after 等前一個結束) — 逾時 raise OrderLookupError
 QUERY_FLIGHT_STALE_SEC = 90.0     # 在飛超過此秒數視為卡死 → 不再讓人排隊等它,允許另起一個 (免單一卡死查詢鎖死全部)
 
+# 免查詢撤單 (2026-10-07 node1 隔日賣晚 3.7 s): sdk.stock.get_order_results 整段呼叫期間**整個 Python
+# process 停擺** (行情 tick / 回報 / 其他下單的回應全部卡住;三台 node 的 tick 空窗與該次查詢耗時吻合到
+# 10 ms 內)。同登入家族委託清單 1500~2400 筆時每次 1.1~1.8 s。撤單原本每次都要先拉全清單找委託物件
+# (踩雷點 #6) → 開盤第一筆市價成功後撤預掛 P / 撤多送 M、出場前撤單,全部會凍住 process。
+# 修法: 下單成功時 place_order 回傳的 result.data 本身就是 OrderResult (官方文件 cancel_order 的參數型別;
+# 阻塞式下單「回覆的 Order Response 即會帶回完整的資料內容」) → 記下來,撤單直接用它,不查清單。
+# 任何不順都退回快照舊路徑 (行為 = 修法前),見 RealOrderClient.cancel_cached。
+#
+# 前提 (cancel_order 收下單回傳物件) 上線前尚未實測 → 「已證實」之前從嚴、之後從寬 (2026-10-12 兩輪審查):
+#   已證實 = 本連線曾有一筆免查詢撤單**真的撤成**。(券商回終結文案不算: 認得這筆 ≠ 能用這個物件撤掉 live 單。)
+#   證實前: 每「放棄」一筆 (SDK 例外 / 未知文案 1 次 / 在途文案拖過 DIRECT_CANCEL_INFLIGHT_UNPROVEN_MAX_SEC)
+#           就記一次,記滿 DIRECT_CANCEL_MAX_EXC 筆 (例外要連續) → 整個停用 + CRITICAL,之後 = 修法前的行為。
+#   證實後: 例外視為傳輸層暫態 (只那一筆退回快照,不停用);未知文案每筆給 DIRECT_CANCEL_MAX_REJECTS 次;
+#           在途文案給 DIRECT_CANCEL_INFLIGHT_MAX_SEC。停用之後才回來的撤成 (同一批併發) 也算證實 → 重新啟用。
+#   交易 WS 自動重連 (re_login) 成功 → 停用旗標與計數重設 (已證實保留);各筆「第一次被拒」的時鐘也從新連線
+#   重新起算、斷線時還在往返的呼叫不計 (斷線期間根本無法重試,不可以拿舊時間讓新連線一上來就熔斷)。
+#   第三種失敗樣子 (2026-10-12 第三輪審查): SDK 對下單回傳物件**完全不回應** (不拒、不丟例外)。證實前:
+#     - 往返超過 DIRECT_CANCEL_ROUNDTRIP_MAX_SEC 沒回的每一筆也算放棄一筆 (_note_direct_stuck,每筆只計一次);
+#     - 同步撤單 (cancel() facade;出場 worker 在送賣單前會走到) 放到 helper thread 送、最多等同一個秒數,
+#       逾時 raise → session 入佇列改走快照,**不讓 caller 無限期卡在一個還沒證實的呼叫上**。
+#   證實後同步撤單照舊直接呼叫 (一般的 SDK 卡住 — 修法前的同步撤單同樣沒有逾時)。
+#   注意: 停用 / CANCEL_DIRECT_OBJ=0 還原的是撤單**路徑** (先查清單再撤);session 撤單重試的退避改成
+#   「從該輪結束起算」是另一項獨立修改、任何模式都生效 (免得查詢比退避久時零間隔連續拉全清單)。
+#   熔斷計數 (_direct_cancel_unproven_drops) 同一筆單在同一條連線上只計一次,不論它是「沒回應」「被未知文案拒」
+#   還是「在途拖過上限」— 要兩筆**不同的**單出問題才停用。
+DIRECT_CANCEL_MAX_REJECTS = 3     # 已證實後: 同一書號被券商以未知的非終結文案拒幾次 → 這筆改走快照
+DIRECT_CANCEL_MAX_EXC = 2         # 證實前: 連續幾次 SDK 例外 / 累計放棄幾筆 → 整個停用免查詢撤單 + CRITICAL
+DIRECT_CANCEL_CACHE_MAX = 4000    # 下單回傳物件最多留幾筆 (超過先丟非今日、再丟最舊的四分之一)
+DIRECT_CANCEL_INFLIGHT_MAX_SEC = 10.0          # 已證實: 「在途」文案最多直接重試多久 (自第一次被拒起算)
+DIRECT_CANCEL_INFLIGHT_UNPROVEN_MAX_SEC = 5.0  # 證實前只給這麼久 (10-07 MH014 實測 4.1 s),過了算放棄一筆
+DIRECT_CANCEL_ROUNDTRIP_MAX_SEC = 5.0          # 免查詢撤單 SDK 呼叫往返超過此秒數 = 卡死 (之後這筆改走快照)
+# 終結文案: 券商認得這筆並回報它已終結 → 物件不必再用 (要核實成交量就讓快照來)。
+#   「成交單/部分成交單/取消單已不允許取消」;「該筆委託已無剩餘量(交)[9050-後檯]」(2026-10-06 node4 MH01p:
+#   交易所端對已全數成交委託的撤單拒絕)
+_DIRECT_CANCEL_TERMINAL_HINTS = ("已不允許取消", "已無剩餘量")
+# 在途文案: 撤單請求已被後檯受理、等交易所回覆 (2026-10-07 node1 MH014「證券檢查成交回報是否已成交」:
+#   請求 14.03 受理,交易所 19.25 才確認,歷時 4.1 s;當時用的是快照物件)。換快照物件結果一樣、只是多凍結 →
+#   物件留著繼續免查詢重試 (下一次多半拿到「取消單已不允許取消」或由 ft=30 status 30 回報結案),有時間上限。
+_DIRECT_CANCEL_INFLIGHT_HINTS = ("檢查成交回報",)
+
+
+def _direct_cancel_env_on() -> bool:
+    """env CANCEL_DIRECT_OBJ (預設開;0/false/no/off = 關 → 所有撤單退回「先拉全清單」舊路徑)。每次現讀。"""
+    import os
+    return str(os.environ.get("CANCEL_DIRECT_OBJ", "1")).strip().lower() not in ("0", "false", "no", "off")
+
 
 class _QueryFlight:
     """一個在飛的全清單 get_order_results (single-flight 共用單位)。時間皆 time.perf_counter()。"""
@@ -77,10 +123,16 @@ class CancelRejected(RuntimeError):
     (replica 延遲) — session 端以訊息 / 委託量核實,不符就留佇列下一輪再看。
     仍是 RuntimeError 子類、str(e) 格式「撤單失敗 <書號>: <富邦原文>」不變 (既有 isinstance / classify 契約)。"""
 
-    def __init__(self, msg: str, filled_qty=None, status: str = ""):
+    def __init__(self, msg: str, filled_qty=None, status: str = "", direct: bool = False):
         super().__init__(msg)
         self.filled_qty = filled_qty
         self.status = status
+        self.direct = direct       # True = 免查詢撤單 (下單回傳物件) 被拒;filled_qty/status 一律未知
+
+
+class CancelInFlight(RuntimeError):
+    """同一書號的免查詢撤單正在往返中 (未滿 DIRECT_CANCEL_ROUNDTRIP_MAX_SEC) — **這次什麼都沒送、也沒查清單**。
+    不是失敗也不是成功: session 入佇列、稍後看在途那一筆的結果 (撤成 → 回報/同步結案;被拒 → 照既有規則重試)。"""
 
 
 def _fmt_price(price: float) -> str:
@@ -125,6 +177,18 @@ class RealOrderClient:
     query_join_max_wait = QUERY_JOIN_MAX_WAIT_SEC
     query_flight_stale = QUERY_FLIGHT_STALE_SEC
     _claimed_order_nos: set = frozenset()      # __new__ 替身的預設 (真 client 在 __init__ 換成 set)
+    # 免查詢撤單 (檔頭 DIRECT_CANCEL_*): 下單回傳的委託物件。類別層預設 = 「沒有」(__new__ 替身安全);
+    # 真 client 在 __init__ 換成 instance 專屬 dict。每次 connect 都是新 client → 不會帶到別的登入。
+    _order_objs: Optional[dict] = None         # order_no → (YYYYMMDD, OrderResult)
+    _order_obj_rejects: Optional[dict] = None  # order_no → (被券商以非終結文案拒的次數, 第一次被拒的 monotonic)
+    _order_obj_inflight: Optional[dict] = None # order_no → 免查詢撤單 SDK 呼叫開始的 monotonic (在途中不重送)
+    _order_obj_stuck: Optional[set] = None     # 往返超過門檻、已計入熔斷 (或因重連不該計) 的書號 — 每筆只看一次
+    _order_obj_lock = threading.Lock()
+    _direct_cancel_exc_streak = 0              # 證實前連續「SDK 例外」次數 (券商有回應就歸零)
+    _direct_cancel_unproven_drops = 0          # 證實前被放棄 / 送出後沒回應的單數 (每筆單只計一次)
+    _direct_cancel_charged: Optional[set] = None   # 本連線已計入上面那個數的書號
+    _direct_cancel_proven = False              # True = 本連線已證實券商收下單回傳物件 (見檔頭)
+    _direct_cancel_off = False                 # True = 本 client 已停用免查詢撤單 (見 cancel_cached)
     # session 掛的判斷 hook: rpt → True = 確定「非本策略委託」的拒單回報 → 略過逐筆 ERROR (session 彙總)
     is_foreign_order_report: Optional[Callable[[dict], bool]] = None
 
@@ -139,6 +203,17 @@ class RealOrderClient:
         # 已認領/回傳過的書號 (每筆下單成功後記) — 缺書號反查時排除,讓管線化同標同量多筆在飛時
         # 仍能唯一認領那筆剛送、還沒書號的 (2026-08-28: 管線化打破「每檔同時僅一張活躍委託」假設)
         self._claimed_order_nos: set = set()
+        # 下單回傳的委託物件 (免查詢撤單用;檔頭 DIRECT_CANCEL_*)
+        self._order_objs = {}
+        self._order_obj_rejects = {}
+        self._order_obj_inflight = {}
+        self._order_obj_stuck = set()
+        self._order_obj_lock = threading.Lock()
+        self._direct_cancel_exc_streak = 0
+        self._direct_cancel_unproven_drops = 0
+        self._direct_cancel_charged = set()
+        self._direct_cancel_proven = False
+        self._direct_cancel_off = False
         self._unknown_ctr = 0          # UNKNOWN 書號流水號 — 免同秒兩筆撞同 key 覆寫掉一筆 live 單
         # 委託查詢閘門 (富邦帳務查詢 5/s) — 鎖內只預約時槽、鎖外 sleep;所有 get_order_results 過這裡
         self._query_lock = threading.Lock()
@@ -255,6 +330,10 @@ class RealOrderClient:
             "account_masked": (self.account_no[:3] + "***") if self.account_no else "",
             "is_test": self.is_test,
             "error": self.error_msg,
+            # on / off (自動停用 → 撤單又會先拉全清單、查詢期間 process 停擺) / env_off (CANCEL_DIRECT_OBJ=0)
+            "direct_cancel": self.direct_cancel_state(),
+            # True = 本連線已有一筆免查詢撤單真的撤成 (前提已證實);False 時保險絲從嚴
+            "direct_cancel_proven": bool(self._direct_cancel_proven),
         }
 
     def _require_ready(self):
@@ -325,6 +404,28 @@ class RealOrderClient:
             self.healthy = True
             self.error_msg = ""
             self._relogin_first_fail = None
+            # 免查詢撤單: 新連線重新驗證 (停用旗標 / 計數歸零;斷線期間的例外不該讓它整天停用)。
+            # 「已證實」保留 — 那是 SDK 收不收下單回傳物件的性質,與哪一條連線無關。
+            with self._order_obj_lock:
+                was_off = self._direct_cancel_off
+                self._direct_cancel_off = False
+                self._direct_cancel_exc_streak = 0
+                self._direct_cancel_unproven_drops = 0
+                self._direct_cancel_charged = set()      # 與計數一起歸零 (只清其一會讓新連線的熔斷變鬆)
+                # 斷線期間撤單 worker 停擺、cancel_cached 也過不了 _require_ready → 根本沒機會重試。
+                # 「自第一次被拒起」的時鐘從新連線重新起算 (未知文案的次數保留),否則新連線還沒送出任何一筆
+                # 就會被斷線前的時間戳記熔斷 (第三輪審查)。新連線上照樣只給完整的時間上限,熔斷沒有變鬆。
+                if self._order_obj_rejects:
+                    now_m = time.monotonic()
+                    for _no, (_cnt, _first) in list(self._order_obj_rejects.items()):
+                        self._order_obj_rejects[_no] = (_cnt, now_m)
+                # 斷線當下還在往返的呼叫: 卡住是因為連線斷了、不是因為物件 → 之後超過門檻也不計入熔斷
+                if self._order_obj_inflight:
+                    if self._order_obj_stuck is None:
+                        self._order_obj_stuck = set()
+                    self._order_obj_stuck.update(self._order_obj_inflight)
+            if was_off:
+                logger.warning("[broker] 交易 WS 重連 → 免查詢撤單重新啟用 (先前因例外/未知拒因停用)")
             logger.critical("[broker] ✅ 交易 WS 自動重連成功 — 觸發權威對帳補收")
             if self.on_reconnected:
                 try:
@@ -408,7 +509,8 @@ class RealOrderClient:
                             "MARKET" if market else price, str(msg)[:80])
             raise RuntimeError(f"下單被拒 {symbol}: {msg}")
 
-        order_no = str(_attr(getattr(result, "data", None), "order_no", default="") or "")
+        placed_obj = getattr(result, "data", None)
+        order_no = str(_attr(placed_obj, "order_no", default="") or "")
         if not order_no or order_no in ("?", "None"):
             # 委託已被接受但回傳缺書號 (防禦路徑) — 反查認領,消除追蹤破口。
             # 不 raise: raise 會觸發上層重試 → 重複下單,比丟追蹤更糟。
@@ -418,6 +520,10 @@ class RealOrderClient:
                 logger.critical(f"[broker] ⚠⚠ {symbol} 委託已送出但無法取得書號!"
                                 f"未追蹤曝險 — 請立即人工至券商查驗 (user_def=hitlimit)")
                 order_no = f"UNKNOWN-{int(ts_sent)}-{self._unknown_ctr}"  # 唯一 → 不覆寫掉另一筆 live 單
+        else:
+            # 回傳物件自己帶著這個書號 → 記下來,之後撤這筆不必拉全清單 (缺書號靠反查認領的不記:
+            # 那個物件不完整,撤單照舊走快照)
+            self._remember_order_obj(order_no, placed_obj)
         self._claimed_order_nos.add(order_no)   # 記已認領 → 之後同標同量缺書號反查能排除本筆
         self._write_row(order_no, ts_sent, ts_accepted, action, symbol, lots,
                         "MARKET" if market else price, extra)
@@ -545,10 +651,16 @@ class RealOrderClient:
             t0 = f.started
             try:
                 result = f.sdk.stock.get_order_results(f.account)
-            except Exception as e:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as e:      # noqa: BLE001
+                # BaseException: PyO3 PanicException 繼承 BaseException (同 cancel_by_obj)。漏接的話撤單 worker
+                # thread 無聲死掉、同步路徑上出場 worker 死在送賣單之前 — 而這條正是免查詢撤單停用後的退路。
+                # 一律轉成 OrderLookupError (= 查詢失敗,不是查無;所有 caller 本來就接這個)。
                 ms = round((time.perf_counter() - t0) * 1000, 1)
-                logger.info(f"[broker] order_results ok=False n=0 ms={ms} msg=例外: {e}")
-                f.error = f"get_order_results 例外: {e}"
+                detail = str(e) if isinstance(e, Exception) else f"{type(e).__name__}: {e}"
+                logger.info(f"[broker] order_results ok=False n=0 ms={ms} msg=例外: {detail}")
+                f.error = f"get_order_results 例外: {detail}"
                 raise OrderLookupError(f.error) from e
             ms = round((time.perf_counter() - t0) * 1000, 1)
             ok = bool(result) and getattr(result, "is_success", None) is True
@@ -635,24 +747,350 @@ class RealOrderClient:
                 return o, True, ""
         return None, True, "NOT_FOUND"
 
+    # ─── 免查詢撤單: 下單回傳的委託物件 (檔頭 DIRECT_CANCEL_*) ─────────
+
+    @staticmethod
+    def _obj_day() -> str:
+        return time.strftime("%Y%m%d")
+
+    def _remember_order_obj(self, order_no: str, obj) -> None:
+        """記下 place_order 回傳的委託物件 (result.data)。**絕不 raise** — 記不到只是撤單退回快照舊路徑,
+        不可以影響下單本身。"""
+        try:
+            if obj is None or not order_no:
+                return
+            with self._order_obj_lock:
+                if self._order_objs is None:          # __new__ 替身: 第一次才建 instance 專屬 dict
+                    self._order_objs = {}
+                    self._order_obj_rejects = {}
+                    self._order_obj_inflight = {}
+                objs = self._order_objs
+                today = self._obj_day()
+                if len(objs) >= DIRECT_CANCEL_CACHE_MAX:
+                    for no in [n for n, (day, _o) in objs.items() if day != today]:
+                        objs.pop(no, None)
+                    if len(objs) >= DIRECT_CANCEL_CACHE_MAX:
+                        # 一次丟最舊的四分之一 (dict 保序) — 免滿載後每筆下單都在鎖內整表掃描
+                        for no in list(objs)[:max(1, DIRECT_CANCEL_CACHE_MAX // 4)]:
+                            objs.pop(no, None)
+                objs[str(order_no)] = (today, obj)
+                if self._order_obj_rejects:
+                    self._order_obj_rejects.pop(str(order_no), None)
+        except Exception as e:                        # noqa: BLE001
+            logger.warning(f"[broker] 記下單回傳物件 {order_no} 失敗 (撤單將走快照): {e}")
+
+    def _direct_cancel_usable(self) -> bool:
+        return not self._direct_cancel_off and _direct_cancel_env_on()
+
+    def _reject_time_limit(self) -> float:
+        """非終結拒因 (在途文案) 自第一次被拒起、最多再用下單回傳物件直接撤多久。"""
+        return (DIRECT_CANCEL_INFLIGHT_MAX_SEC if self._direct_cancel_proven
+                else DIRECT_CANCEL_INFLIGHT_UNPROVEN_MAX_SEC)
+
+    def direct_cancel_route(self, order_no: str) -> str:
+        """這個書號現在該怎麼撤 — **一個鎖區塊內看完所有狀態再決定** (第三輪審查: 原本「在途嗎」「有物件嗎」
+        分兩次問,中間被別的 thread 認領就會掉進快照查詢 + 重複送撤單):
+          'direct'    → 用下單回傳物件直接撤 (cancel_cached),不查全清單
+          'in_flight' → 同一筆的免查詢撤單正在**正常往返中** (已送出、未滿 DIRECT_CANCEL_ROUNDTRIP_MAX_SEC)
+                        → 不要重送、也不要為它查清單 (10-07 開盤撤單往返 0.3~2.3 s;第二個撤同一筆的呼叫 —
+                        例如市價成功後同步撤 P 還沒回、出場 worker 又來撤 P — 若改走快照,會在出場賣單前
+                        凍住 process)
+          'snapshot'  → 快照舊路徑 (= 修法前): 已停用 / env 關、沒記到、不是今日的、往返超過門檻 (卡死;同一個
+                        物件絕不重送)、被拒後拖過時間上限 (順手放棄這筆)
+        讀完之後才被別的 thread 認領也沒關係: _claim_order_obj 在同一把鎖內檢查並登記,後到者拿到
+        CancelInFlight (什麼都沒送、沒查)。"""
+        if not self._direct_cancel_usable():
+            return "snapshot"
+        no = str(order_no)
+        with self._order_obj_lock:
+            t = self._order_obj_inflight.get(no) if self._order_obj_inflight else None
+            ent = self._order_objs.get(no) if self._order_objs else None
+            rec = self._order_obj_rejects.get(no) if self._order_obj_rejects else None
+        if t is not None:
+            if time.monotonic() - t < DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:
+                return "in_flight"
+            self._note_direct_stuck(no)              # 送出去沒回: 證實前計入熔斷 (每筆一次)
+            return "snapshot"
+        if ent is None or ent[0] != self._obj_day():
+            return "snapshot"
+        if rec is not None and time.monotonic() - rec[1] >= self._reject_time_limit():
+            # 被拒 (在途文案) 之後拖過上限仍沒結案 → 不再用這個物件;下一次嘗試由快照的券商 status 決定
+            self._give_up_object(no, "", f"自第一次被拒已過 {self._reject_time_limit():g} s 仍未結案")
+            return "snapshot"
+        return "direct"
+
+    def _forget_order_obj(self, order_no: str) -> None:
+        with self._order_obj_lock:
+            if self._order_objs:
+                self._order_objs.pop(str(order_no), None)
+            if self._order_obj_rejects:
+                self._order_obj_rejects.pop(str(order_no), None)
+
+    def has_cached_order(self, order_no: str) -> bool:
+        """這個書號能不能**不查全清單**直接撤 (= direct_cancel_route 回 'direct')。"""
+        return self.direct_cancel_route(order_no) == "direct"
+
+    def direct_cancel_in_flight(self, order_no: str) -> bool:
+        """同一書號的免查詢撤單是否正在正常往返中 (= direct_cancel_route 回 'in_flight')。"""
+        return self.direct_cancel_route(order_no) == "in_flight"
+
+    def direct_cancel_state(self) -> str:
+        """'on' / 'off' (自動停用,見 cancel_cached) / 'env_off' (CANCEL_DIRECT_OBJ=0) — status() 與 log 用。"""
+        if not _direct_cancel_env_on():
+            return "env_off"
+        return "off" if self._direct_cancel_off else "on"
+
+    def _claim_order_obj(self, order_no: str):
+        """取出物件並登記「在途」— **同一個鎖區塊內完成** (同一書號 SDK 同時只會被呼叫一次)。
+        已在途 → raise CancelInFlight (往返中) 或 RuntimeError (卡死);沒有可用物件 → raise RuntimeError。"""
+        no = str(order_no)
+        if not self._direct_cancel_usable():
+            raise RuntimeError(f"撤單失敗 {order_no}: 手上沒有可用的下單回傳物件 (改走快照查詢)")
+        today = self._obj_day()
+        with self._order_obj_lock:
+            if self._order_obj_inflight is None:          # __new__ 替身
+                self._order_obj_inflight = {}
+            t = self._order_obj_inflight.get(no)
+            if t is not None:
+                if time.monotonic() - t < DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:
+                    raise CancelInFlight(f"撤單在途 {order_no}: 同一筆免查詢撤單往返中 (未重送、未查清單)")
+                raise RuntimeError(f"撤單失敗 {order_no}: 同一筆免查詢撤單卡住超過 "
+                                   f"{DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:g} s (改走快照查詢)")
+            ent = self._order_objs.get(no) if self._order_objs else None
+            if ent is None or ent[0] != today:
+                raise RuntimeError(f"撤單失敗 {order_no}: 手上沒有可用的下單回傳物件 (改走快照查詢)")
+            self._order_obj_inflight[no] = time.monotonic()
+            return ent[1]
+
+    def cancel_cached(self, order_no: str, symbol: str = "", reason: str = "") -> None:
+        """用**下單當下回傳的委託物件**直接撤單 — 不呼叫 get_order_results (那個呼叫會凍住整個 process)。
+
+        成功 / 失敗的語意與 cancel_by_obj 相同 (成功才算撤掉;被拒 raise CancelRejected,原文供 session 分類),
+        差別只有: 被拒時 CancelRejected.filled_qty=None、status="" — 手上物件是下單當下的值,不能當成交依據,
+        session 會留佇列核實 (成交回報已到就直接結案,否則下一輪用新快照;不會把舊的 0 當成「沒成交」)。
+        什麼時候放棄這個物件、退回快照舊路徑 (之後的撤單 = 修法前的行為) — 規則見檔頭與 _on_direct_reject /
+        _on_direct_exception:
+          - 撤成 → 丟 (終結),並算「已證實」
+          - 券商回終結文案 → 丟 (這筆不必再直接撤;不算已證實)
+          - 券商回在途文案 (「檢查成交回報」) → 留著繼續免查詢重試,自第一次被拒起拖過時間上限才放棄
+          - 券商回其他未知文案 → 證實前 1 次就放棄;證實後累計 DIRECT_CANCEL_MAX_REJECTS 次才丟
+          - SDK 例外 (cancel_by_obj 已把 PyO3 panic 等 BaseException 轉成 RuntimeError) → 丟;證實前連續
+            DIRECT_CANCEL_MAX_EXC 次 → **整個停用** (CRITICAL 一次);證實後不停用
+          證實前每放棄一筆記一次,滿 DIRECT_CANCEL_MAX_EXC 筆也整個停用。
+        同一書號的免查詢撤單往返中 → raise CancelInFlight (不重送、不查清單);卡死超過門檻 → RuntimeError。
+        broker 未連線 / 不健康、或呼叫途中斷線 / 已換 SDK → 照常 raise,不動物件、不計次 (與物件無關)。"""
+        self._require_ready()
+        no = str(order_no)
+        obj = self._claim_order_obj(no)
+        sdk_ref = self.sdk
+        try:
+            self.cancel_by_obj(obj, order_no, symbol, reason, cached=True)
+        except CancelRejected as e:
+            self._on_direct_reject(no, symbol, str(e), sdk_ref)
+            raise
+        except Exception:
+            self._on_direct_exception(no, sdk_ref)
+            raise
+        else:
+            self._mark_direct_proven()                   # 撤成 = 券商收這種物件
+            self._forget_order_obj(no)                   # 終結,物件用不到了
+        finally:
+            with self._order_obj_lock:
+                if self._order_obj_inflight:
+                    self._order_obj_inflight.pop(no, None)
+                if self._order_obj_stuck:
+                    self._order_obj_stuck.discard(no)
+
+    def _mark_direct_proven(self) -> None:
+        """一筆免查詢撤單真的撤成 → 前提成立。若先前 (同一批併發裡較早回來的失敗) 已把它停用 → 重新啟用。"""
+        with self._order_obj_lock:
+            self._direct_cancel_exc_streak = 0
+            self._direct_cancel_proven = True
+            was_off = self._direct_cancel_off
+            if was_off:
+                self._direct_cancel_off = False
+                self._direct_cancel_unproven_drops = 0
+                self._direct_cancel_charged = set()
+        if was_off:
+            logger.warning("[broker] 免查詢撤單已有一筆撤成 (券商確認) → 重新啟用 (先前的停用告警作廢)")
+
+    def _connection_changed(self, sdk_ref) -> bool:
+        """呼叫途中斷線 / 已換 SDK (re_login) → 這次的失敗與物件無關。"""
+        return self.sdk is not sdk_ref or not (self.sdk and self.connected and self.healthy)
+
+    def _charge_unproven_locked(self, no: str) -> tuple:
+        """證實前把一筆單計入熔斷 — **同一筆單在同一條連線上只計一次** (caller 持 _order_obj_lock)。
+        「送出後沒回應」(_note_direct_stuck) 與「放棄」(_give_up_object) 共用: 一筆卡住的單之後又被拒 / 拖過
+        時間上限,仍然只是一筆單有問題;各計一次的話一筆慢單就能把整條連線的免查詢撤單停掉 (第三輪複核)。
+        回 (目前計數, 這次是否剛好觸發停用)。"""
+        if self._direct_cancel_charged is None:          # __new__ 替身
+            self._direct_cancel_charged = set()
+        if no in self._direct_cancel_charged:
+            return self._direct_cancel_unproven_drops, False
+        self._direct_cancel_charged.add(no)
+        self._direct_cancel_unproven_drops += 1
+        drops = self._direct_cancel_unproven_drops
+        trip = drops >= DIRECT_CANCEL_MAX_EXC and not self._direct_cancel_off
+        if trip:
+            self._direct_cancel_off = True
+        return drops, trip
+
+    def _give_up_object(self, no: str, symbol: str, why: str) -> None:
+        """放棄用下單回傳物件撤這一筆 (之後走快照)。證實前每放棄一筆記一次,滿 DIRECT_CANCEL_MAX_EXC 筆 →
+        整個停用 + CRITICAL (前提可能不成立: 最壞白撞這幾筆就回到修法前的行為)。證實後只是這一筆。"""
+        with self._order_obj_lock:
+            had = bool(self._order_objs) and self._order_objs.pop(no, None) is not None
+            if self._order_obj_rejects:
+                self._order_obj_rejects.pop(no, None)
+            if not had:
+                return                                   # 別的 thread 已經放棄過這一筆 → 不重複計數
+            proven = self._direct_cancel_proven
+            drops = 0
+            trip = False
+            if not proven:
+                drops, trip = self._charge_unproven_locked(no)
+        tag = f"{no}{' (' + symbol + ')' if symbol else ''}"
+        if trip:
+            logger.critical(f"[broker] ⚠⚠ 免查詢撤單: 本連線尚無任何一筆撤成,已放棄 {drops} 筆 (最近 {tag}: {why[-90:]}) → "
+                            f"停用,所有撤單退回「先拉全清單」舊路徑 (撤單仍會做,只是查詢期間 process 會短暫停擺);"
+                            f"請確認 SDK 是否接受下單回傳物件撤單")
+        else:
+            logger.warning(f"[broker] {tag} 免查詢撤單放棄 ({why[-90:]}) → 這筆改走快照查詢"
+                           f"{'' if proven else ' (尚未證實可用)'}")
+
+    def _note_direct_stuck(self, no: str, symbol: str = "") -> None:
+        """免查詢撤單送出去超過 DIRECT_CANCEL_ROUNDTRIP_MAX_SEC 沒回 — 不是被拒、不是例外,是**完全沒回應**。
+        證實前這是前提不成立的第三種樣子 (SDK 對下單回傳物件不回應),而被拒 / 例外兩條計數都看不到它 →
+        每筆計一次「放棄」,滿 DIRECT_CANCEL_MAX_EXC 筆整個停用 + CRITICAL。在途標記不動 (同一個物件絕不重送);
+        那筆之後若回來撤成,_mark_direct_proven 會重新啟用。證實後不計 (一般的 SDK / 網路卡住)。
+        連線不健康時不計 (卡住多半是因為斷線);重連當下還在途的由 re_login 先登記為「不計」。"""
+        if not (self.connected and self.healthy):
+            return
+        with self._order_obj_lock:
+            if self._direct_cancel_proven:
+                return
+            if self._order_obj_stuck is None:
+                self._order_obj_stuck = set()
+            if no in self._order_obj_stuck:
+                return
+            self._order_obj_stuck.add(no)
+            drops, trip = self._charge_unproven_locked(no)
+        tag = f"{no}{' (' + symbol + ')' if symbol else ''}"
+        if trip:
+            logger.critical(f"[broker] ⚠⚠ 免查詢撤單: 本連線尚無任何一筆撤成,已有 {drops} 筆送出後超過 "
+                            f"{DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:g} s 沒有回應 (最近 {tag}) → 停用,所有撤單退回"
+                            f"「先拉全清單」舊路徑 (撤單仍會做,只是查詢期間 process 會短暫停擺);"
+                            f"請確認 SDK 是否接受下單回傳物件撤單")
+        else:
+            logger.warning(f"[broker] {tag} 免查詢撤單送出超過 {DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:g} s 沒有回應 → "
+                           f"這筆改走快照查詢 (尚未證實可用)")
+
+    def _cancel_cached_bounded(self, order_no: str, symbol: str = "", reason: str = "") -> None:
+        """**證實前**的同步免查詢撤單: 放到 helper thread 送,caller 最多等 DIRECT_CANCEL_ROUNDTRIP_MAX_SEC。
+        為什麼: 同步撤單在 caller 的 thread 上直接呼叫 SDK、沒有逾時 (修法前也是)。但修法前傳的是查詢來的物件
+        (已知可用);現在傳的是下單回傳物件,在第一筆撤成之前沒人知道 SDK 收不收。萬一它的反應是「不回」,
+        出場 worker 會卡在送賣單之前 (exited 已設 → 這個部位再也沒有出場保護) — 第三輪審查實跑重現。
+        逾時 → 計一筆 (_note_direct_stuck) 並 raise RuntimeError;session 把它當一般撤單失敗入佇列,worker 下一輪
+        看到這筆「往返超過門檻」→ 走快照路徑撤。helper thread 留在背景: 之後若回來撤成,照常結案 (券商的
+        ft=30 回報 / 下一輪快照 status 30 會讓 session 出佇列) 並把免查詢撤單重新啟用。
+        helper 內的例外 (CancelRejected / CancelInFlight / RuntimeError …) 原樣轉回 caller。"""
+        box: dict = {}
+        sdk_ref = self.sdk
+
+        def _run():
+            try:
+                self.cancel_cached(order_no, symbol, reason)
+                box["ok"] = True
+            except BaseException as e:      # noqa: BLE001 — 原例外原樣轉回 caller
+                box["err"] = e
+
+        t = threading.Thread(target=_run, name=f"direct-cancel-{order_no}", daemon=True)
+        t.start()
+        t.join(DIRECT_CANCEL_ROUNDTRIP_MAX_SEC)
+        err = box.get("err")
+        if err is not None:
+            raise err
+        if box.get("ok"):
+            return
+        if not self._connection_changed(sdk_ref):
+            self._note_direct_stuck(str(order_no), symbol)
+        raise RuntimeError(f"撤單失敗 {order_no}: 免查詢撤單送出 {DIRECT_CANCEL_ROUNDTRIP_MAX_SEC:g} s 未回 "
+                           f"(改走快照查詢)")
+
+    def _on_direct_reject(self, no: str, symbol: str, text: str, sdk_ref=None) -> None:
+        """免查詢撤單被券商拒 (is_success=False;有回應 = 傳輸層沒問題) → 決定這個物件留不留、要不要整個停用。"""
+        if any(h in text for h in _DIRECT_CANCEL_TERMINAL_HINTS):
+            # 券商認得這筆、它已終結 → 這筆不必再直接撤。**不算已證實**: 認得 ≠ 能用這個物件撤掉 live 單
+            with self._order_obj_lock:
+                self._direct_cancel_exc_streak = 0
+            self._forget_order_obj(no)
+            return
+        if sdk_ref is not None and self._connection_changed(sdk_ref):
+            return                                       # 舊連線晚回的拒絕 — 不動物件、不計次
+        now = time.monotonic()
+        inflight_msg = any(h in text for h in _DIRECT_CANCEL_INFLIGHT_HINTS)
+        with self._order_obj_lock:
+            self._direct_cancel_exc_streak = 0
+            rej = self._order_obj_rejects
+            rec = rej.get(no) if rej is not None else None
+            unknown = (rec[0] if rec else 0) + (0 if inflight_msg else 1)   # 只數未知文案;在途文案只看時間
+            first = rec[1] if rec else now
+            if rej is not None:
+                rej[no] = (unknown, first)
+            proven = self._direct_cancel_proven
+        if inflight_msg:
+            if now - first >= self._reject_time_limit():
+                self._give_up_object(no, symbol, f"撤單在途超過 {self._reject_time_limit():g} s 仍未結案 (回報可能遺失)")
+            return
+        if unknown >= (DIRECT_CANCEL_MAX_REJECTS if proven else 1):
+            self._give_up_object(no, symbol, f"被券商以未知文案拒 {unknown} 次: {text}")
+
+    def _on_direct_exception(self, no: str, sdk_ref) -> None:
+        """免查詢撤單的 SDK 呼叫丟例外 (非券商拒單)。途中斷線 / 已換 SDK → 與物件無關,什麼都不動。"""
+        if self._connection_changed(sdk_ref):
+            return
+        self._forget_order_obj(no)                       # 這筆退回快照
+        with self._order_obj_lock:
+            if self._direct_cancel_proven:
+                return                                   # 物件已證實可用 → 傳輸層暫態,不累計、不停用
+            self._direct_cancel_exc_streak += 1
+            streak = self._direct_cancel_exc_streak
+            trip = streak >= DIRECT_CANCEL_MAX_EXC and not self._direct_cancel_off
+            if trip:
+                self._direct_cancel_off = True
+        if trip:
+            logger.critical(f"[broker] ⚠⚠ 免查詢撤單連續 {streak} 次 SDK 例外、且本連線尚無任何一筆撤成 → "
+                            f"停用,所有撤單退回「先拉全清單」舊路徑 (撤單仍會做,只是查詢期間 process 會短暫停擺);"
+                            f"可能是 SDK 不接受下單回傳物件,也可能只是連線不穩 (重連後會重新嘗試)")
+
     # ─── 撤單 ──────────────────────────────────────────────
 
     def cancel_by_obj(self, order_obj, order_no: str, symbol: str = "",
-                      reason: str = "") -> None:
+                      reason: str = "", cached: bool = False) -> None:
         """用已拿到的委託物件直接撤 (worker 一次快照 → 多筆撤,免每筆再查)。
         成功寫 CSV CANCEL 列 (extra=reason);失敗寫 extra=FAIL:<msg> 並
         raise CancelRejected("撤單失敗 <書號>: <富邦原文>", filled_qty=, status=) — 原文供 session
         classify_cancel_error 分類 (成交單/部分成交單/取消單已不允許取消),filled_qty/status 供立刻補成交。
-        SDK 例外 (傳輸層) 仍 raise 純 RuntimeError。CSV latency = 撤單 REST 往返 (不含查詢)。"""
+        SDK 例外 (傳輸層) 仍 raise 純 RuntimeError。CSV latency = 撤單 REST 往返 (不含查詢)。
+        cached=True (cancel_cached 專用): order_obj 是**下單當下**回傳的物件,不是剛查的快照 → 被拒時
+        filled_qty=None / status="" (未知),log 標「免查詢」。"""
         self._require_ready()
         ts_sent = time.time()
         try:
             result = self.sdk.stock.cancel_order(self.account, order_obj)
-        except Exception as e:
-            msg = f"例外: {e}"
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:      # noqa: BLE001
+            # **BaseException**: fubon_neo 是 Rust/PyO3 擴充,Rust panic 會變成 pyo3_runtime.PanicException —
+            # 它繼承 BaseException、`except Exception` 接不到。漏接的後果 (2026-10-12 第二輪審查實跑): 撤單
+            # thread 直接死 → 被當成「逾時」每秒重送、不計 attempts、永不退回快照;同步路徑上出場 worker 會死在
+            # 送賣單之前 (exited 已設 → 部位再也沒有出場保護)。這裡是唯一呼叫 cancel_order 的地方,一律轉成
+            # RuntimeError,上游既有的 except Exception 才接得住 (查清單那一支在 _run_query_flight 同樣處理)。
+            msg = f"例外: {type(e).__name__}: {e}"
             self._write_row(order_no, ts_sent, time.time(), "CANCEL", symbol, 0, "-",
                             f"FAIL:{msg[:60]}")
-            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 例外: {e}")
+            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 例外{' (免查詢)' if cached else ''}: "
+                         f"{type(e).__name__}: {e}")
             raise RuntimeError(f"撤單失敗 {order_no}: {msg}") from e
         ts_accepted = time.time()
         # 與下單一致用 is True 判斷 (原 is not False 會把 None/缺失誤判為成功)
@@ -661,7 +1099,10 @@ class RealOrderClient:
             msg = str((getattr(result, "message", None) if result else None) or "cancel_order 回空")
             self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-",
                             f"FAIL:{msg[:60]}")
-            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 失敗: {msg}")
+            logger.error(f"[broker] CANCEL {order_no} ({symbol}) 失敗{' (免查詢)' if cached else ''}: {msg}")
+            if cached:
+                # 物件是下單當下的值 (filled_qty 多半是 0、status 是當時的) → 不可當成交依據,回「未知」
+                raise CancelRejected(f"撤單失敗 {order_no}: {msg}", filled_qty=None, status="", direct=True)
             # 帶上手上物件的 filled_qty/status (撤單前快照值) — session 對「已成交」立刻補成交
             try:
                 fq = int(_attr(order_obj, "filled_qty", "filledQty", default=0) or 0)
@@ -671,16 +1112,31 @@ class RealOrderClient:
             raise CancelRejected(f"撤單失敗 {order_no}: {msg}", filled_qty=fq,
                                  status="" if stt is None else str(stt))
         self._write_row(order_no, ts_sent, ts_accepted, "CANCEL", symbol, 0, "-", reason)
-        logger.info(f"[broker] CANCEL {order_no} ({symbol}) reason={reason}")
+        logger.info(f"[broker] CANCEL {order_no} ({symbol}) reason={reason}{' (免查詢)' if cached else ''}")
 
     def cancel(self, order_no: str, symbol: str = "", reason: str = "") -> None:
-        """撤單 facade: 快照找 order object (踩雷點 #6) → cancel_by_obj。**絕不靜默返回、絕不回 None 當成功**:
+        """撤單 facade。**絕不靜默返回、絕不回 None 當成功**。
+        手上有今日下單回傳的委託物件 → cancel_cached 直接撤,**不查全清單** (2026-10-07: 那個查詢會凍住
+        整個 process);被拒照樣 raise (CancelRejected / RuntimeError),由 session 分類、入佇列重試 —
+        這個呼叫內不再退回快照 (退路在下一次嘗試: cancel_cached 會視情況丟掉物件)。
+        沒有物件 (缺書號反查認領的單 / 重啟前下的單 / 已退回) → 快照找 order object (踩雷點 #6) → cancel_by_obj:
           查詢失敗 (限流/斷線/例外) → CSV 列 FAIL:QUERY:<msg> + raise OrderLookupError
           查詢成功但清單無此書號   → CSV 列 FAIL:NOT_FOUND     + raise OrderNotFound
           撤單被券商拒            → CSV 列 FAIL:<msg>         + raise RuntimeError (cancel_by_obj)
         2026-09-09 node3: 舊版對 None 只 log「查無委託」不 raise → 上層標 cancelled → 4 筆隱形裸單。
         「查無」可能是後檯快照延遲或 5/s 限流,**不等於已成交/已撤** — 由 session 撤單佇列重試。"""
         self._require_ready()
+        route = self.direct_cancel_route(order_no)
+        if route == "in_flight":
+            # 別的 thread 對同一筆的免查詢撤單正在往返 (例: 市價成功後同步撤 P 還沒回、出場 worker 又來撤 P)
+            # → 不重送、**不查清單** (那會在出場賣單前凍住 process);caller 入佇列稍後看那一筆的結果
+            raise CancelInFlight(f"撤單在途 {order_no}: 同一筆免查詢撤單往返中 (未重送、未查清單)")
+        if route == "direct":
+            if self._direct_cancel_proven:
+                self.cancel_cached(order_no, symbol, reason)
+            else:
+                self._cancel_cached_bounded(order_no, symbol, reason)   # 還沒證實 → 不讓 caller 無限期等
+            return
         ts_sent = time.time()
         obj, snapshot_ok, msg = self._find_order_obj(order_no)
         if not snapshot_ok:

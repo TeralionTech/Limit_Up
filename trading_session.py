@@ -36,8 +36,11 @@ except Exception:                                        # pragma: no cover — 
 
 def _exc_kind(e: BaseException) -> str:
     """撤單例外分類 (以 MRO 類名判斷,tests 的 fake 例外不必 import broker):
-    'not_found' (查詢成功但無此書號) / 'lookup' (查詢失敗:流量控管/SDK 例外) / 'other'。"""
+    'not_found' (查詢成功但無此書號) / 'lookup' (查詢失敗:流量控管/SDK 例外) /
+    'in_flight' (同一筆的免查詢撤單往返中 — 這次什麼都沒送) / 'other'。"""
     names = {c.__name__ for c in type(e).__mro__}
+    if "CancelInFlight" in names:
+        return "in_flight"
     if "OrderNotFound" in names:
         return "not_found"
     if "OrderLookupError" in names:
@@ -52,6 +55,13 @@ _CANCEL_FILLED_KEYWORDS = ("成交單已不允許取消", "部分成交單已不
 _CANCEL_ALREADY_KEYWORDS = ("取消單已不允許取消",)
 
 
+# 「[9050]該筆委託已無剩餘量(交)[9050-後檯]」: 交易所端對已全數成交 (或已無剩餘) 委託的撤單拒絕。
+#   券商認得這筆、它已終結,成交量待核實 → **只在免查詢撤單被拒時**比照「成交單已不允許取消」處理 (留佇列、
+#   標 fbc_unverified;成交回報到了直接結案,沒到才由快照核實 — 快照是 status 30 就結成 cancelled)。
+#   快照路徑 / 停用後不走這條 (classify_cancel_error 不變 = 修法前行為)。broker 收到這個文案會丟掉下單回傳
+#   物件,若這裡仍當一般重試,下一輪必定為它拉一次全清單 — 就落在第一筆市價成功後那幾毫秒 (第三輪審查)。
+_CANCEL_NO_REMAINING_KEYWORDS = ("已無剩餘量",)
+
 _UNKNOWN_CANCEL_REJECT_SEEN: set = set()   # 已告警過的未知拒撤文案 (每種文案只 CRITICAL 一次)
 
 
@@ -65,12 +75,23 @@ def classify_cancel_error(msg) -> str:
     if any(k in s for k in _CANCEL_FILLED_KEYWORDS):
         return "filled_before_cancel"
     if "已不允許取消" in s:
-        key = s[-80:]
+        # 去重以富邦原文為準 — broker 例外字串是「撤單失敗 <書號>: <原文>」,不剝前綴的話短訊息的 key 會含
+        # 書號,同一種文案每個書號各 CRITICAL 一次 (2026-10-12 審查)
+        raw = s.split(": ", 1)[1] if s.startswith("撤單失敗 ") and ": " in s else s
+        key = raw[-80:]
         if key not in _UNKNOWN_CANCEL_REJECT_SEEN:
             _UNKNOWN_CANCEL_REJECT_SEEN.add(key)
             logger.critical(f"[session] ⚠ 撤單被拒文案未知 (非「成交單/部分成交單/取消單已不允許取消」) → "
                             f"視為可重試;請確認是否為新終結文案並補進 classify_cancel_error: {s[:120]}")
     return "retry"
+
+
+def _classify_direct_cancel_error(msg) -> str:
+    """免查詢撤單 (用下單回傳物件) 被拒的分類 = classify_cancel_error,外加「已無剩餘量」→ filled_before_cancel。"""
+    cls = classify_cancel_error(msg)
+    if cls == "retry" and any(k in str(msg or "") for k in _CANCEL_NO_REMAINING_KEYWORDS):
+        return "filled_before_cancel"
+    return cls
 
 
 # 撤單佇列 worker 參數 (2026-09-09 node3「管線多送市價單未撤」事故 A2):
@@ -92,6 +113,7 @@ _BROKER_LIVE_STATUSES = ("0", "4", "8", "10")   # 富邦委託 status: 尚未終
 # 50 完全成交、90 失敗 — 撤單 worker 對這些**不送撤單**,直接依券商狀態結案 (審查 2026-09-10)
 _BROKER_TERMINAL_CANCELLED = ("30", "40")
 _CANCEL_SKIP_BACKOFF_SEC = 1.0     # broker 不健康 / 不可管理時到期項延後多久 (不計 attempts;免忙迴圈)
+_CANCEL_INFLIGHT_RECHECK_SEC = 0.3  # 同一筆的免查詢撤單往返中 → 佇列項延後多久再看 (不計 attempts、不查清單)
 _CLOSE_SWEEP_RETRY_SEC = 2.0       # 收盤券商權威掃單失敗 → drain 期間每 N s 重試到成功或逾時
 _FBC_ERR_PREFIX = "FILLED_BEFORE_CANCEL: "   # row.cancel_err 前綴 = 「撤單前已成交」已結案 (冪等標記)
 _SWEEP_TERMINAL_GRACE_SEC = 2.0    # 券商權威掃單: 本地剛終結 (<N s) 的列本輪略過 — 查詢 replica 落後於 WS 回報
@@ -352,6 +374,10 @@ class TradingSession:
         self._lock = threading.RLock()
         self.mode: str = "sim"            # "sim" / "real"
         self.armed: bool = False          # kill switch — True 才會真下單
+        # 「開始隔日賣」(2026-10-14): armed 但 entry_enabled=False → 只做隔日賣 / 既有部位出場 / 撤單
+        # (這些都看 is_live),**不預掛、不盲送、不市價追** (所有新進場路徑看 entry_allowed())。
+        # roll_day 重設 True;armed=False 時沒有意義 (一律回 True,下次「開始交易」= 正常進場)。
+        self.entry_enabled: bool = True
         self.broker = None                # broker.RealOrderClient
         self.connecting = False
         self.connect_error = ""
@@ -469,6 +495,7 @@ class TradingSession:
             self._buy_cost_actual = 0.0       # 每日重置實際買進累計
             self._budget_breached = False     # 每日重置硬上限煞車
             self.armed = False
+            self.entry_enabled = True         # 隔日賣模式不跨日 — 每天由使用者重新選「開始交易 / 開始隔日賣」
             self.dispositions = {}
             self.day_tradable = {}   # 每日重抓 (canDayTrade)
             self.limit_downs = {}    # 每日價格不同,新日清空由 runner 重填
@@ -722,8 +749,14 @@ class TradingSession:
         logger.info(f"[session] 配置: mode={self.sizing_mode} 固定 {self.fixed_lots} 張 / "
                     f"總預算 {self.total_budget:,.0f} / 每檔 {self.per_symbol_budget:,.0f}")
 
-    def set_armed(self, armed: bool):
-        """kill switch。開啟前 pre-flight (day-trade 模式): 連線健康 + 預算已設。"""
+    def set_armed(self, armed: bool, overnight_only: bool = False):
+        """kill switch。開啟前 pre-flight (day-trade 模式): 連線健康 + 預算已設。
+
+        overnight_only=True = 「開始隔日賣」: 一樣 arm (隔日賣 / 既有部位出場 / 撤單都要 is_live),
+        但 entry_enabled=False → 08:59:58 預掛、08:59:59 起盲送、09:00 後市價追一律不送;沒有新進場所以
+        **不要求預算**。armed=False 兩者都關;之後再按「開始交易」(overnight_only=False) 就回正常進場
+        (要過預算 pre-flight)。盤中由正常進場切成隔日賣模式只停「之後的送單」,已在券商端的買單不動
+        (要撤請用撤單),這裡只 WARNING 點名。"""
         if armed:
             if self.mode != "real":
                 raise RuntimeError("模擬模式不能開始交易 (先切真實模式)")
@@ -733,16 +766,25 @@ class TradingSession:
             if foreign:
                 logger.warning(f"[session] ⛔ 拒絕開始交易: {foreign}")
                 raise RuntimeError(foreign)
-            if self.total_budget <= 0:
-                raise RuntimeError("先設定總預算 (> 0)")
-            if self.sizing_mode == "fixed_lots":
-                if self.fixed_lots <= 0:
-                    raise RuntimeError("固定張數模式: 先設定每檔張數 (> 0)")
-            elif self.per_symbol_budget <= 0:
-                raise RuntimeError("依金額模式: 先設定每檔上限 (> 0)")
+            if not overnight_only:
+                if self.total_budget <= 0:
+                    raise RuntimeError("先設定總預算 (> 0)")
+                if self.sizing_mode == "fixed_lots":
+                    if self.fixed_lots <= 0:
+                        raise RuntimeError("固定張數模式: 先設定每檔張數 (> 0)")
+                elif self.per_symbol_budget <= 0:
+                    raise RuntimeError("依金額模式: 先設定每檔上限 (> 0)")
         with self._lock:
             self.armed = armed
-        logger.warning(f"[session] ⚡ armed = {armed}")
+            self.entry_enabled = (not overnight_only) if armed else True
+            pending_buys = [no for no, r in self.order_log.items()
+                            if r.get("action") == "buy" and r.get("status") == "pending"] \
+                if (armed and overnight_only) else []
+        logger.warning(f"[session] ⚡ armed = {armed}"
+                       f"{' (隔日賣模式: 不預掛 / 不盲送 / 不市價追,只做隔日賣與既有部位出場)' if armed and overnight_only else ''}")
+        if pending_buys:
+            logger.warning(f"[session] ⚠ 隔日賣模式只停之後的送單 — 券商端仍有 {len(pending_buys)} 筆 pending 買單 "
+                           f"{pending_buys[:10]},要撤請手動撤單")
         if armed:
             # 每日 arm = 交易日入口: 連線時若還是 sim (之後才切 real),connect_async 那次沒起 worker →
             # 這裡補起 (pre-flight 已過 = is_live 成立);否則 09:05 起的盤中券商權威對帳整天不跑 (審查)
@@ -765,9 +807,16 @@ class TradingSession:
                 f"請先斷線,改用本節點帳號重新連線")
 
     def is_live(self) -> bool:
-        """True = 真實模式 + armed + 連線健康 → 才會真下單。**只給進場路徑用**。"""
+        """True = 真實模式 + armed + 連線健康 → 才會真下單。隔日賣 / 盲送 cadence 等看這個;
+        **新進場 (預掛 / 盲送 / 市價追) 要看 entry_allowed()** — 隔日賣模式下 is_live=True 但不准進場。"""
         with self._lock:
             return self.mode == "real" and self.armed and self._broker_ready()
+
+    def entry_allowed(self) -> bool:
+        """True = is_live 且非隔日賣模式 → 才可以**新進場** (08:59:58 預掛 / 08:59:59 盲送 / 09:00 市價追)。
+        隔日賣模式 (set_armed(True, overnight_only=True)) 下恆 False。"""
+        with self._lock:
+            return self.entry_enabled and self.mode == "real" and self.armed and self._broker_ready()
 
     def _can_manage(self) -> bool:
         """出場/撤單閘門 — 真實模式 + broker 物件在就嘗試 (不看 armed、不看連線健康)。
@@ -848,6 +897,10 @@ class TradingSession:
         if not self.is_live():
             logger.info("[session] 未 armed/未連線 — 跳過預掛")
             return
+        if not self.entry_allowed():
+            # 「開始隔日賣」: 不搶今天的單 — 早退在冪等保護之前 (今日額度不燒掉,之後若改按「開始交易」仍可預掛)
+            logger.warning(f"[session] 🌙 隔日賣模式 (不搶今天的單) — 跳過預掛 {len(symbols)} 檔")
+            return
         # 冪等保護 (check-and-set 原子): 就算 timer 生命週期修壞了、兩個 timer 同時到,
         # 也只有一個能預掛 (放在 is_live 之後 — 未 armed 的早退不燒掉今日額度)。
         with self._lock:
@@ -861,6 +914,10 @@ class TradingSession:
                 return
             limit_up = float(limit_ups.get(sym) or 0)
             with self._lock:
+                if not self.entry_enabled:
+                    # 預掛迴圈進行中 (逐檔阻塞往返) 操作者按了「開始隔日賣」→ 下一檔起不送 (這檔還沒保留預算)
+                    logger.warning(f"[session] 🌙 預掛中切成隔日賣模式 → 中止,{sym} 起剩餘不送")
+                    return
                 if not limit_up:
                     continue
                 st = self.trades.get(sym) or SymbolTrade(sym, limit_up)
@@ -983,7 +1040,7 @@ class TradingSession:
             self._active_chase.add(symbol)
         try:
             while True:
-                if not self.is_live():
+                if not self.entry_allowed():      # 未 armed / 斷線 / 隔日賣模式 (不搶今天的單) → 不盲送
                     return
                 inflight.acquire()        # 併發安全帽 (真正節流是公平均分節拍 + 45/s rate;高延遲自然回壓)
                 with self._lock:
@@ -1046,7 +1103,17 @@ class TradingSession:
           免多部位;已成交 = 超買,已由 _log_order→_on_fill 計入 filled_lots,出場全量賣掉;硬上限兜底
           runaway)。使用者定案 (2026-08-28): 為求最快排到市價、接受此殘餘超買。
         - 致命拒因 → 設 stopped_reason (保留 P);非致命 (含集合競價「不可市價」) → 什麼都不做,cadence 續送。
+        - 送出前已停 (淘汰 / 出場 / 硬上限) → **不送**,回 "stopped"。
         """
+        # 送出前再看一次: cadence 判斷之後還隔著公平節拍的 sleep、45/s 額度、sender thread 起跑 — 這期間
+        # 被淘汰 (stop_entry) / 已出場 / 硬上限 → 這筆不送 (2026-10-12)。已經交給 SDK 的收不回來,
+        # 由下面「委託成功後發現已停」那條撤掉。
+        with self._lock:
+            if not self.entry_enabled:            # 隔日賣模式 (不搶今天的單): 任何路徑進來都不送市價買
+                return "stopped"
+            st0 = self.trades.get(symbol)
+            if st0 is not None and (st0.stopped_reason or st0.exited or self._budget_breached):
+                return "stopped"
         try:
             no = self.broker.place_market_buy(symbol, shortfall)
         except Exception as e:
@@ -1073,7 +1140,9 @@ class TradingSession:
                 self._release_budget(st)              # 釋放預掛 P 剩餘保留
                 self._reserve_budget(st, shortfall)   # 改保留市價 M (等額 → budget_used 守恆)
             # aborted 含 _budget_breached: 送單是放鎖後做的,這期間別檔成交可能觸發硬上限 latch。
-            aborted = bool(st.stopped_reason) or st.exited or self._budget_breached
+            # 含 not entry_enabled (2026-10-14): SDK 往返期間操作者按了「開始隔日賣」→ 視同淘汰,撤 M+P
+            aborted = (bool(st.stopped_reason) or st.exited or self._budget_breached
+                       or not self.entry_enabled)
         if first:
             if aborted:
                 logger.warning(f"[session] {symbol} 市價盲送成功後發現已停 → 撤 M={no}+預掛 P")
@@ -1282,6 +1351,8 @@ class TradingSession:
     def _cancel_worker_run_once(self, now: Optional[float] = None) -> dict:
         """跑**一輪**撤單佇列 (可同步驅動 — 測試/replay/收盤 drain 用;production 由 worker thread 叫)。
         now = epoch 秒 (time.time());None = 現在。
+        2026-10-07: due 先分流 — broker 手上有下單回傳物件的書號**免查詢直接撤** (_run_direct_cancels;
+        不呼叫 get_order_snapshot — 那個查詢會凍住整個 process),其餘才走下面的快照演算法。
         演算法: due = next_ts<=now → **一次** get_order_snapshot() → 在快照者 ≤8 thread 扇出
         cancel_by_obj (各過 45/s _rate) → 成功才標 cancelled + _close_cancel + 出佇列;
         撤單失敗訊息走 classify_cancel_error;不在快照者: row 已終結 → 出佇列,否則 attempts+1 退避
@@ -1314,6 +1385,17 @@ class TradingSession:
             out["pending"] = [no for no, _ in due]
             return
         broker = self.broker
+        # ── 券商已回「成交單已不允許取消」、之後成交回報也到了 (本地 row 已 filled) → 直接結案,不為它查清單 ──
+        due = self._settle_reported_fills(due, out)
+        # ── 免查詢撤單 (2026-10-07 node1): broker 手上有「下單回傳的委託物件」的書號直接撤,不拉全清單
+        #    (get_order_results 整段呼叫期間整個 process 停擺 1~2 s — 行情 tick / 回報 / 其他下單回應全卡住)。
+        #    只有沒物件的書號 (缺書號認領 / 重啟前的單 / 掃單發現的孤兒 / 直接撤不順被 broker 退回者) 才走快照。
+        direct, due = self._split_direct_cancels(due, now, out)
+        if direct:
+            self._run_direct_cancels(direct, now, out)
+        if not due:
+            self._cancel_giveup_check(now)
+            return
         snap_fn = getattr(broker, "get_order_snapshot", None)
         if snap_fn is None:
             # 舊式 broker/fake 無快照 API → 退回逐筆 broker.cancel (facade) 路徑
@@ -1325,14 +1407,15 @@ class TradingSession:
         except Exception as e:
             kind = _exc_kind(e)
             out["snapshot_ok"] = False
+            retry_at = max(now, time.time()) + 1.0    # 從查詢**結束**起算 (查詢本身可能已花 1~5 s)
             with self._lock:
                 for no, _ in due:
                     it = self._cancel_queue.get(no)
                     if it is not None:
-                        it["next_ts"] = now + 1.0     # 不計 attempts
+                        it["next_ts"] = retry_at      # 不計 attempts
             for no, _ in due:
                 self._note_cancel_err(no, f"QUERY:{e}")
-            out["pending"] = [no for no, _ in due]
+            out["pending"].extend(no for no, _ in due)   # extend: 免查詢那段留佇列的書號已在裡面
             logger.warning(f"[session] 撤單 worker 快照失敗 ({kind}: {e}) → {len(due)} 筆 1 s 後重試"
                            f" (不計 attempts)")
             return
@@ -1359,37 +1442,7 @@ class TradingSession:
                     if row is not None:
                         row["cancel_state"] = "sent"
             results = self._fanout_cancel(in_snap, _CANCEL_SDK_TIMEOUT_SEC)
-            for no, it, entry in in_snap:
-                r = results.get(no)
-                if r is None:
-                    # 逾時 = 未確認、不計 attempts
-                    self._note_cancel_err(no, "撤單 SDK 逾時", state="unconfirmed")
-                    with self._lock:
-                        q = self._cancel_queue.get(no)
-                        if q is not None:
-                            q["next_ts"] = now + 1.0
-                    out["pending"].append(no)
-                    continue
-                status, msg = r
-                if status == "ok":
-                    self._confirm_cancelled(no, it["symbol"], it["reason"], source="worker")
-                    out["cancelled"].append(no)
-                    continue
-                cls = classify_cancel_error(msg)
-                if cls == "already_cancelled":
-                    self._confirm_cancelled(no, it["symbol"], it["reason"], source=f"worker:{msg[:40]}")
-                    out["cancelled"].append(no)
-                elif cls == "filled_before_cancel":
-                    fq = entry.get("filled_qty")
-                    if self._settle_filled_before_cancel(
-                            no, it["symbol"], it["reason"], None if fq is None else int(fq), msg,
-                            snapshot_status=str(entry.get("status") or "")):
-                        out["filled_before_cancel"].append(no)
-                    else:
-                        out["pending"].append(no)     # 快照落後無法核實 → 留佇列,下一輪用新快照結案
-                else:
-                    self._cancel_retry_later(no, now, msg)
-                    out["pending"].append(no)
+            self._apply_cancel_results(in_snap, results, now, out, source="worker")
         # ── 不在快照者 ──
         for no, it in not_in_snap:
             with self._lock:
@@ -1401,6 +1454,149 @@ class TradingSession:
             self._cancel_retry_later(no, now, "NOT_IN_SNAPSHOT (查無此書號;可能後檯延遲)")
             out["pending"].append(no)
         self._cancel_giveup_check(now)
+
+    def _apply_cancel_results(self, work: list, results: dict, now: float, out: dict, source: str):
+        """扇出撤單的結果 → 結案 / 留佇列 (快照路徑與免查詢路徑共用;work = [(no, it, entry)])。
+        entry 的 filled_qty / status 是撤單當下手上的券商值 — 免查詢路徑沒有 (None / "") →
+        「已成交」無法當場核實 → _settle_filled_before_cancel 留佇列,下一輪由快照結案。"""
+        for no, it, entry in work:
+            r = results.get(no)
+            if r is None:
+                # 逾時 = 未確認、不計 attempts。免查詢路徑: 那筆 SDK 呼叫還在途 (下一輪多半已超過 broker 的
+                # 往返門檻 = 卡死) → broker.has_cached_order 回 False → 改走快照 (看券商 status 再決定);
+                # 還沒超過門檻就再延後,兩種情況都不會拿同一個物件重送
+                self._note_cancel_err(no, "撤單 SDK 逾時", state="unconfirmed")
+                with self._lock:
+                    q = self._cancel_queue.get(no)
+                    if q is not None:
+                        q["next_ts"] = max(now, time.time()) + 1.0   # 從扇出結束起算 (扇出已等滿逾時)
+                out["pending"].append(no)
+                continue
+            status, msg = r
+            if status == "ok":
+                self._confirm_cancelled(no, it["symbol"], it["reason"], source=source)
+                out["cancelled"].append(no)
+                continue
+            if status == "in_flight":
+                # 分流之後才被別的 thread 搶先認領 (同步撤單) → 這次什麼都沒送;稍後看那一筆的結果,
+                # 不計 attempts、不記錯誤 (與 _split_direct_cancels 的延後同一個規則)
+                with self._lock:
+                    q = self._cancel_queue.get(no)
+                    if q is not None:
+                        q["next_ts"] = max(now, time.time()) + _CANCEL_INFLIGHT_RECHECK_SEC
+                out["pending"].append(no)
+                continue
+            cls = (_classify_direct_cancel_error(msg) if entry.get("_direct")
+                   else classify_cancel_error(msg))
+            if cls == "already_cancelled":
+                self._confirm_cancelled(no, it["symbol"], it["reason"], source=f"{source}:{msg[:40]}")
+                out["cancelled"].append(no)
+            elif cls == "filled_before_cancel":
+                fq = entry.get("filled_qty")
+                if self._settle_filled_before_cancel(
+                        no, it["symbol"], it["reason"], None if fq is None else int(fq), msg,
+                        snapshot_status=str(entry.get("status") or "")):
+                    out["filled_before_cancel"].append(no)
+                else:
+                    out["pending"].append(no)     # 手上的值無法核實 → 留佇列,下一輪用新快照結案
+            else:
+                self._cancel_retry_later(no, now, msg)
+                out["pending"].append(no)
+
+    def _settle_reported_fills(self, due: list, out: dict) -> list:
+        """到期項預篩 (查清單 / 送撤單之前): 佇列項帶 fbc_unverified (= 券商已親口回「成交單/部分成交單已不允許
+        取消」或快照 status 50,只差成交量待核實) 且成交回報已讓本地 row 變 filled → 直接以「撤單前已成交」結案。
+        2026-10-12 審查: 免查詢撤單被拒「成交單已不允許取消」後 broker 丟掉物件,0.3 s 後這筆落到快照路徑 →
+        就算成交回報已到也照拉一次全清單 (凍 1~2 s),正好在開盤撤 P / 多送 M 剛成交的那一秒。
+        **只認 fbc_unverified** — 沒有券商終結文案背書的書號 (重連補收可能把本地雙算成 filled 而券商仍 live)
+        仍須走快照,以券商 status 為準。回剩下要處理的 due。"""
+        rest = []
+        for no, it in due:
+            if it.get("fbc_unverified"):
+                with self._lock:
+                    row = self.order_log.get(no)
+                    reported = row is not None and row["status"] == "filled"
+                if reported and self._settle_filled_before_cancel(
+                        no, it["symbol"], it["reason"], None, "成交回報已到 (本地已 filled)"):
+                    out["filled_before_cancel"].append(no)
+                    continue
+            rest.append((no, it))
+        return rest
+
+    def _split_direct_cancels(self, due: list, now: float = 0.0, out: Optional[dict] = None) -> tuple:
+        """到期項分流: (broker 手上有下單回傳物件 → 免查詢直接撤, 其餘 → 快照舊路徑)。
+        broker 不支援 (舊 fake / replay 替身沒有 has_cached_order + cancel_cached) → 全部走舊路徑。
+        同一書號的免查詢撤單**正在往返中** (別的 thread 的同步撤單還沒回;broker.direct_cancel_in_flight) →
+        本輪延後 _CANCEL_INFLIGHT_RECHECK_SEC: 不重送、不進快照批 (不為它拉全清單)、不計 attempts。
+        往返超過 broker 的門檻 (卡死) 才會落到快照批。"""
+        broker = self.broker
+        has = getattr(broker, "has_cached_order", None)
+        if not callable(has) or not callable(getattr(broker, "cancel_cached", None)):
+            return [], due
+        in_flight = getattr(broker, "direct_cancel_in_flight", None)
+        route_fn = getattr(broker, "direct_cancel_route", None)
+        direct, rest = [], []
+        for no, it in due:
+            # 一次問完 (broker 一個鎖區塊內決定) — 分兩次問的話,中間被別的 thread 認領會掉進快照批、
+            # 為一筆正在撤的單拉全清單 (第三輪審查)。沒有 direct_cancel_route 的替身才分兩次問。
+            try:
+                if callable(route_fn):
+                    route = route_fn(no)
+                elif callable(in_flight) and in_flight(no) is True:
+                    route = "in_flight"
+                else:
+                    route = "direct" if has(no) is True else "snapshot"
+            except Exception:
+                route = "snapshot"
+            if route == "in_flight":
+                with self._lock:
+                    q = self._cancel_queue.get(no)
+                    if q is not None:
+                        q["next_ts"] = max(now, time.time()) + _CANCEL_INFLIGHT_RECHECK_SEC
+                if out is not None:
+                    out["pending"].append(no)
+                continue
+            (direct if route == "direct" else rest).append((no, it))
+        return direct, rest
+
+    def _run_direct_cancels(self, direct: list, now: float, out: dict):
+        """免查詢撤單 (2026-10-07): 不拉全清單,直接用 broker 記下的下單回傳物件扇出撤單。
+        成功 / 「取消單已不允許取消」→ 券商確認撤單 (與快照路徑同一個結案點);
+        「成交單/部分成交單已不允許取消」→ 手上沒有券商成交量 → 留佇列;broker 已丟掉該物件,下一輪走快照、
+          由快照 status / filled_qty 結案 (若成交回報已先到、本地已 filled → 下面的本地終結檢查直接結案,免快照);
+        其他拒因 / 例外 → attempts+1 退避;broker 視情況保留或丟掉物件 (cancel_cached),丟掉後自動改走快照。
+        本地 row 已終結 (回報先到) 者不送撤單 — 免查詢路徑沒有快照 status 可預分類,改看本地:
+          filled → 「撤單前已成交」結案 (計數/告警/晚結案 hook 與快照路徑一致);cancelled / rejected → 出佇列。
+          例外: row 的成交量曾被「券商權威補入」(auth_filled;重連補收 reconcile_orders 等) → 本地 filled 可能是
+          補收 + 晚到回報雙算出來的、券商端其實還有剩餘量 live → **照送撤單讓券商回答** (撤成 → 確認撤單;
+          回「成交單已不允許取消」→ row 已非 pending 當場結案)。舊路徑是以快照 status 為準,這裡等價。"""
+        work = []
+        for no, it in direct:
+            with self._lock:
+                row = self.order_log.get(no)
+                local = row["status"] if row is not None else None
+                if local == "filled" and row.get("auth_filled"):
+                    local = "pending"          # 視同未終結 → 下面照送撤單
+            if local is not None and local != "pending":
+                if local == "filled":
+                    if self._settle_filled_before_cancel(no, it["symbol"], it["reason"], None,
+                                                         "成交回報先到 (本地已 filled)"):
+                        out["filled_before_cancel"].append(no)
+                    else:
+                        out["pending"].append(no)
+                else:
+                    self._dequeue_cancel(no, f"row 已 {local} (回報先到)")
+                continue
+            work.append((no, it, {"_direct": True}))
+        if not work:
+            return
+        with self._lock:
+            for no, _, _ in work:
+                row = self.order_log.get(no)
+                if row is not None:
+                    row["cancel_state"] = "sent"
+        results = self._fanout_cancel(work, _CANCEL_SDK_TIMEOUT_SEC)
+        self._apply_cancel_results(work, results, now, out, source="worker:direct")
 
     def _cancel_run_legacy(self, due: list, now: float, out: dict):
         """無 get_order_snapshot 的 broker (舊 fake/replay) — 逐筆 broker.cancel 同步試。"""
@@ -1441,13 +1637,20 @@ class TradingSession:
         def _one(no, it, entry):
             try:
                 self._rate.acquire()
-                if cancel_by_obj is not None:
+                if entry.get("_direct"):
+                    # 免查詢: broker 用它記下的下單回傳物件撤 (不查全清單)
+                    broker.cancel_cached(no, it["symbol"], it["reason"])
+                elif cancel_by_obj is not None:
                     cancel_by_obj(entry.get("_obj"), no, it["symbol"], it["reason"])
                 else:
                     broker.cancel(no, it["symbol"], reason=it["reason"])
                 r = ("ok", "")
             except Exception as e:           # noqa: BLE001
-                r = ("err", str(e))
+                r = ("in_flight" if _exc_kind(e) == "in_flight" else "err", str(e))
+            except BaseException as e:       # noqa: BLE001
+                # 縱深防禦: broker.cancel_by_obj 已把 SDK 的 BaseException (PyO3 panic) 轉成 RuntimeError;
+                # 萬一還有漏網的,也要留下結果 — thread 無聲死掉會被當成「逾時」(不計 attempts、每秒重送)
+                r = ("err", f"{type(e).__name__}: {e}")
             finally:
                 sem.release()
             with rlock:
@@ -1488,7 +1691,9 @@ class TradingSession:
             it["attempts"] += 1
             n = it["attempts"]
             back = _CANCEL_BACKOFF[n - 1] if n - 1 < len(_CANCEL_BACKOFF) else _CANCEL_BACKOFF[-1]
-            it["next_ts"] = now + back
+            # 退避從「現在」(該輪結束) 起算,不是該輪開始時刻 — 一輪含一次全清單查詢 (1~2 s) 時,從開始起算的
+            # 0.3/0.5/1 s 早已過期 = 零退避、連續拉全清單 (2026-10-07 node1 第二次查詢就是這樣緊接著第一輪)
+            it["next_ts"] = max(now, time.time()) + back
             row = self.order_log.get(order_no)
             if row is not None:
                 row["cancel_state"] = "unconfirmed"
@@ -1605,6 +1810,9 @@ class TradingSession:
         if delta <= 0:
             return 0
         row["filled_lots"] = auth_lots                    # 覆寫非累加
+        # 這列的成交量有一部分是「補入」而非逐筆回報 — 之後同一批成交的回報若晚到會再加一次 (雙算),本地可能
+        # 顯示 filled 而券商端仍有剩餘量 live → 免查詢撤單不可只憑本地 filled 就不送 (_run_direct_cancels)
+        row["auth_filled"] = True
         if row["filled_lots"] >= row["lots"] and row["status"] == "pending":
             row["status"] = "filled"
             row["terminal_ts"] = time.time()
@@ -1819,6 +2027,12 @@ class TradingSession:
             self._cancel_retry_later(order_no, time.time(),
                                      f"FILLED_UNVERIFIED (fq={filled_qty_shares}, "
                                      f"status={snapshot_status or '-'}): {text}")
+            with self._lock:
+                q = self._cancel_queue.get(order_no)
+                if q is not None:
+                    # 券商已說「已成交」、只差成交量 → 成交回報一到 (row 變 filled) worker 就直接結案,
+                    # 不必為它再拉全清單 (_settle_reported_fills)
+                    q["fbc_unverified"] = True
             logger.warning(f"[session] {symbol} 撤單回已成交 order={order_no} ({reason}) 但快照無法核實 "
                            f"(fq={filled_qty_shares} status={snapshot_status or '-'}) → 留佇列下一輪核實: {text}")
         elif first:
@@ -1837,21 +2051,49 @@ class TradingSession:
 
     def _try_cancel_sync(self, order_no: str, symbol: str, reason: str,
                          enqueue: bool = True) -> str:
-        """同步 broker.cancel 試一次 (過 45/s _rate)。回:
+        """同步 broker.cancel 試一次 (過 45/s _rate)。broker.cancel 手上有下單回傳物件時**不查全清單**
+        (2026-10-07;被拒帶的 filled_qty 為 None → 「已成交」留佇列由下一輪快照核實)。回:
         'ok' / 'already_cancelled' / 'filled_before_cancel' (終端;**結案已在此處理** —
         broker.CancelRejected 帶撤單當下委託物件的 filled_qty/status → _settle_filled_before_cancel
         立刻補成交或留佇列核實,caller 不必再呼叫) /
         'queued' (查無/查詢失敗/非終端錯 → 已入佇列;enqueue=False 時回 'not_found'|'lookup'|'retry')。
         **任何非終端失敗都不標 cancelled、不動 st.order_no、不釋放預算。**"""
         self._rate.acquire()
+        # 只在免查詢撤單啟用時才走這條捷徑 — 停用 / CANCEL_DIRECT_OBJ=0 時撤單路徑要與修法前完全相同
+        # (一律先問券商;那個模式本來每次撤單都查清單,省這一次沒有意義)
+        state_fn = getattr(self.broker, "direct_cancel_state", None)
+        try:
+            direct_on = callable(state_fn) and state_fn() == "on"
+        except Exception:      # noqa: BLE001
+            direct_on = False
+        if direct_on:
+            with self._lock:
+                row = self.order_log.get(order_no)
+                if row is not None and row["status"] == "cancelled":
+                    # caller 讀到「pending」之後、在送單額度上排隊的期間,別的 thread 的撤單已拿到券商確認
+                    # (cancelled 只由券商確認寫入) → 不必再問券商。不擋的話: 物件已丟 → 掉進快照查詢,
+                    # 為一筆已撤的單凍住 process (出場 worker 撤 P 時就凍在賣單之前;第三輪審查)
+                    return "already_cancelled"
         try:
             self.broker.cancel(order_no, symbol, reason=reason)
             return "ok"
         except Exception as e:     # noqa: BLE001 — 例外/回傳失敗都要接 (踩雷點 #8)
             kind = _exc_kind(e)
             msg = str(e)
+            if kind == "in_flight":
+                # 別的 thread 對同一筆的免查詢撤單正在往返 → 這次沒送、沒查清單。入佇列稍後看那一筆的結果
+                # (不計 attempts、不記錯誤;撤成會由同步結案/回報出佇列)
+                if not enqueue:
+                    return "retry"
+                self.request_cancel(order_no, symbol, reason)
+                with self._lock:
+                    q = self._cancel_queue.get(order_no)
+                    if q is not None:
+                        q["next_ts"] = max(q["next_ts"], time.time() + _CANCEL_INFLIGHT_RECHECK_SEC)
+                return "queued"
             if kind == "other":
-                cls = classify_cancel_error(msg)
+                cls = (_classify_direct_cancel_error(msg) if getattr(e, "direct", False) is True
+                       else classify_cancel_error(msg))
                 if cls == "already_cancelled":
                     return cls
                 if cls == "filled_before_cancel":
@@ -1970,16 +2212,40 @@ class TradingSession:
             return {"ok": False, "live": [], "queued": [], "orphans": [], "flagged": []}
         return self._broker_sweep("intraday_sweep", dry_run=dry_run, protect_active=True)
 
+    def has_entries_today(self) -> bool:
+        """今天這個會話是否嘗試過進場 (有預掛 / 任何買單紀錄;roll_day 會清)。runner 09:00 據此決定能不能
+        提早收工 — 見 Runner._trade_phase。"""
+        with self._lock:
+            return bool(self.trades) or any(r.get("action") == "buy" for r in self.order_log.values())
+
+    def stop_entry(self, symbol: str, reason: str) -> None:
+        """**立刻**記下「這檔停止進場」— 只改本地旗標、不碰券商,行情 thread 上可直接呼叫。
+        市價盲送的 cadence 每送一筆前都看 st.stopped_reason;以前這個旗標要等撤單往返回來才設
+        (cancel_symbol_orders 的同步撤成 → _close_cancel),淘汰之後那 0.2~0.4 s 盲送照送
+        (2026-10-12 6872: 五台 node 在賣單出現後又送了 56 筆市價單,幸好當時是集合競價全部被退)。
+        先到的 reason 為準 (與其他設這個旗標的地方相同);沒有 st (這檔今天沒預掛) → 不做事。"""
+        if not reason:
+            return
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is not None:
+                st.stopped_reason = st.stopped_reason or reason
+
     def cancel_symbol_orders_async(self, symbol: str, reason: str):
         """撤單非同步版 — **行情 callback thread 專用** (撤單 REST 往返 ~60ms,
-        同步呼叫會卡住同 socket 其他股票的 tick,包括正要觸發市價追的那筆)。"""
+        同步呼叫會卡住同 socket 其他股票的 tick,包括正要觸發市價追的那筆)。
+        停止進場的旗標在**呼叫的當下**就設好 (stop_entry),不等背景 thread 起跑、更不等撤單往返。"""
+        self.stop_entry(symbol, reason)
         threading.Thread(target=self.cancel_symbol_orders, args=(symbol, reason),
                          name=f"cancel-{symbol}", daemon=True).start()
 
     def cancel_symbol_orders(self, symbol: str, reason: str):
         """撤該檔 pending 委託 (unmark/首盤淘汰/出場 worker 用)。不賣持倉。
         閘門 = _can_manage (非 is_live) — 關 kill switch 後撤單仍要能動。
-        ⚠ 同步阻塞 (REST 往返) — 行情 thread 上請用 cancel_symbol_orders_async。"""
+        ⚠ 同步阻塞 (REST 往返) — 行情 thread 上請用 cancel_symbol_orders_async。
+        一進來先設停止進場的旗標 (stop_entry) — 下面每一條路最後都會設同一個旗標,只是以前有一條
+        (有 pending 單、同步撤) 要等券商回覆才設,盲送就多送了那一段。"""
+        self.stop_entry(symbol, reason)
         with self._lock:
             st = self.trades.get(symbol)
             if st is None or not st.order_no or st.order_status != "pending":
@@ -3488,6 +3754,10 @@ class TradingSession:
             return {
                 "mode": self.mode,
                 "armed": self.armed,
+                # 「開始隔日賣」(2026-10-14): off / trade / overnight_only (armed 但不進場)
+                "entry_enabled": self.entry_enabled,
+                "arm_mode": ("overnight_only" if (self.armed and not self.entry_enabled)
+                             else "trade" if self.armed else "off"),
                 "connecting": self.connecting,
                 "connect_error": self.connect_error,
                 **b,

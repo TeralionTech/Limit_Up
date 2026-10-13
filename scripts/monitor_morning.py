@@ -123,9 +123,13 @@ def _fmt_node(name, r, hub_marked, now_t):
             ok = False
     mode, armed = tr.get("mode", "?"), tr.get("armed")
     conn = tr.get("connected")
-    arm_c = GREEN if (mode == "real" and armed) else YEL
+    # 2026-10-14「開始隔日賣」: arm_mode = trade / overnight_only / off (舊版 status 沒有 → None)。
+    # 隔日賣模式 = 今天不搶單 → 黃色 + 明寫,盤前一眼看出哪幾台不會買
+    overnight_only = tr.get("arm_mode") == "overnight_only"
+    arm_c = GREEN if (mode == "real" and armed and not overnight_only) else YEL
+    arm_txt = ("ARMED(隔日賣,不搶單)" if overnight_only else "ARMED") if armed else "unarmed"
     line = (f"{name} phase={st.get('phase', '?')} "
-            f"{arm_c}{mode}/{'ARMED' if armed else 'unarmed'}{RST}"
+            f"{arm_c}{mode}/{arm_txt}{RST}"
             f"/{'conn' if conn else 'NOCONN'} marked({len(marked)})={' '.join(marked) or '—'}{match}")
     return line, ok
 

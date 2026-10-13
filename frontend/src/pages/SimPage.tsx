@@ -408,7 +408,37 @@ function TradingPanel() {
     if (!ts) return
     if (!ts.armed && !window.confirm(
       '⚡ 確定開始「真實下單」?\n\n08:59:58 會對標記清單預掛漲停價限價單,9:00 後依策略下市價單。')) return
-    try { await api.tradingArm(!ts.armed); flash(ts.armed ? '已停止交易' : '⚡ 交易已啟動') }
+    try {
+      // 不帶 overnight_only: 節點若已在隔日賣模式,後端不會悄悄升級成搶單 (回 unchanged) — 要搶單請按「改為搶單」
+      const r = await api.tradingArm(!ts.armed)
+      if (r.unchanged) { flash('節點在隔日賣模式,未改為搶單 — 要搶單請按「⚡ 改為搶單」'); return }
+      flash(ts.armed ? '已停止交易' : '⚡ 交易已啟動')
+    } catch (e: any) { flash(`✗ ${e.message}`) }
+  }
+
+  // 「開始隔日賣」: arm 但不搶今天的單 — 不預掛、不盲送、不市價追;只監控並賣出隔日賣標的 (以及既有部位的出場/撤單)
+  async function startOvernightOnly() {
+    if (!ts) return
+    if (!window.confirm(
+      '🌙 確定「開始隔日賣」?\n\n今天不搶新單: 08:59:58 不預掛、09:00 後不下市價買單。\n'
+      + '只持續監控並依規則賣出隔日賣標的 (漲停打開 → 跌停價限價賣),既有部位的出場與撤單照常。')) return
+    try {
+      const r = await api.tradingArm(true, true)
+      if (r.overnight_only !== true) {
+        // 後端沒有這個功能 (舊版會忽略 overnight_only 並以**正常搶單模式** arm) → 立刻停止交易,不可留著
+        try { await api.tradingArm(false) } catch { /* 下面的訊息已要求人工確認 */ }
+        flash('✗ 後端不支援「開始隔日賣」(版本不符),已自動停止交易 — 請確認節點狀態為未 armed')
+        return
+      }
+      flash('🌙 隔日賣模式已啟動 (不搶今天的單)')
+    } catch (e: any) { flash(`✗ ${e.message}`) }
+  }
+
+  // 隔日賣模式中改為正常搶單 (要過預算 pre-flight;09:00 後才切的話今天不會再補搶)
+  async function switchToTrade() {
+    if (!ts) return
+    if (!window.confirm('⚡ 由「隔日賣模式」改為正常搶單?\n\n之後的預掛 / 市價單會照策略送出 (已過的時點不補)。')) return
+    try { await api.tradingArm(true, false); flash('⚡ 已改為正常搶單') }
     catch (e: any) { flash(`✗ ${e.message}`) }
   }
 
@@ -464,7 +494,9 @@ function TradingPanel() {
           : ts.connected ? <Badge cls="bg-red-100 text-red-800">⚠ 連線不健康 — 請重連</Badge>
           : <Badge cls="bg-gray-100 text-gray-600">未連線</Badge>
         )}
-        {ts?.armed && <Badge cls="bg-red-600 text-white animate-pulse">⚡ 交易中</Badge>}
+        {ts?.armed && (ts.arm_mode === 'overnight_only'
+          ? <Badge cls="bg-indigo-600 text-white animate-pulse">🌙 隔日賣模式 (不搶今天的單)</Badge>
+          : <Badge cls="bg-red-600 text-white animate-pulse">⚡ 交易中</Badge>)}
         {/* 撤單未確認 (查無/查詢失敗/撤單被拒,worker 重試中) — 券商端可能仍 live,不可當已撤 */}
         {(ts?.n_cancel_unconfirmed ?? 0) > 0 && (
           <Badge cls="bg-amber-100 text-amber-800 border border-amber-300">
@@ -558,6 +590,21 @@ function TradingPanel() {
                         ts.armed ? 'bg-gray-600 hover:bg-gray-700' : 'bg-red-600 hover:bg-red-700'}`}>
                 {ts.armed ? '■ 停止交易' : '⚡ 開始交易'}
               </button>
+              {/* 只在後端有這個功能 (status 帶 arm_mode) 時才顯示 — 舊後端會把 overnight_only 當成正常搶單 */}
+              {!ts.armed && ts.arm_mode !== undefined && (
+                <button onClick={startOvernightOnly}
+                        title="不搶今天的單: 不預掛、不盲送、不市價追;只監控並賣出隔日賣標的 (既有部位的出場/撤單照常)"
+                        className="px-4 py-2 rounded font-bold text-white bg-indigo-600 hover:bg-indigo-700">
+                  🌙 開始隔日賣
+                </button>
+              )}
+              {ts.armed && ts.arm_mode === 'overnight_only' && (
+                <button onClick={switchToTrade}
+                        title="由隔日賣模式改為正常搶單 (要先設好預算)"
+                        className="px-3 py-2 rounded font-medium border border-red-400 text-red-700 hover:bg-red-100">
+                  ⚡ 改為搶單
+                </button>
+              )}
               <button onClick={closeAll}
                       className="px-3 py-2 rounded font-medium border border-red-400 text-red-700 hover:bg-red-100">
                 🚨 緊急全平

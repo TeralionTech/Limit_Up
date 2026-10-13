@@ -16,12 +16,78 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
+import time
 from datetime import datetime
 from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ─── 行情連線健康 / 自動重連 (2026-10-12: hub 8 條 socket 08:48 全部停擺、其中 5 條之後斷線且從未重連,
+#     hub 拿著過期的「鎖漲停」標記凍結名單 → 五台 node 對 08:57:48 已打開的 6872 預掛) ───
+# 做法比照 day-trade 系統的生產分支 (teralion day-trade-system: fubon_adapter._handle_disconnect /
+# _md_connect_with_timeout,以及之後的 fugle_connect_patch),每條 socket 各自一套:
+#   disconnect 事件 → single-flight 的重連 thread → 先 disconnect() 舊的 (重設認證狀態、取消舊計時器) → 0.5 s →
+#   開連線 → 重新訂閱;**不設次數上限**,退避 2,4,8,16,32,60,60… s。
+# day-trade 踩過、這裡一併處理的坑:
+#   1. 函式庫的 connect() 是沒有 sleep、沒有期限的忙等 (等 auth_status 變成已認證 / 認證失敗):TCP 根本連不上
+#      時永遠不返回、吃滿一顆 CPU (day-trade 一台 1 vCPU 主機上留過 11 條)。→ 不呼叫它: 自己起收訊 thread
+#      (函式庫 connect() 做的同一件事)、用 sleep 輪詢認證狀態、有期限 (_open_socket)。**開機第一次連線也走
+#      這條** — node 是 08:59:50 才連行情,那時候忙等會把唯一的一顆 CPU 佔到開盤。
+#   2. 連線斷掉後 auth_status 仍停在「已認證」→ 不先 disconnect() 就 connect() 會立刻返回,接著訂閱全炸。
+#   3. Linux 上關掉 socket 叫不醒正在 select() 的舊收訊 thread,它要等自己的 10 s 逾時才發現 → 強制關閉停擺的
+#      連線後最多等 MD_CLOSE_WAIT_SEC;舊的沒結束就**不在同一個物件上開第二條** (兩條會搶同一個 socket)。
+#   4. 同一組 token 重連可能一直「authentication timeout」(realtime session 失效;官方的斷線重連作法是重新登入)
+#      → 認證類失敗 / 舊收訊迴圈不結束 / 連續 MD_REBUILD_AFTER_FAILS 次失敗 → 這條 socket 換**全新 session**
+#      (新 SDK login + init_realtime,_rebuild_socket),每條 MD_REBUILD_COOLDOWN_SEC 最多一次;換下來的 SDK 要
+#      logout (否則留一條原生忙等 thread + 佔一個連線名額)。
+#   5. 「Maximum number of connections reached」: 只開不關會把券商的連線名額塞滿、連上就被踢 (2026-08-25 的死亡
+#      螺旋)。→ 一律先關舊的;看到這個錯誤就等 MD_CONN_CAP_WAIT_SEC 讓券商回收名額,再用全新 session 連。
+#   6. **不可以只靠 disconnect 事件**: 舊版 websocket-client 在同一個物件第二次以後的連線結束時不再發這個事件
+#      (實測 1.6.4;生產機的版本沒有 pin)。→ 收訊 thread 是我們自己起的,thread 結束 = 連線結束 (_rx_main 的
+#      finally),不管事件有沒有來;看門狗也會檢查收訊 thread 還在不在。連線層的致命錯誤 (逾時 / 連線中斷)
+#      一出現就先標斷線 — 關閉事件要等函式庫跟對方握手,會晚約 3 s。
+# 另加看門狗: 一條 socket 安靜 MD_IDLE_PING_SEC 秒就送 ping (伺服器回 pong = 一則訊息),連 pong 都沒有、
+# 總共約 MD_STALL_SEC 秒沒有任何訊息 → 視為停擺,強制重連 (SDK 內建的 30 s 心跳要 60~90 s 才會發現;
+# day-trade 的看門狗是 120 s,但盤前凍結名單等不了那麼久)。
+# 重連之後**沒有初始畫面** (盤前試撮五檔只在變動時推送) → 該連線上的檔在收到新的 books 之前都算「過期」
+# (is_stale),hub 的 marked 快照會把它們排除 (runner.marked_snapshot)。
+MD_IDLE_PING_SEC_DEFAULT = 5.0      # 一條 socket 這麼久沒任何訊息 → 開始送 ping 探測
+MD_STALL_SEC_DEFAULT = 20.0         # 這麼久沒任何訊息 (含 pong) → 停擺,強制重連;0 = 停用看門狗
+MD_CONNECT_TIMEOUT_SEC = 12.0       # 重連時開連線 + 認證最多等多久 (TCP 逾時 5 s + 函式庫認證計時 5 s)
+MD_CLOSE_WAIT_SEC = 12.0            # 強制關閉後等舊收訊迴圈結束的上限 (Linux 要 ~10 s,見上 3)
+MD_RECONNECT_STEP_SEC = 2.0         # 重連退避 = min(2 × 2^(n−1), 60) s (同 day-trade 生產分支)
+MD_RECONNECT_MAX_SEC = 60.0
+MD_REBUILD_AFTER_FAILS = 3          # 同一個物件連續失敗幾次 → 換全新 session
+MD_REBUILD_COOLDOWN_SEC = 60.0      # 每條 socket 換 session 的最短間隔 (防洗登入)
+MD_CONN_CAP_WAIT_SEC = 20.0         # 連線數達上限: 等券商回收名額多久再連
+MD_FLAP_SEC = 10.0                  # 重連成功後這麼快又斷 = 沒撐住 → 接著上一輪繼續退避 / 累計失敗 (不從 2 s 重來)。
+#                                     要小於 MD_STALL_SEC: 看門狗誤判停擺最快也要 20 s 後,那種只該花一次 2 s 重連
+_AUTH_OK = 2                        # fugle_marketdata AuthenticationState.AUTHENTICATED
+_AUTH_FAILED = 3                    # fugle_marketdata AuthenticationState.UNAUTHENTICATED
+_CONN_CAP_TEXT = "Maximum number of connections"
+
+
+class _MdAuthError(RuntimeError):
+    """連線開了但認證失敗 / 認證逾時 — 這組 token (realtime session) 可能已失效 → 換全新 session。"""
+
+
+class _MdNotEstablished(RuntimeError):
+    """連線根本沒建立 (連不上 / 被拒 / 認證前就關了) — 多半是對方或網路的問題,照退避重試。"""
+
+
+class _MdOldLoopAlive(RuntimeError):
+    """舊連線的收訊迴圈還沒結束 — 不可以在同一個物件上再開一條 (兩條會搶同一個 socket)。"""
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.environ.get(name, "")
+        return float(raw) if str(raw).strip() != "" else default
+    except (TypeError, ValueError):
+        return default
 
 
 class Subscriber:
@@ -85,6 +151,31 @@ class Subscriber:
         # runner 的凍結後補收 (2026-10-06) 等這個 event 才 add_symbol,免得送進還沒連上的 socket
         self._ready = threading.Event()
         self._connect_grace_sec = 2.0        # 開機批次送出前的保守等待 (舊行為;測試可調短)
+        # ─── 連線健康 / 自動重連 (檔頭 MD_*) ───
+        # 每條 socket 一個 dict (見 _init_socket_health);空 list = 尚未初始化 (舊測試的替身 socket) →
+        # 一律視為正常、沒有過期的檔
+        self._sock_state: List[dict] = []
+        self._sock_lock = threading.Lock()
+        # symbol → 最後一筆 books 屬於所屬 socket 的第幾段連線 (st["epoch"])。用計數而不是時間比較:
+        # 時鐘解析度粗的平台 (Windows ~16 ms) 上「斷線前最後一筆」與「重連」可能落在同一個時間刻度
+        self._last_book_epoch: dict = {}
+        self._trade_subs: set = set()        # 訂過 trades 的檔 (重連後要一併重訂)
+        self._cur_batch: dict = {}           # socket_idx → 這條 socket 目前訂的檔 (socket loop 每輪更新)
+        self._sock_sdks: List = []           # 每條 socket 的資料 SDK (第 1 條 = primary_sdk)
+        self._sock_creds: List = []          # 每條 socket 的登入資訊 (換全新 session 用);None = 不能換
+        self._rebuild_lock = threading.Lock()    # 換 session (登入) 一次只做一條
+        self._stall_sec = _env_float("MD_STALL_SEC", MD_STALL_SEC_DEFAULT)
+        self._idle_ping_sec = max(0.5, _env_float("MD_IDLE_PING_SEC", MD_IDLE_PING_SEC_DEFAULT))
+        self._connect_timeout_sec = MD_CONNECT_TIMEOUT_SEC
+        self._close_wait_sec = MD_CLOSE_WAIT_SEC
+        self._reconnect_step_sec = MD_RECONNECT_STEP_SEC
+        self._reconnect_max_sec = MD_RECONNECT_MAX_SEC
+        self._reconnect_settle_sec = 0.5     # disconnect() 之後、開新連線之前 (同 day-trade)
+        self._rebuild_after_fails = MD_REBUILD_AFTER_FAILS
+        self._rebuild_cooldown_sec = MD_REBUILD_COOLDOWN_SEC
+        self._conn_cap_wait_sec = MD_CONN_CAP_WAIT_SEC
+        self._flap_sec = MD_FLAP_SEC
+        self._watchdog_tick_sec = 1.0
 
     # ─── 對外 API ────────────────────────────────────────────
 
@@ -96,6 +187,9 @@ class Subscriber:
         else:
             logger.warning("[subscriber] multi-SDK 失敗，fallback loop single-socket")
             self._sockets = [self.primary_sdk.marketdata.websocket_client.stock]
+            plan = self._account_plan(self.login_cfg)
+            self._sock_sdks = [self.primary_sdk]
+            self._sock_creds = [tuple(plan[0][:5])] if plan else [None]
             self._start_loop_single_socket()
         # heartbeat thread — 每 10 秒印一次 tick 統計 (即使 0 也印，方便診斷)
         hb = threading.Thread(target=self._heartbeat_loop, name="subscriber-heartbeat",
@@ -107,6 +201,15 @@ class Subscriber:
                               daemon=True)
         pr.start()
         self._threads.append(pr)
+        # watchdog thread — 收訊 thread 死掉就標斷線;安靜的 socket 送 ping 探測,停擺就強制重連
+        # (MD_STALL_SEC=0 只停用「停擺」判定)
+        if self._sock_state:
+            wd = threading.Thread(target=self._watchdog_loop, name="subscriber-watchdog",
+                                  daemon=True)
+            wd.start()
+            self._threads.append(wd)
+            if self._stall_sec <= 0:
+                logger.warning("[subscriber] MD_STALL_SEC=0 → 行情停擺看門狗停用 (只靠連線結束事件重連)")
 
     def stop(self):
         """乾淨關閉:
@@ -179,6 +282,7 @@ class Subscriber:
         first_err = None
         for sym in symbols:
             idx = self._symbol_idx.get(sym, 0) % n
+            self._trade_subs.add(sym)            # 送失敗也記 — 該 socket 重連後一併補訂
             try:
                 self._sockets[idx].subscribe({"channel": "trades", "symbol": sym})
                 ok += 1
@@ -186,8 +290,11 @@ class Subscriber:
                 fail += 1
                 if first_err is None:
                     first_err = (sym, str(e)[:150])
-        logger.info(f"[subscriber] subscribe_trades_for: {ok} ok / {fail} fail "
-                    f"(watchlist {len(symbols)} 檔) first_err={first_err}")
+        # 全部送失敗 = 這些檔的成交完全收不到 (2026-10-12 09:00 hub 14 檔 0 ok / 14 fail 只記了一行 INFO)
+        log = logger.critical if (fail and not ok) else (logger.warning if fail else logger.info)
+        log(f"[subscriber] subscribe_trades_for: {ok} ok / {fail} fail "
+            f"(watchlist {len(symbols)} 檔) first_err={first_err}"
+            f"{' — 送失敗的檔會在該行情連線重連後補訂' if fail else ''}")
 
     def add_symbol(self, symbol: str) -> bool:
         """盤中手動加訂一檔 (隔日賣手動輸入用) — 立即訂 books+trades。
@@ -212,6 +319,7 @@ class Subscriber:
             return False
         with self._extra_lock:
             self._extra_symbols.add(symbol)      # 之後 socket loop 每輪一起重訂 (重連後不漏)
+        self._trade_subs.add(symbol)             # trades 也要在重連後補訂
         ok = True
         sent = []
         for ch in ("books", "trades"):
@@ -234,6 +342,66 @@ class Subscriber:
         """伺服器是否已回 event=subscribed (帶 subscription id) — 補訂成功的真正依據。"""
         with self._sub_ids_lock:
             return (channel, symbol) in self._sub_ids
+
+    # ─── 連線健康 / 過期判定 (對外) ──────────────────────────
+
+    def _socket_index(self, symbol: str) -> int:
+        """symbol 所屬 socket 的 index (與 _socket_for 同一套 round-robin)。"""
+        n = len(self._sockets)
+        return (self._symbol_idx.get(symbol, 0) % n) if n else 0
+
+    def is_stale(self, symbol: str) -> bool:
+        """這檔的五檔是否「過期」= 不能拿來判斷它現在還鎖不鎖漲停:
+          - 它所屬的行情連線目前斷線 / 停擺中,或
+          - 該連線重連過,而這檔在重連之後還沒收到任何一筆 books。
+        重連後**沒有初始畫面** (盤前試撮五檔只在變動時推送),所以第二種不能省 — 斷線期間它可能已經打開
+        (2026-10-12 的 6872)。收到新的 books (filter handler 照常 mark / unmark) 就自動恢復。
+        連線健康尚未初始化 (測試替身 socket) → 一律 False。"""
+        ss = self._sock_state
+        if not ss:
+            return False
+        idx = self._socket_index(symbol)
+        if idx >= len(ss):
+            return False
+        st = ss[idx]
+        if not st["up"]:
+            return True
+        epoch = st["epoch"]                      # 這條 socket 重連成功過幾次;0 = 沒斷過
+        return epoch > 0 and self._last_book_epoch.get(symbol, -1) < epoch
+
+    def stale_symbols(self, symbols) -> set:
+        """symbols 當中目前過期的 (見 is_stale)。"""
+        return {s for s in symbols if self.is_stale(s)}
+
+    def is_down(self, symbol: str) -> bool:
+        """這檔所屬的行情連線**目前**斷線 / 停擺中 (看不到它的任何變化)。與 is_stale 的差別: 不含
+        「重連後尚未收到新五檔」— node 的行情 08:59:50 才訂,沒有畫面是常態,只有連線本身斷了才算瞎。"""
+        ss = self._sock_state
+        if not ss:
+            return False
+        idx = self._socket_index(symbol)
+        return idx < len(ss) and not ss[idx]["up"]
+
+    def down_symbols(self, symbols) -> set:
+        return {s for s in symbols if self.is_down(s)}
+
+    def socket_health(self) -> dict:
+        """各條行情連線的狀態 — get_tick_stats()["sockets"] (/api/health 看得到)。"""
+        now_m = time.monotonic()
+        rows = []
+        for i, st in enumerate(self._sock_state):
+            up = bool(st["up"])
+            rows.append({
+                "idx": i + 1,
+                "up": up,
+                "down_sec": 0.0 if up else round(now_m - st["down_mono"], 1),
+                "reason": "" if up else st["down_reason"],
+                "reconnects": st["reconnects"],
+                "rebuilds": st["rebuilds"],
+                "idle_sec": round(now_m - st["last_msg_mono"], 1),
+            })
+        return {"total": len(rows), "down": sum(1 for r in rows if not r["up"]),
+                "reconnects": sum(r["reconnects"] for r in rows), "detail": rows}
 
     def request_unsubscribe(self, symbol: str):
         """單檔退訂 (unmark 淘汰時呼叫) — thread-safe，可在 message handler 內呼叫。
@@ -306,6 +474,523 @@ class Subscriber:
         idx = self._symbol_idx.get(symbol, 0) % n
         return self._sockets[idx]
 
+    # ─── 連線健康: 斷線偵測 / 自動重連 / 看門狗 (檔頭 MD_*) ────
+
+    def _init_socket_health(self):
+        """每條 socket 建健康狀態並掛 disconnect / error 事件 — 在第一次 connect() 之前呼叫 (重連沿用同一個
+        client 物件,事件一直在)。掛不上 (替身沒有 on) 只警告: 那條 socket 就沒有事件驅動的重連。"""
+        now_m = time.monotonic()
+        self._sock_state = [{
+            "up": True,                     # False = 斷線 / 停擺中 (該連線上的檔全部過期)
+            "down_since": None, "down_mono": 0.0, "down_reason": "",
+            "epoch": 0,                     # 第幾段連線 (每次重連 +1);books 記下當時的值,較舊 = 過期
+            "last_msg_mono": now_m,         # 最後一則訊息 (任何 event,含 pong)
+            "last_ping_mono": 0.0,          # 看門狗最後一次送 ping
+            "first_ping_mono": 0.0,         # 最後一則訊息之後的第一個 ping (還沒被回應的最早那個)
+            "reconnects": 0,
+            "rebuilds": 0,                  # 換過幾次全新 session
+            "reconnecting": False,          # 這條的重連 thread 在跑 (single-flight)
+            "gen": 0,                       # client 物件的世代;換 session 後舊物件晚到的事件依此丟棄
+            "loop_closed": False,           # 目前這個物件的收訊迴圈已結束 (收過 disconnect 事件)
+            "closed_ev": threading.Event(),
+            "rx_thread": None,              # 我們自己起的收訊 thread (_open_socket);開機那條是函式庫起的
+            "want_rebuild": False,          # 下一次嘗試要換全新 session
+            "last_rebuild_mono": 0.0,
+            "cap_until": 0.0,               # 連線數達上限 → 這個時刻之前不連
+            "up_mono": 0.0,                 # 最近一次標回正常的時刻 (判斷「連上就又斷」用)
+            "carry_attempt": 0,             # 那一次重連用到第幾次嘗試 / 累計幾次失敗 — 沒撐住的話接著算
+            "carry_fail": 0,
+        } for _ in self._sockets]
+        n = len(self._sockets)
+        self._sock_sdks = (list(self._sock_sdks) + [None] * n)[:n]
+        self._sock_creds = (list(self._sock_creds) + [None] * n)[:n]
+        for i, ws in enumerate(self._sockets):
+            try:
+                ws.on("disconnect", self._make_disconnect_handler(i, 0))
+                ws.on("error", self._make_error_handler(i, 0))
+            except Exception as e:
+                logger.warning(f"[subscriber] socket #{i+1} 掛 disconnect/error 事件失敗 "
+                               f"(這條沒有事件驅動的自動重連): {e}")
+
+    def _socket_is_up(self, idx: int) -> bool:
+        ss = self._sock_state
+        return True if idx >= len(ss) else bool(ss[idx]["up"])
+
+    def _symbols_on_socket(self, idx: int) -> list:
+        """這條 socket 目前該訂的檔: socket loop 這一輪的批次 + 補訂的 extras − 已淘汰。"""
+        with self._removed_lock:
+            removed = set(self._removed)
+        with self._extra_lock:
+            extras = [s for s in sorted(self._extra_symbols) if self._socket_index(s) == idx]
+        base = list(self._cur_batch.get(idx) or [])
+        return [s for s in dict.fromkeys(base + extras) if s not in removed]
+
+    def _make_disconnect_handler(self, idx: int, gen: int = 0):
+        def _on_disconnect(code=None, message=None, *_a):
+            st = self._sock_state[idx]
+            if st["gen"] != gen:
+                return                       # 已換掉的舊物件晚到的關閉事件
+            st["loop_closed"] = True
+            st["closed_ev"].set()
+            if self._stop.is_set():
+                return                       # 我們自己 stop() 關的
+            if message is not None and _CONN_CAP_TEXT in str(message):
+                self._note_conn_cap(idx, message)    # 舊版 websocket-client: 關閉 frame 的原因只出現在這裡
+            self._socket_down(idx, f"disconnect code={code} msg={message}")
+        return _on_disconnect
+
+    def _note_conn_cap(self, idx: int, detail) -> None:
+        """券商端連線名額滿了 (多半是之前的連線沒關乾淨)。繼續一直連只會一直被踢 → 等券商回收名額,
+        下一次用全新 session (舊的 logout 才會釋放名額)。"""
+        st = self._sock_state[idx]
+        first = st["cap_until"] <= time.monotonic()
+        st["cap_until"] = time.monotonic() + self._conn_cap_wait_sec
+        st["want_rebuild"] = True
+        if first:
+            logger.critical(f"[subscriber] ⚠⚠ 行情 socket #{idx+1} 被券商拒絕: 連線數達上限 ({detail}) — "
+                            f"等 {self._conn_cap_wait_sec:g} s 讓券商回收名額,再用全新 session 重連")
+
+    def _make_error_handler(self, idx: int, gen: int = 0):
+        def _on_error(err=None, *_a):
+            # 只記錄 (去重);斷線一律以 disconnect 事件 / 看門狗為準。沒人聽 error 事件的話,事件發射器會把它
+            # 當例外丟回 websocket thread,斷線原因 (例「Connection timed out」) 就不會有我們自己的一行 log
+            st = self._sock_state[idx]
+            if st["gen"] != gen:
+                return
+            text = f"{type(err).__name__}: {err}"
+            if _CONN_CAP_TEXT in text:
+                self._note_conn_cap(idx, err)
+                return
+            key = f"ws-error:{idx}:{text[:80]}"
+            cnt = self._error_count.get(key, 0) + 1
+            self._error_count[key] = cnt
+            if cnt <= 3 or cnt % 500 == 0:
+                logger.warning(f"[socket#{idx}] 連線層錯誤 #{cnt}: {text}")
+            # 連線已經不能用的錯誤 (讀取逾時 / 連線中斷) → 現在就標斷線。關閉事件要等函式庫跟對方握手
+            # (對方沒回應時約 3 s),這段時間訂閱已經送不出去、資料也不會再來
+            if self._is_fatal_ws_error(err) and not self._stop.is_set():
+                self._socket_down(idx, f"error {text[:120]}")
+        return _on_error
+
+    @staticmethod
+    def _is_fatal_ws_error(err) -> bool:
+        """連線層的致命錯誤: OS / 逾時 / 連線中斷,以及 websocket-client 自己的 WebSocket*Exception。
+        (handler 內的例外不會走到這裡 — 訊息處理全程自己接;保守起見其他型別一律不當致命)"""
+        if isinstance(err, (OSError, TimeoutError, ConnectionError, EOFError)):
+            return True
+        return any(c.__name__.startswith("WebSocket") and c.__name__.endswith("Exception")
+                   for c in type(err).__mro__)
+
+    def _socket_down(self, idx: int, reason: str):
+        """把一條 socket 標成斷線 / 停擺 (只有從正常轉過來那一次 CRITICAL),並確保有一條重連 thread 在跑。"""
+        if self._stop.is_set() or idx >= len(self._sock_state):
+            return
+        st = self._sock_state[idx]
+        with self._sock_lock:
+            was_up = st["up"]
+            if was_up:
+                st["up"] = False
+                st["down_since"] = time.time()
+                st["down_mono"] = time.monotonic()
+                st["down_reason"] = reason
+            start = not st["reconnecting"]
+            if start:
+                st["reconnecting"] = True
+        if was_up:
+            logger.critical(f"[subscriber] ⚠⚠ 行情 socket #{idx+1} 斷線/停擺 ({reason}) — 這條連線上 "
+                            f"{len(self._symbols_on_socket(idx))} 檔收不到資料,已視為過期 "
+                            f"(hub 名單會排除);自動重連中")
+        if start:
+            try:
+                threading.Thread(target=self._reconnect_loop, args=(idx,),
+                                 name=f"subscriber-reconnect-{idx}", daemon=True).start()
+            except BaseException as e:      # noqa: BLE001 — 例「can't start new thread」
+                # 旗標已經立了、thread 卻沒起來 → 不放掉的話這條 socket 整天沒人重連 (day-trade 生產環境發生過)
+                with self._sock_lock:
+                    st["reconnecting"] = False
+                logger.critical(f"[subscriber] ⚠⚠ 行情 socket #{idx+1} 重連 thread 起不來 "
+                                f"({type(e).__name__}: {e}) — 看門狗下一輪再試")
+
+    def _reconnect_delay(self, attempt: int) -> float:
+        """第 attempt 次嘗試前等多久: 2,4,8,16,32,60,60… s (同 day-trade 生產分支;不設次數上限)。"""
+        return min(self._reconnect_step_sec * (2 ** (min(attempt, 6) - 1)), self._reconnect_max_sec)
+
+    def _should_rebuild(self, idx: int, consec_fail: int) -> bool:
+        """這一次嘗試要不要換全新 session (新 SDK 登入)。有登入資訊、過了冷卻,而且: 上一次是認證類失敗 /
+        舊收訊迴圈不結束 / 連線數達上限 (want_rebuild),或同一個物件已連續失敗 MD_REBUILD_AFTER_FAILS 次。"""
+        st = self._sock_state[idx]
+        if idx >= len(self._sock_creds) or not self._sock_creds[idx]:
+            return False
+        if not (st["want_rebuild"] or consec_fail >= self._rebuild_after_fails):
+            return False
+        last = st["last_rebuild_mono"]
+        return last <= 0 or time.monotonic() - last >= self._rebuild_cooldown_sec
+
+    def _reconnect_loop(self, idx: int):
+        """單條 socket 的重連迴圈 (single-flight = st["reconnecting"];比照 day-trade,不設次數上限)。
+        連上、重訂完,而且這期間沒有再收到關閉事件,才把 socket 標回正常;標回之後若又斷了就留在迴圈。"""
+        st = self._sock_state[idx]
+        attempt = 0
+        consec_fail = 0
+        # 上一次「重連成功」沒撐過 MD_FLAP_SEC 就又斷了 (連上、認證過、馬上被踢) → 接著上一輪的次數繼續退避、
+        # 累計失敗 (夠了就換全新 session)。每次都從 2 s 重來的話: 一條 socket 每分鐘開 20 幾條連線、永遠不換
+        # session,而券商對短時間大量連線是會擋的
+        if st["up_mono"] > 0 and st["down_mono"] - st["up_mono"] < self._flap_sec:
+            attempt = st["carry_attempt"]
+            consec_fail = st["carry_fail"] + 1
+        handed_back = False                      # True = 已在鎖內把 single-flight 旗標交回去了
+        try:
+            while True:
+                attempt += 1
+                delay = max(self._reconnect_delay(attempt), st["cap_until"] - time.monotonic())
+                if self._stop.wait(delay):
+                    return
+                how = ""
+                try:
+                    if self._should_rebuild(idx, consec_fail):
+                        self._rebuild_socket(idx)
+                        how = ",全新 session"
+                        consec_fail = 0
+                    else:
+                        self._close_old_connection(idx)
+                    if self._stop.is_set():
+                        return                   # stop() 之後不再開新連線
+                    self._open_socket(idx)
+                    nb, nt, nf = self._resubscribe_socket(idx)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as e:      # noqa: BLE001
+                    # BaseException: 換 session 會呼叫 FubonSDK() / login() / init_realtime() (Rust),panic 是
+                    # pyo3 的 PanicException (繼承 BaseException)。漏接的話這條 thread 無聲死掉、旗標卡住 →
+                    # 這條 socket 整天沒人重連。當成又一次失敗的嘗試,照退避繼續
+                    consec_fail += 1
+                    if isinstance(e, (_MdAuthError, _MdOldLoopAlive)):
+                        st["want_rebuild"] = True
+                    log = logger.critical if attempt % 10 == 0 else logger.warning
+                    log(f"[subscriber] 行情 socket #{idx+1} 重連失敗 (第 {attempt} 次{how},"
+                        f"已斷 {time.monotonic() - st['down_mono']:.0f} s): {type(e).__name__}: {e}")
+                    continue
+                with self._sock_lock:
+                    closed_again = st["loop_closed"]     # 重訂期間新連線又關了 → 這次不算成功
+                    if not closed_again:
+                        down_for = time.monotonic() - st["down_mono"]
+                        st["up"] = True
+                        st["down_since"] = None
+                        st["reconnects"] += 1
+                        st["want_rebuild"] = False
+                        st["last_msg_mono"] = st["up_mono"] = time.monotonic()
+                        st["last_ping_mono"] = st["first_ping_mono"] = 0.0
+                        st["carry_attempt"] = attempt
+                        st["carry_fail"] = consec_fail
+                if closed_again:
+                    consec_fail += 1
+                    logger.warning(f"[subscriber] 行情 socket #{idx+1} 剛連上就又斷了 (第 {attempt} 次) → 再試")
+                    continue
+                logger.critical(f"[subscriber] ✅ 行情 socket #{idx+1} 重連成功 (第 {attempt} 次嘗試{how},斷線 "
+                                f"{down_for:.1f} s),已重訂 books {nb} 檔 / trades {nt} 檔"
+                                f"{f'、{nf} 筆送失敗' if nf else ''} — 這些檔在收到新的五檔之前仍視為過期")
+                with self._sock_lock:
+                    if st["up"] or self._stop.is_set():
+                        st["reconnecting"] = False
+                        handed_back = True
+                        return
+                consec_fail += 1                 # 標回正常後馬上又斷 → 算一次失敗,接著退避 (不歸零)
+        finally:
+            if not handed_back:
+                # stop / thread 異常結束: 放掉 single-flight (還斷著的話看門狗會重新啟動重連)
+                with self._sock_lock:
+                    st["reconnecting"] = False
+
+    def _old_loop_running(self, idx: int) -> bool:
+        """目前這個物件的收訊迴圈還在跑嗎。收訊 thread 是我們起的 → 只看 thread (不依賴 disconnect 事件,
+        舊版 websocket-client 重用物件時不會再發);沒有 handle (公開 connect() 那條路) 才看關閉事件。"""
+        st = self._sock_state[idx]
+        th = st["rx_thread"]
+        if th is not None:
+            return th.is_alive()
+        return not st["loop_closed"]
+
+    def _rx_main(self, idx: int, gen: int, run):
+        """我們自己起的收訊 thread: 跑函式庫的 run_forever,結束時 (不管怎麼結束) 當成這條連線已關閉。"""
+        try:
+            run()
+        except BaseException as e:      # noqa: BLE001 — run_forever 自己丟出來的也只是「連線結束」
+            logger.warning(f"[socket#{idx}] 收訊迴圈例外結束: {type(e).__name__}: {e}")
+        finally:
+            st = self._sock_state[idx]
+            if st["gen"] == gen:
+                st["loop_closed"] = True
+                st["closed_ev"].set()
+                if not self._stop.is_set():
+                    self._socket_down(idx, "收訊迴圈結束 (連線已關閉)")
+
+    def _close_old_connection(self, idx: int):
+        """重連前先 disconnect() 舊連線 (比照 day-trade): 重設函式庫的認證狀態、取消舊的認證 / 心跳計時器。
+        舊連線的收訊迴圈還活著 (停擺被看門狗抓到、或上一次嘗試剛失敗) → 等它結束,最多 MD_CLOSE_WAIT_SEC
+        (Linux 上要 ~10 s 才醒);還不結束就 raise _MdOldLoopAlive — 絕不在同一個物件上開第二條。"""
+        ws = self._sockets[idx]
+        st = self._sock_state[idx]
+        running = self._old_loop_running(idx)
+        try:
+            ws.disconnect()
+        except Exception as e:
+            logger.info(f"[subscriber] socket #{idx+1} 重連前 disconnect() 例外 (略過): {e}")
+        if running:
+            deadline = time.monotonic() + self._close_wait_sec
+            while self._old_loop_running(idx) and time.monotonic() < deadline:
+                if self._stop.wait(0.05):
+                    break
+            if self._old_loop_running(idx):
+                if st["rx_thread"] is not None:
+                    raise _MdOldLoopAlive(f"舊連線的收訊迴圈 {self._close_wait_sec:g} s 內沒有結束")
+                # 沒有 thread handle (拿不到函式庫內部欄位、走公開 connect() 的退路): 只能靠關閉事件,而它
+                # 不一定會來 → 等過上限就當它已結束 (盡力而為;正常的路有 handle,不會走到這裡)
+                st["loop_closed"] = True
+        self._stop.wait(self._reconnect_settle_sec)
+
+    def _rebuild_socket(self, idx: int):
+        """這條 socket 換**全新 session**: 新的 FubonSDK login + init_realtime → 新的 client 物件,掛上同一套
+        事件 (新世代;舊物件晚到的事件丟棄),取代 self._sockets[idx]。之後由 _open_socket 連線。
+        先把舊連線關掉 (釋放券商端的連線名額);換下來的 SDK 若不是 primary_sdk 就 logout (背景、盡力而為 —
+        logout 才會停掉它的原生忙等 thread,也才釋放名額;primary_sdk 主流程還要用來打 REST,不動)。
+        登入失敗 → raise (算一次失敗的嘗試;冷卻照算,不會每輪都重登)。"""
+        st = self._sock_state[idx]
+        creds = self._sock_creds[idx]
+        label, acct, pwd, pfx, pfxpwd = creds
+        with self._rebuild_lock:
+            st["last_rebuild_mono"] = time.monotonic()
+            from fubon_neo.sdk import FubonSDK
+            old_ws = self._sockets[idx]
+            old_sdk = self._sock_sdks[idx]
+            try:
+                old_ws.disconnect()
+            except Exception:
+                pass
+            if st["cap_until"] > 0 and old_sdk is not None and old_sdk is not self.primary_sdk:
+                self._logout_sdk(old_sdk, idx, wait=True)      # 名額滿: 先確實登出舊的再登入
+                old_sdk = None
+            sdk = FubonSDK()
+            try:
+                if pfxpwd == "":
+                    accounts = sdk.login(acct, pwd, pfx)
+                else:
+                    accounts = sdk.login(acct, pwd, pfx, pfxpwd)
+                if not accounts:
+                    raise RuntimeError("換 session: login 回空 accounts")
+                if getattr(accounts, "is_success", None) is False:
+                    raise RuntimeError(f"換 session: login is_success=False: {getattr(accounts, 'message', '?')}")
+                sdk.init_realtime()
+                ws = sdk.marketdata.websocket_client.stock
+                gen = st["gen"] + 1
+                ws.on("message", self._make_msg_handler(socket_idx=idx, gen=gen))
+                ws.on("disconnect", self._make_disconnect_handler(idx, gen))
+                ws.on("error", self._make_error_handler(idx, gen))
+            except BaseException:
+                # 登入之後的任何一步失敗 (換行情 token 失敗、Rust panic …): 這個新 SDK 沒有人會用到,一定要登出 —
+                # 不登出就留下一條原生忙等 thread + 佔一個連線名額,而且每 60 s 冷卻又來一個 (同 broker.re_login
+                # 對失敗的新 SDK 的做法)
+                self._logout_sdk(sdk, idx, wait=False)
+                raise
+            with self._sock_lock:
+                st["gen"] = gen
+                st["rx_thread"] = None
+                st["loop_closed"] = True                     # 新物件還沒有收訊迴圈
+                st["closed_ev"].clear()
+                st["rebuilds"] += 1
+                st["cap_until"] = 0.0
+                self._sockets[idx] = ws
+                self._sock_sdks[idx] = sdk
+            self._extra_sdks.append(sdk)
+        logger.critical(f"[subscriber] 行情 socket #{idx+1} 已換全新 session ({label} "
+                        f"{str(acct)[:3]}***,第 {st['rebuilds']} 次) — 接著連線、重訂")
+        if old_sdk is not None and old_sdk is not self.primary_sdk:
+            self._logout_sdk(old_sdk, idx, wait=False)
+        self._stop.wait(self._reconnect_settle_sec)
+
+    def _logout_sdk(self, sdk, idx: int, wait: bool):
+        """登出換下來的資料 SDK (不是 primary_sdk 才呼叫)。logout 偶爾會卡很久 → 放背景 thread;
+        wait=True 時最多等 10 s (連線名額滿的情況要先確實釋放)。"""
+        try:
+            self._extra_sdks.remove(sdk)
+        except ValueError:
+            pass
+
+        def _do():
+            try:
+                sdk.logout()
+            except BaseException as e:      # noqa: BLE001 — 盡力而為;原生 SDK 的 panic 也只記一行
+                logger.info(f"[subscriber] socket #{idx+1} 舊 session logout 例外 (略過): "
+                            f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=_do, name=f"md-logout-{idx}", daemon=True)
+        t.start()
+        if wait:
+            t.join(10.0)
+
+    def _open_socket(self, idx: int):
+        """開連線並等到認證完成 (開機第一次與之後每次重連都走這裡);失敗 / 逾時 raise。
+        **一定會返回** (函式庫的 connect() 連不上時不會,見檔頭 1)。
+        首選: 自己起收訊 thread (函式庫 connect() 做的同一件事) 再用 sleep 輪詢認證狀態,沒有忙等;
+        拿不到函式庫內部的 WebSocketApp (版本不同 / 測試替身) → 退回公開的 connect(),放在 helper thread 並
+        在逾時 / 連線先關掉時把 auth_status 改成「認證失敗」讓它跳出。
+        成功 = 已認證 + 沒有收到關閉事件。失敗分三種 (決定要不要換 session):
+          _MdAuthError       連線開了但認證失敗 / 逾時
+          _MdNotEstablished  連線根本沒建立
+          _MdOldLoopAlive    舊收訊 thread 還在 (呼叫前應先 _close_old_connection)"""
+        ws = self._sockets[idx]
+        st = self._sock_state[idx]
+        prev = st["rx_thread"]
+        if prev is not None and prev.is_alive():
+            raise _MdOldLoopAlive("舊連線的收訊 thread 還在")
+        inner = getattr(ws, "_client", ws)                      # fubon_neo 的 wrapper 包了一層
+        app = getattr(inner, "_WebSocketClient__ws", None)       # fugle_marketdata 2.4.1 的 WebSocketApp
+        run = getattr(app, "run_forever", None) if app is not None else None
+        st["closed_ev"].clear()
+        st["loop_closed"] = False
+        deadline = time.monotonic() + self._connect_timeout_sec
+        if callable(run) and hasattr(inner, "auth_status"):
+            th = threading.Thread(target=self._rx_main, args=(idx, st["gen"], run),
+                                  name=f"md-ws-{idx}", daemon=True)
+            st["rx_thread"] = th
+            th.start()
+            fail: Optional[Exception] = None
+            while True:
+                status = getattr(inner, "auth_status", None)
+                if status in (_AUTH_OK, _AUTH_FAILED):
+                    break
+                if st["closed_ev"].is_set() or not th.is_alive():
+                    fail = _MdNotEstablished("連線沒有建立 (連不上 / 被拒 / 認證完成前就關閉)")
+                    break
+                if time.monotonic() >= deadline:
+                    fail = _MdAuthError(f"{self._connect_timeout_sec:g} s 內未完成認證")
+                    break
+                if self._stop.wait(0.02):
+                    fail = _MdNotEstablished("subscriber 已停止")
+                    break
+            err = getattr(inner, "error", None)                 # 關連線之前先抓住 (disconnect() 會清掉)
+            status = getattr(inner, "auth_status", None)
+            if fail is None and err is None and status == _AUTH_OK and not st["closed_ev"].is_set():
+                return
+            if fail is None:
+                fail = (_MdAuthError(f"認證失敗: {err}") if err is not None or status == _AUTH_FAILED
+                        else _MdNotEstablished("連線在認證完成時已關閉"))
+            try:
+                ws.disconnect()                                 # 同函式庫 connect() 失敗時: 關掉 + 取消計時器
+            except Exception:
+                pass
+            raise fail
+        box: dict = {}
+
+        def _run():
+            try:
+                ws.connect()
+                box["ok"] = True
+            except BaseException as e:      # noqa: BLE001 — 原樣帶回
+                box["err"] = e
+
+        th = threading.Thread(target=_run, name=f"md-connect-{idx}", daemon=True)
+        th.start()
+        fail = None
+        while th.is_alive():
+            if st["closed_ev"].is_set():
+                fail = _MdNotEstablished("連線沒有建立 (認證完成前就關閉)")
+            elif time.monotonic() >= deadline:
+                fail = _MdAuthError(f"{self._connect_timeout_sec:g} s 內 connect() 未返回")
+            elif self._stop.is_set():
+                fail = _MdNotEstablished("subscriber 已停止")
+            if fail is not None:
+                try:                                            # 讓函式庫的忙等迴圈跳出
+                    if getattr(inner, "error", None) is None:
+                        inner.error = fail
+                    inner.auth_status = _AUTH_FAILED
+                except Exception:
+                    pass
+                th.join(2.0)
+                break
+            th.join(0.02)
+        if box.get("ok") and fail is None:
+            return
+        if fail is None:
+            err = box.get("err")
+            text = str(err) if err is not None else "connect() 未返回"
+            fail = (_MdAuthError(text) if "auth" in text.lower() or "認證" in text
+                    else _MdNotEstablished(text))
+        raise fail
+
+    def _resubscribe_socket(self, idx: int) -> tuple:
+        """重連後把這條 socket 的訂閱補回來: books (這一輪的批次 + extras − 已淘汰) 與訂過的 trades。
+        舊連線的 subscription id 全部作廢 (has_ack 要等新的 ack)。回 (books 數, trades 數, 送失敗數)。
+        ⚠ 先把 epoch +1 再送訂閱: 送出後馬上回來的 books 才算「重連後的新資料」。"""
+        ws = self._sockets[idx]
+        st = self._sock_state[idx]
+        syms = self._symbols_on_socket(idx)
+        with self._sub_ids_lock:
+            for key in [k for k in self._sub_ids if self._socket_index(k[1]) == idx]:
+                self._sub_ids.pop(key, None)
+        st["epoch"] += 1
+        nb = nt = nf = 0
+        for sym in syms:
+            try:
+                ws.subscribe({"channel": "books", "symbol": sym})
+                nb += 1
+            except Exception:
+                nf += 1
+        with self._removed_lock:
+            removed = set(self._removed)
+        for sym in sorted(self._trade_subs):
+            if self._socket_index(sym) != idx or sym in removed:
+                continue
+            try:
+                ws.subscribe({"channel": "trades", "symbol": sym})
+                nt += 1
+            except Exception:
+                nf += 1
+        if nb + nt == 0 and nf > 0:
+            raise _MdNotEstablished(f"重訂全部送失敗 ({nf} 筆) — 連線可能又斷了")
+        return nb, nt, nf
+
+    def _watchdog_loop(self):
+        while not self._stop.is_set():
+            self._stop.wait(self._watchdog_tick_sec)
+            if self._stop.is_set():
+                return
+            try:
+                self._watchdog_once()
+            except Exception as e:
+                logger.exception(f"[subscriber] 行情看門狗例外 (下一輪繼續): {e}")
+
+    def _watchdog_once(self, now_m: Optional[float] = None):
+        """看門狗一輪: 安靜的 socket 送 ping (伺服器回 pong = 一則訊息);第一個沒被回應的 ping 送出後又過了
+        (MD_STALL_SEC − MD_IDLE_PING_SEC) 秒仍然沒有任何訊息 → 停擺,強制重連。以「沒被回應的 ping」計時而不是
+        單看安靜多久: 整個 process 被凍住 (例如全清單查詢) 之後醒來,要先給它一次回應的機會。"""
+        now_m = time.monotonic() if now_m is None else now_m
+        grace = max(self._stall_sec - self._idle_ping_sec, self._idle_ping_sec)
+        for idx, st in enumerate(self._sock_state):
+            if not st["up"] and not st["reconnecting"]:
+                # 斷線中卻沒有重連 thread 在跑 (thread 起不來 / 異常結束) — 不可以就這樣停在斷線
+                self._socket_down(idx, st["down_reason"] or "重連中斷")
+                continue
+            if not st["up"] or st["reconnecting"]:
+                continue
+            th = st["rx_thread"]
+            if th is not None and not th.is_alive():
+                self._socket_down(idx, "收訊 thread 已結束")      # 正常由 _rx_main 的 finally 先標;這裡兜底
+                continue
+            last_msg = st["last_msg_mono"]
+            idle = now_m - last_msg
+            waiting = st["first_ping_mono"] > last_msg           # 有還沒被回應的 ping
+            if self._stall_sec > 0 and waiting and now_m - st["first_ping_mono"] >= grace:
+                self._socket_down(idx, f"{idle:.0f} s 沒有任何訊息 (ping 也沒有回應)")
+                continue
+            if idle >= self._idle_ping_sec and now_m - st["last_ping_mono"] >= self._idle_ping_sec:
+                st["last_ping_mono"] = now_m
+                if not waiting:
+                    st["first_ping_mono"] = now_m
+                try:
+                    self._sockets[idx].ping("wd")
+                except Exception as e:
+                    self._socket_down(idx, f"ping 送不出去: {type(e).__name__}: {e}")
+
     # ─── Multi-SDK: 開 N 個 login sessions ───────────────────
 
     @staticmethod
@@ -343,12 +1028,16 @@ class Subscriber:
             return False
 
         sockets = []
+        sdks = []                    # 與 sockets 對齊: 每條 socket 的資料 SDK
+        creds = []                   # 與 sockets 對齊: 換全新 session 用的登入資訊 (不寫進任何 log)
         summary = []
         for label, acct, pwd, pfx, pfxpwd, n in self._account_plan(self.login_cfg):
             opened = 0
             for i in range(n):
                 if label == "primary" and i == 0:
                     sockets.append(self.primary_sdk.marketdata.websocket_client.stock)
+                    sdks.append(self.primary_sdk)
+                    creds.append((label, acct, pwd, pfx, pfxpwd))
                     opened += 1
                     continue
                 ws = self._login_extra_sdk(FubonSDK, acct, pwd, pfx, pfxpwd,
@@ -357,6 +1046,8 @@ class Subscriber:
                     logger.error(f"[subscriber] {label} 只開 {opened}/{n} 條就放棄")
                     break
                 sockets.append(ws)
+                sdks.append(self._extra_sdks[-1] if self._extra_sdks else None)
+                creds.append((label, acct, pwd, pfx, pfxpwd))
                 opened += 1
             if opened == 0:
                 logger.critical(f"[subscriber] ⚠⚠ {label} 帳號 ({str(acct)[:3]}***) 一條 socket "
@@ -364,6 +1055,8 @@ class Subscriber:
                                 f"盡快檢查該帳號憑證/密碼!")
             summary.append(f"{opened} {label}")
         self._sockets = sockets
+        self._sock_sdks = sdks
+        self._sock_creds = creds
         logger.info(f"[subscriber] 共開 {len(sockets)} 個 sockets ({' + '.join(summary)})")
         return len(sockets) >= 2
 
@@ -421,6 +1114,7 @@ class Subscriber:
             logger.info(f"[subscriber] universe {len(self.universe)} 檔 <= 容量 {capacity} 檔，"
                         f"全部一次性 subscribe 常駐 (不 rotation)")
         self._rebuild_symbol_index()      # universe 定案 (truncate 後) → 建 O(1) 路由表
+        self._init_socket_health()        # connect 之前掛 disconnect/error 事件 (斷線自動重連)
         connected_events = []
         for i, ws in enumerate(self._sockets):
             ev = threading.Event()
@@ -432,10 +1126,11 @@ class Subscriber:
                     logger.info(f"[subscriber] socket #{_i+1} connected event fired ✓")
                 ws.on("connect", _on_conn)
                 ws.on("message", self._make_msg_handler(socket_idx=i))
-                ws.connect()
+                self._open_socket(i)              # 有期限、不忙等;返回時已認證
                 logger.info(f"[subscriber] socket #{i+1} connect() 已呼叫 (等 broker ready)")
             except Exception as e:
                 logger.error(f"[subscriber] socket #{i+1} connect 失敗: {e}")
+                self._socket_down(i, f"開機連線失敗: {e}")   # 交給自動重連 (舊版這條就整天不收)
 
         per_socket = self._split_universe_per_socket()
 
@@ -503,8 +1198,14 @@ class Subscriber:
         while not self._stop.is_set():
             round_num += 1
             for i, batch in enumerate(batches, 1):
+                # 這條 socket 斷線 / 重連中 → 這一輪先不送 (送了只會整批失敗;重連成功時 _resubscribe_socket
+                # 會把訂閱補回來),等它回來再繼續
+                while not self._stop.is_set() and not self._socket_is_up(socket_idx):
+                    self._stop.wait(1.0)
                 if self._stop.is_set():
                     return
+                if socket_idx < len(self._sockets):
+                    ws = self._sockets[socket_idx]      # 換全新 session 後 client 物件會換,每輪重拿
                 # subscribe 這批 — 只 books，不訂 trades (省一半 sub 額度，每檔佔 1 sub)
                 # 已淘汰 (removed) 的股票跳過 — 否則 pruner 退訂完又被這裡訂回
                 sub_ok = 0
@@ -518,7 +1219,8 @@ class Subscriber:
                 if i == 1:
                     with self._extra_lock:
                         extras = [s for s in sorted(self._extra_symbols)
-                                  if s not in batch and self._socket_for(s) is ws]
+                                  if s not in batch and self._socket_index(s) == socket_idx]
+                self._cur_batch[socket_idx] = list(batch)   # 重連時照這份補訂 (extras 另外即時算)
                 for sym in list(batch) + extras:
                     if sym in removed_snapshot:
                         continue
@@ -562,6 +1264,7 @@ class Subscriber:
 
     def _start_loop_single_socket(self):
         ws = self._sockets[0]
+        self._init_socket_health()        # connect 之前掛 disconnect/error 事件 (斷線自動重連)
         connected_event = threading.Event()
         try:
             def _on_conn(_e=connected_event):
@@ -569,11 +1272,13 @@ class Subscriber:
                 logger.info("[subscriber] 保底 socket connected event fired ✓")
             ws.on("connect", _on_conn)
             ws.on("message", self._make_msg_handler(socket_idx=0))
-            ws.connect()
+            self._open_socket(0)                  # 有期限、不忙等;返回時已認證
             logger.info("[subscriber] 保底 socket connect() 已呼叫")
         except Exception as e:
+            # 舊版在這裡 raise → 整台當天不收行情 (隔日賣也賣不掉)。現在交給自動重連;連回來之前這條連線上的
+            # 檔都算斷線中,runner 不會為它們預掛 / 盲送 (runner._stale_marked)
             logger.error(f"[subscriber] 保底 socket connect 失敗: {e}")
-            raise
+            self._socket_down(0, f"開機連線失敗: {e}")
 
         self._rebuild_symbol_index()      # 保底路線也要建 O(1) 路由表
         batches = self._make_batches(self.universe, self.batch_size)
@@ -587,8 +1292,9 @@ class Subscriber:
 
     # ─── Message 分派 ───────────────────────────────────────
 
-    def _make_msg_handler(self, socket_idx: int):
+    def _make_msg_handler(self, socket_idx: int, gen: int = 0):
         """Per-socket message handler.
+        gen = 這個 handler 掛在第幾代的 client 物件上;換全新 session 後舊物件晚到的訊息直接丟掉。
 
         富邦 SDK 傳給 handler 的 message 是 JSON string (Alex fubon_adapter.py:665)。
         Schema: {"event": "data"|"pong"|"subscribed"|..., "data": {channel, symbol, bids, asks, price, size}}
@@ -596,6 +1302,13 @@ class Subscriber:
         """
         def _handler(msg):
             self._tick_counter += 1
+            # 連線活著的證據: 任何一則訊息 (data / subscribed / pong …) — 看門狗據此判停擺
+            now_m = time.monotonic()
+            ss = self._sock_state
+            if socket_idx < len(ss):
+                if ss[socket_idx]["gen"] != gen:
+                    return
+                ss[socket_idx]["last_msg_mono"] = now_m
             try:
                 # 富邦 message 是 JSON string — 先 parse (若已是 dict 也接受)
                 if isinstance(msg, str):
@@ -662,6 +1375,8 @@ class Subscriber:
                 if channel == "books":
                     bids = data.get("bids") or []
                     asks = data.get("asks") or []
+                    if socket_idx < len(ss):                 # 這檔在目前這段連線上收到過五檔 (is_stale 用)
+                        self._last_book_epoch[symbol] = ss[socket_idx]["epoch"]
                     try:
                         # isContinuous = 交易所權威「已逐筆(開盤後)」旗標 → 傳給 handler
                         # (filter 靠它退場,免拿開盤市價列 bids[0]=0 反推;2026-08-27 8105/1312)
@@ -749,6 +1464,7 @@ class Subscriber:
             "total_tick_count": self._tick_counter,
             "books_count": self._books_count,
             "trades_count": self._trades_count,
+            "sockets": self.socket_health(),     # 幾條 / 幾條斷線中 / 各條狀態
         }
 
     @staticmethod

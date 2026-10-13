@@ -69,6 +69,7 @@ class Runner:
         self.limit_downs: Dict[str, float] = {}   # symbol → 跌停價 (出場限價賣用,2026-08-12)
         self.dispositions: Dict[str, bool] = {}   # symbol → isDisposition (處置股)
         self._marked_frozen: bool = False   # hub 模式 08:59:50 凍結 marked 後 = True (marked-snapshot final 旗標)
+        self._node_hub_stale: set = set()   # node: hub 最後一份快照判定「行情過期」的檔 (stale_excluded)
         self.day_tradable: Dict[str, bool] = {}   # symbol → canDayTrade (禁現沖減半用,風控①)
         self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
         self._avgvol: dict = {}          # 月均量篩選結果 (今天 ran/dropped/kept/meta) — /api/avg-volume 顯示用
@@ -158,14 +159,39 @@ class Runner:
     def is_running(self) -> bool:
         return self._main_thread is not None and self._main_thread.is_alive()
 
+    def _stale_marked(self, symbols) -> set:
+        """symbols 當中**行情過期**的檔: 所屬行情連線斷線 / 停擺中,或重連後尚未收到新的五檔
+        (Subscriber.is_stale)。這些檔的「鎖漲停」標記是斷線前的畫面,不能再當真 (2026-10-12: hub 8 條 socket
+        斷 5 條沒人知道,6872 的鎖 08:57:48 打開、hub 的畫面還停在 08:47:51 → 五台 node 照樣預掛)。
+        重連後沒有初始畫面 (盤前試撮五檔只在變動時推送),所以「重連成功」不等於可以放回名單。
+        hub / standalone 從 08:00 起自己收全母體 → 用完整的過期判定 (stale_symbols)。
+        node 的行情是 08:59:50 才訂的 (沒有畫面是常態,名單以 hub 為準) → 只看**連線本身是否斷線中**
+        (down_symbols): 自己的行情連線斷著 = 看不到賣單出現、也看不到開盤,不可以瞎著預掛 / 盲送。
+        檢查本身出錯 → CRITICAL + 回空集合 (不讓整份名單因此消失)。"""
+        if not symbols:
+            return set()
+        name = "down_symbols" if getattr(self.cfg, "role", "standalone") == "node" else "stale_symbols"
+        fn = getattr(self.subscriber, name, None) if self.subscriber is not None else None
+        if not callable(fn):
+            return set()
+        try:
+            return set(fn(list(symbols)))
+        except Exception as e:
+            logger.critical(f"[runner] ⚠⚠ 行情過期檢查例外 — 這次名單**未排除**過期檔: {e}")
+            return set()
+
     def marked_snapshot(self) -> dict:
         """中心過濾 Hub → 交易節點的 marked 快照 (見架構 plan)。node 靠它預掛+訂閱,不自己 filter。
-        每檔帶: 漲停價 / 處置旗標 / 開盤即鎖 / 優先序。final=True = hub 已於 08:59:50 凍結。"""
+        每檔帶: 漲停價 / 處置旗標 / 開盤即鎖 / 優先序。final=True = hub 已於 08:59:50 凍結。
+        行情過期的檔 (_stale_marked) **不放進 symbols**,另列在 stale_excluded 供人查;收到新五檔且仍鎖住
+        就自動回到 symbols (node 的凍結後補收會收進去)。"""
         role = self.cfg.role if self.cfg else "standalone"
         now = datetime.now().isoformat(timespec="seconds")
         if not self.state:
             return {"ts": now, "final": False, "role": role, "symbols": []}
-        marked = self.state.get_marked_prioritized()          # 已排序: 開盤即鎖優先
+        marked_all = self.state.get_marked_prioritized()      # 已排序: 開盤即鎖優先
+        stale = self._stale_marked(marked_all)
+        marked = [s for s in marked_all if s not in stale]
         first_tick = self.state.first_tick_limit_up
         # session.untradable 在 runner-main 執行緒被整組 rebind、這裡在 FastAPI 執行緒讀 —
         # 先 bind local (單次屬性讀取原子),list comprehension 全程看同一組
@@ -185,7 +211,8 @@ class Runner:
             "is_t30": s in untradable,                           # 全額交割禁單 (08-12 事故防線)
             "day_tradable": bool(self.day_tradable.get(s, True)),  # 禁現沖 → 減半 (is False 嚴格比對,務必 bool)
         } for i, s in enumerate(marked)]
-        return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols}
+        return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols,
+                "stale_excluded": [s for s in marked_all if s in stale]}
 
     def _wait_until_clock(self, time_str: str):
         """精準等到今天的 HH:MM:SS (已過則立即返回);stop_event 可中斷。"""
@@ -209,10 +236,16 @@ class Runner:
             self._wait_until_clock(self.cfg.hub_freeze_time)
             if self._stop_event.is_set():
                 return
-            n = len(self.state.get_marked_list()) if self.state else 0
+            marked_all = self.state.get_marked_list() if self.state else []
+            stale = self._stale_marked(marked_all)
+            n = len(marked_all) - len(stale)
             self._marked_frozen = True
             logger.warning(f"[runner] ⏸ {self.cfg.hub_freeze_time} 凍結 marked ({n} 檔) "
                            f"→ final=true,node 可拉")
+            if stale:
+                logger.critical(f"[runner] ⚠⚠ 凍結名單**排除 {len(stale)} 檔**行情過期的標記 (所屬行情連線斷線中 / "
+                                f"重連後尚未收到新五檔,無法確認是否仍鎖漲停): {sorted(stale)} — 之後收到新五檔且"
+                                f"仍鎖住者會自動補回 (node 補收到 08:59:57)")
         t = threading.Thread(target=_timer, name="hub-freeze-timer", daemon=True)
         t.start()
         self._timer_threads.append(t)
@@ -229,6 +262,8 @@ class Runner:
         t30_set: set = set()
         self._node_bid_vol_fallback = {}     # sym → Hub 最後已知漲停層委買量 (20% cap 兜底)
         self._node_known_syms = set()        # 首份快照見過的檔 (凍結後補收只處理不在這裡的)
+        _se = snap.get("stale_excluded") if isinstance(snap, dict) else None
+        self._node_hub_stale = {str(x) for x in _se} if isinstance(_se, (list, tuple)) else set()
         if snap and snap.get("symbols"):
             for s in snap["symbols"]:
                 sym = s.get("symbol") if isinstance(s, dict) else None
@@ -369,6 +404,11 @@ class Runner:
         def _on_snapshot(snap):
             present: set = set()
             new_entries: list = []
+            # hub 這一份判定「行情過期」的檔 (hub 那條行情連線斷線中 / 重連後還沒收到新五檔)。每份 final 快照整組
+            # 換掉 — hub 之後收到新五檔、放回 symbols 的檔,下一輪就不在這裡了。08:59:58 預掛前看最後這一份
+            _se = snap.get("stale_excluded")
+            hub_stale = {str(x) for x in _se} if isinstance(_se, (list, tuple)) else set()
+            self._node_hub_stale = hub_stale
             try:
                 for s in snap.get("symbols") or []:
                     sym = s.get("symbol") if isinstance(s, dict) else None
@@ -407,6 +447,8 @@ class Runner:
             for sym in list(added):
                 if sym in present or sym in dropped or not self.state.is_marked(sym):
                     continue
+                if sym in hub_stale:
+                    continue      # hub 只是暫時看不到它 (不是看到它打開) → 不永久淘汰;還過期的話預掛前會排除
                 if self.state.unmark_hub_dropped(sym, f"hub ts={snap.get('ts')}"):
                     dropped.append(sym)
                     pending.pop(sym, None)
@@ -636,11 +678,7 @@ class Runner:
         # unmark 淘汰 → 立即退訂 + 撤該檔預掛/pending 委託 (與 standalone _unsub_and_cancel 同款;
         # session 未 armed 時撤單為 no-op)
         def _unsub_and_cancel(symbol: str):
-            self._unsub_symbol(symbol)
-            try:
-                self.session.cancel_symbol_orders_async(symbol, "unmarked")
-            except Exception as e:
-                logger.warning(f"[node] 撤 {symbol} 委託失敗: {e}")
+            self._unmark_stop_and_unsub(symbol, "node")
         unsub_ref["fn"] = _unsub_and_cancel
         self._node_unsub_and_cancel = _unsub_and_cancel     # 凍結後補收的檔被 Hub 拿掉時走同一條淘汰路徑
 
@@ -786,13 +824,7 @@ class Runner:
 
         # unmark 淘汰 → 立即退訂 + 撤該檔預掛/pending 委託 (session 未 armed 時為 no-op)
         def _unsub_and_cancel(symbol: str):
-            self._unsub_symbol(symbol)
-            try:
-                # async — unmark 在行情 thread 上觸發,08:59:58 後有預掛單時
-                # 同步 REST 會卡住同 socket 其他股票的 tick
-                self.session.cancel_symbol_orders_async(symbol, "unmarked")
-            except Exception as e:
-                logger.warning(f"[runner] 撤 {symbol} 委託失敗: {e}")
+            self._unmark_stop_and_unsub(symbol, "runner")
         unsub_ref["fn"] = _unsub_and_cancel
 
         # 預掛限價單 timer (08:59:58) — real mode + armed 才會真的下;
@@ -864,7 +896,18 @@ class Runner:
         # 「有沒有隔日賣要顧」一律問 session (即時清單),不信呼叫端傳進來的 list —
         # 那可能是 08:00 的快照 (2026-09-30: 手動加入的 2030 被當成不存在 → 這裡直接收工)。
         overnight_syms = self._overnight_now()
-        if not watchlist and not overnight_syms:
+        # 今天下過單 (有預掛 / 任何買單紀錄) 就不提早收工: 名單全被淘汰的日子,淘汰當下已經在券商那邊的單
+        # (撤單還沒確認的預掛 P、盲送中的市價單) 仍可能在開盤後成交。提早收工 = 不建 Trader、13:24 不寫隔日賣
+        # 清單 → 那筆部位今天沒人賣、明天的隔日賣也不知道它 (2026-10-12 的 6872 撤單確認只比開盤早 0.45 s)。
+        # 走下面的 Trader 路徑 (watchlist 空;只有隔日賣的日子本來就走這條) 不會送任何新單。
+        try:
+            entered_today = bool(self.session.has_entries_today())
+        except Exception:
+            entered_today = False
+        if not watchlist and not overnight_syms and entered_today:
+            logger.warning("[runner] 名單空 + 無隔日賣,但今天下過單 → 不提早收工 (等 13:24 撤單 + 寫隔日賣清單;"
+                           "在途的單若成交才有人記)")
+        if not watchlist and not overnight_syms and not entered_today:
             logger.info("[runner] 篩選結果空 + 無隔日賣 + SKIP_TRADER=false → 直接 finished")
             self.subscriber.stop()
             self.recorder.close()
@@ -932,6 +975,29 @@ class Runner:
         self.recorder.close()
         self.phase = Phase.FINISHED
         logger.info("[runner] 收盤結束")
+
+    def _node_has_own_book(self, symbol: str) -> bool:
+        """本機 (node) 自己的行情是否已經收到過這檔的五檔。查不到 / 例外 → False。"""
+        try:
+            snap = self.subscriber.get_latest_snapshot(symbol) if self.subscriber else None
+            return bool((snap or {}).get("books"))
+        except Exception:
+            return False
+
+    def _unmark_stop_and_unsub(self, symbol: str, who: str = "runner"):
+        """一檔被淘汰 (unmark) 時: **先**停止進場 + 撤該檔預掛 / pending 委託,**再**退訂行情。
+        順序與各自的 try 都是必要的: 退訂若丟例外 (filter 那層會吞掉),停單不可以跟著沒做 (2026-10-12 審查;
+        舊版是先退訂、而且退訂在 try 外面)。撤單用 async 版 — unmark 在行情 thread 上觸發,同步的券商往返會卡住
+        同一條 socket 其他股票的 tick;停止進場的旗標則在呼叫當下就設好 (session.stop_entry)。
+        session 未 armed 時撤單是 no-op。"""
+        try:
+            self.session.cancel_symbol_orders_async(symbol, "unmarked")
+        except Exception as e:
+            logger.error(f"[{who}] 撤 {symbol} 委託失敗: {e}")
+        try:
+            self._unsub_symbol(symbol)
+        except Exception as e:
+            logger.warning(f"[{who}] 退訂 {symbol} 失敗: {e}")
 
     def _unsub_symbol(self, symbol: str):
         """退訂單檔 — 但隔日賣清單的標的**不退訂** (要持續收五檔+成交才能賣掉)。"""
@@ -1320,6 +1386,23 @@ class Runner:
                         pass
             # 開盤即鎖 (first_tick) 優先下單+吃預算,再盤中鎖;各組內照代號
             marked = self.state.get_marked_prioritized() if self.state else []
+            # 行情過期的標記不預掛、不盲送 (同 hub 的名單排除): standalone = 連線斷線中 / 重連後尚未收到
+            # 新五檔;node = 自己的行情連線斷線中 (看不到賣單出現、看不到開盤 → 不可以瞎著下)
+            stale = self._stale_marked(marked)
+            if stale:
+                logger.critical(f"[runner] ⚠⚠ 預掛**排除 {len(stale)} 檔** — 本機行情過期 (所屬行情連線斷線中"
+                                f"{'' if getattr(self.cfg, 'role', '') == 'node' else ' / 重連後尚未收到新五檔'}): "
+                                f"{sorted(stale)}")
+                marked = [s for s in marked if s not in stale]
+            # node: hub 最後一份快照說「行情過期」的檔,而本機自己也還沒收到它的五檔 → 沒有任何一邊能確認它還
+            # 鎖著 → 不預掛、不盲送 (不淘汰)。本機有自己的五檔就照本機的 (打開了 filter 早就淘汰它)。
+            # 這條補的是: hub 的連線在 08:59:50 首份名單**之後**才被判定斷線 — 首份名單的檔 node 不會跟著拿掉
+            if getattr(self.cfg, "role", "") == "node" and self._node_hub_stale:
+                blind = [s for s in marked if s in self._node_hub_stale and not self._node_has_own_book(s)]
+                if blind:
+                    logger.critical(f"[runner] ⚠⚠ 預掛**排除 {len(blind)} 檔** — hub 判定行情過期 (hub 的行情連線"
+                                    f"斷線中 / 重連後尚未收到新五檔),本機也還沒收到五檔: {sorted(blind)}")
+                    marked = [s for s in marked if s not in blind]
             if not marked:
                 logger.info("[runner] PRE_ORDER_TIME 到但 marked 清單空 — 不預掛")
                 return

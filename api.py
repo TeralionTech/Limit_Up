@@ -418,16 +418,32 @@ def trading_params(req: TradingParamsReq):
 
 class TradingArmReq(BaseModel):
     armed: bool
+    # True = 「開始隔日賣」: arm 但不搶今天的單 (不預掛/不盲送/不市價追);False = 明確改為正常搶單;
+    # None (舊呼叫 / 遠端 {armed:true}) = 正常 arm,**但不會把已開啟的隔日賣模式悄悄升級成搶單**
+    overnight_only: Optional[bool] = None
 
 
 @router.post("/trading/arm")
 def trading_arm(req: TradingArmReq):
-    """kill switch — 開啟前 pre-flight (real mode + 連線健康 + 預算已設)。"""
+    """kill switch — 開啟前 pre-flight (real mode + 連線健康 + 預算已設;overnight_only 不看預算)。"""
+    s = Runner.get().session
+    if (req.armed and req.overnight_only is None
+            and getattr(s, "armed", False) and getattr(s, "entry_enabled", True) is False):
+        # 操作者選了隔日賣模式;沒帶 overnight_only 的 {armed:true} (舊前端 / central 自動 arm) 不得改變它 —
+        # 要搶單請明確送 overnight_only=false (前端「⚡ 改為搶單」)
+        logger.warning("[api] /trading/arm {armed:true} 未帶 overnight_only,節點在隔日賣模式 → 維持不變 (不升級成搶單)")
+        return {"ok": True, "armed": True, "overnight_only": True, "unchanged": True}
     try:
-        Runner.get().session.set_armed(req.armed)
+        if req.overnight_only:
+            s.set_armed(req.armed, overnight_only=True)
+        else:
+            s.set_armed(req.armed)
     except RuntimeError as e:
         raise HTTPException(400, str(e))
-    return {"ok": True, "armed": req.armed}
+    out = {"ok": True, "armed": req.armed}
+    if req.armed and req.overnight_only:
+        out["overnight_only"] = True
+    return out
 
 
 @router.post("/trading/close_all")
