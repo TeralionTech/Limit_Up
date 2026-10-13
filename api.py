@@ -1,8 +1,12 @@
 """API endpoints — 給前端 3 個分頁讀資料."""
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
+import socket
+import subprocess
 from datetime import datetime, time as _time
 from pathlib import Path
 from typing import Optional
@@ -12,7 +16,11 @@ from pydantic import BaseModel
 
 import pnl
 import symbol_budget
+import trading_config
+from config import ConfigError, load_config
 from runner import Runner
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["hit-limit-up"])
 
@@ -316,6 +324,48 @@ def trading_connect(req: TradingConnectReq):
     return {"status": "connecting"}
 
 
+class AutoConnectReq(BaseModel):
+    is_test: bool = False
+
+
+@router.post("/trading/auto_connect")
+def trading_auto_connect(req: Optional[AutoConnectReq] = None):
+    """central 每日 08:30 用 (2026-09-07): 讀**機上** .env 的主帳號憑證
+    (FUBON_ACCOUNT_ID / PASSWORD / PFX_PATH / PFX_PASSWORD) 自己連線券商 —
+    帳密不經網路,central 零機密。pfx 已在機上,不需 /trading/connect 的 base64 落檔。
+    非同步: 立刻回 connecting,由 /api/trading/status 輪詢 connected/healthy/connect_error。
+    mode **不**在這裡切 — central 另打 /api/trading/mode,讓「切真實」是獨立可稽核的一步。
+    body {is_test: bool=false} (可省略)。"""
+    r = Runner.get()
+    # hub 只篩選不交易：它 .env 的 FUBON_* 是行情帳號，不能被拿去開交易 session (2026-10-13 審查)
+    if os.environ.get("ROLE", "standalone").split("#", 1)[0].strip().lower() == "hub":
+        raise HTTPException(400, "這台是 hub（只篩選不交易），不提供 auto_connect")
+    if r.session.connecting:
+        raise HTTPException(400, "連線進行中")
+    # 冪等：已連線且健康 → 不再建第二個 client (舊版會把健康的 broker 換掉、交換空窗漏回報)；
+    # 交易 WS 斷線、SDK 自動重連中 → 409 讓中控等，不要並行再 login 出孤兒 session
+    broker = getattr(r.session, "broker", None)
+    if broker is not None:
+        if getattr(broker, "connected", False) and getattr(broker, "healthy", False):
+            return {"status": "already_connected",
+                    "account_masked": (getattr(broker, "account_no", "") or "")[:3] + "***"}
+        lock = getattr(broker, "_relogin_lock", None)
+        if lock is not None and getattr(lock, "locked", lambda: False)():
+            raise HTTPException(409, "交易 WS 自動重連進行中，請稍後再查 /api/trading/status")
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        raise HTTPException(400, str(e))
+    is_test = bool(req.is_test) if req is not None else False
+    output_dir = Path(__file__).parent / "output"
+    try:
+        r.session.connect_async(cfg.account_id, cfg.password, cfg.pfx_path,
+                                cfg.pfx_password, is_test, output_dir)
+    except RuntimeError as e:          # 兩個 auto_connect 同時進來 → session 自己也擋「連線進行中」
+        raise HTTPException(400, str(e))
+    return {"status": "connecting", "account_masked": cfg.account_id[:3] + "***"}
+
+
 @router.get("/trading/status")
 def trading_status():
     return Runner.get().session.status()
@@ -343,6 +393,8 @@ def trading_mode(req: TradingModeReq):
         Runner.get().session.set_mode(req.mode)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
+    # 2026-10-13: 落檔，重啟後套回 (armed 不存)；寫檔失敗不影響這次切換
+    trading_config.persist(Runner.get().session)
     return {"ok": True, "mode": req.mode}
 
 
@@ -360,6 +412,7 @@ def trading_params(req: TradingParamsReq):
                                         req.sizing_mode, req.fixed_lots)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    trading_config.persist(Runner.get().session)     # 2026-10-13: 跨重啟保留 (見 trading_config.py)
     return {"ok": True}
 
 
@@ -497,3 +550,173 @@ def pnl_delete(req: PnlDeleteReq):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "removed": removed}
+
+
+# ─── central 彙整狀態 (2026-09-07, teralion-central poller 每 3s 打) ────────
+# 一台 5 個 endpoint → 1 個;09:00 前後 session.status() 取 _lock (與下單同鎖),少打為妙。
+# 薄彙整: 全部由 Runner / session 既有方法組成,不新增 state。
+# 任何子項例外 → 該子項回 None (不讓整支 500 — central 只會看到「這台掛了」,反而看不出哪裡壞)。
+
+
+@functools.lru_cache(maxsize=1)
+def _app_version() -> str:
+    """git short sha (central 顯示部署版本用);非 git 目錄 (node 是 tarball 部署) / 無 git → "0.1"。
+    process 生命週期內不變 (deploy = restart) → 只算一次,poller 每 3s 打不會每次 spawn git。"""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=str(Path(__file__).parent),
+                             capture_output=True, text=True, timeout=3)
+        sha = (out.stdout or "").strip()
+        return sha if out.returncode == 0 and sha else "0.1"
+    except Exception:
+        return "0.1"
+
+
+def _safe(label: str, fn):
+    """子項彙整保護: 例外 → None + warning (不 500)。"""
+    try:
+        return fn()
+    except Exception as e:
+        logger.warning(f"[central/status] {label} 例外: {e}")
+        return None
+
+
+def _central_role(cfg) -> str:
+    # runner 尚未跑 (08:00 前 / 重啟後) cfg=None → 直接讀 env (同 config.py 規則),
+    # 不呼叫 load_config (缺憑證會 raise)。marked_snapshot 同情境回 standalone,這裡對 central 要更準。
+    if cfg is not None:
+        return cfg.role
+    return os.environ.get("ROLE", "standalone").strip().lower()
+
+
+def _central_config(cfg) -> dict:
+    if cfg is not None:
+        return {
+            "hub_url": cfg.hub_url,
+            "hub_freeze_time": cfg.hub_freeze_time,
+            "pre_order_time": cfg.pre_order_time,
+            "cancel_pending_time": cfg.cancel_pending_time,
+            "trading_end_time": cfg.trading_end_time,
+        }
+    env = os.environ.get           # 預設值與 config.load_config 一致
+    return {
+        "hub_url": env("HUB_URL", "").strip(),
+        "hub_freeze_time": env("HUB_FREEZE_TIME", "08:59:50").strip(),
+        "pre_order_time": env("PRE_ORDER_TIME", "08:59:58").strip(),
+        "cancel_pending_time": env("CANCEL_PENDING_TIME", "13:23:00").strip(),
+        "trading_end_time": env("TRADING_END_TIME", "13:24:00").strip(),
+    }
+
+
+def _central_runner(r) -> dict:
+    s = r.get_status()             # /api/status 同源,取子集
+    return {
+        "phase": s["phase"],
+        "is_running": s["is_running"],
+        "error": s["error"],
+        "watchlist_size": s["watchlist_size"],
+        "limit_up_progress": s["limit_up_progress"],
+        "recorder_tick_count": s["recorder_tick_count"],
+    }
+
+
+def _central_marked(r) -> dict:
+    snap = r.marked_snapshot()     # /api/marked-snapshot 同源,裁掉每檔明細只留代號
+    syms = [x["symbol"] for x in snap.get("symbols") or []]
+    return {"final": bool(snap.get("final")), "ts": snap.get("ts"),
+            "count": len(syms), "symbols": syms}
+
+
+def _central_spending(session) -> dict:
+    s = session.spending_summary()  # /api/trading/spending 同源,去 symbols 明細
+    rows = s.get("symbols") or []
+    return {
+        "total_budget": s["total_budget"],
+        "total_spent": s["total_spent"],
+        "total_over": s["total_over"],
+        "budget_breached": s["budget_breached"],
+        "n_over_symbols": sum(1 for x in rows if x.get("over", 0) > 0),
+    }
+
+
+def _central_orders(session) -> dict:
+    rows = session.get_orders()     # /api/trading/orders 同源,只計數
+    status_of = [x.get("status") for x in rows]
+    kind_of = [x.get("kind") for x in rows]
+    return {
+        "total": len(rows),
+        "pending": status_of.count("pending"),
+        "filled": status_of.count("filled"),
+        "rejected": status_of.count("rejected"),
+        "cancelled": status_of.count("cancelled"),
+        "pre_limit": kind_of.count("pre_limit"),
+        "market_buy": kind_of.count("market_buy"),
+    }
+
+
+def _central_overnight(session) -> dict:
+    rows = session.overnight_status()   # /api/trading/overnight 同源 (不補五檔)
+    # pending_sell = 還沒賣完且未被使用者 skip 的檔數 (09:00 開盤自動賣的待辦)
+    pending = sum(1 for x in rows
+                  if not x.get("skip") and int(x.get("sold_lots") or 0) < int(x.get("lots") or 0))
+    return {"count": len(rows), "pending_sell": pending}
+
+
+def _central_ready(session, trading: dict) -> dict:
+    """複製 trading_session.set_armed 的 pre-flight **求值**,不真的 arm。
+    block_reason 依 set_armed 檢查順序取第一個紅燈;全綠 = ""。
+    trading = session.status() 的 dict (呼叫端已取過,避免再拿一次 _lock)。"""
+    p = trading.get("params") or {}
+    mode_real = trading.get("mode") == "real"
+    connected = bool(trading.get("connected"))
+    healthy = bool(trading.get("healthy"))
+    total_budget = float(p.get("total_budget") or 0)
+    sizing_mode = p.get("sizing_mode")
+    fixed_lots = int(p.get("fixed_lots") or 0)
+    per_symbol = float(p.get("per_symbol_budget") or 0)
+    per_symbol_ok = fixed_lots > 0 if sizing_mode == "fixed_lots" else per_symbol > 0
+    budget_set = total_budget > 0 and per_symbol_ok
+    if not mode_real:
+        block = "模擬模式"
+    elif not (connected and healthy):
+        block = "券商未連線或不健康"
+    elif total_budget <= 0:
+        block = "未設總預算"
+    elif not per_symbol_ok:
+        block = "未設每檔上限或張數"
+    else:
+        block = ""
+    return {
+        "mode_real": mode_real,
+        "connected": connected,
+        "healthy": healthy,
+        "budget_set": budget_set,
+        "armed": bool(trading.get("armed")),
+        "is_live": bool(session.is_live()),
+        "block_reason": block,
+    }
+
+
+@router.get("/central/status")
+def central_status():
+    """central poller 用的單一彙整 (形狀見計畫 A3 / 跨 agent 契約)。"""
+    r = Runner.get()
+    cfg = r.cfg
+    session = r.session
+    trading = _safe("trading", lambda: session.status())
+    return {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "role": _safe("role", lambda: _central_role(cfg)),
+        "node_name": os.environ.get("NODE_NAME") or socket.gethostname(),
+        "version": _app_version(),
+        "config": _safe("config", lambda: _central_config(cfg)),
+        "runner": _safe("runner", lambda: _central_runner(r)),
+        "marked": _safe("marked", lambda: _central_marked(r)),
+        "trading": trading,
+        "spending": _safe("spending", lambda: _central_spending(session)),
+        "orders": _safe("orders", lambda: _central_orders(session)),
+        "overnight": _safe("overnight", lambda: _central_overnight(session)),
+        "t30": _safe("t30", lambda: {"count": len(session.untradable)}),
+        "ready": _safe("ready", lambda: _central_ready(session, trading if trading is not None
+                                                        else session.status())),
+    }

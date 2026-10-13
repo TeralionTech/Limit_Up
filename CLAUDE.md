@@ -117,3 +117,19 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - 更新:`git fetch origin main && git reset --hard origin/main && systemctl restart hit-limit-up`
 - 服務:systemd `hit-limit-up`(port 8100);log:`journalctl -u hit-limit-up -f`
 - `.env` 實體在 `/opt/hit_limit_up/secrets/.env`(symlink 到 app 目錄);憑證 `/opt/hit_limit_up/certs/`
+
+## 中控接入 (2026-10-13 上線;teralion-central 同機 hub :8001)
+
+- **token 中介層** (`server.py`):POST/PUT/DELETE `/api/*` 需 header `X-Limitup-Token` = `.env LIMITUP_API_TOKEN`
+  (fail-closed:沒設 = 遠端 POST 全 401,啟動 log CRITICAL);GET 開放;真本機 loopback (無 CF-Connecting-IP) 放行。
+  hub + 所有 node + 中控用同一把。前端右上「🔑 token」存 localStorage。
+- **中控用的端點**:`GET /api/central/status` (單一彙整,poller 每 5 s 打;`ready.block_reason` = arm 會被哪一關擋)、
+  `POST /api/trading/auto_connect` (讀**機上** .env 的 FUBON_* 自己連線,帳密不經網路)、既有 `/api/trading/mode|arm|disconnect`。
+  中控每日:08:30 auto_connect → 08:50 mode real + arm → 13:45 disarm (時間在中控「自動化設定」頁改)。
+- **通知** (`notifier.py`):掛在 root logger 的 handler,把 CRITICAL 全部、出場/隔日賣/緊急全平/armed/連線/成交回報
+  等規則 (`should_forward`) 轉到 `CENTRAL_FORWARD_URL/api/central/notify`,中控加 `[<label>-LimitUp-<level>]` 發 Signal。
+  30 s 同訊息去重、2 s 合併一封、每分鐘 60 則上限;交易路徑零改動。`.env`:CENTRAL_FORWARD_URL / CENTRAL_VPS_ID / CENTRAL_LABEL。
+- **設定落檔** (`trading_config.py`):`/api/trading/mode` 與 `/params` 改完寫 `output/trading_config.json`,
+  啟動套回 mode / 預算 / 張數 (**armed 永不還原**)。重啟後不再退回 sim / 預算 0 → 中控自動 arm 才過得了 pre-flight。
+- 部署:`ops/limitup_deploy/deploy_limitup_commit.py --commit <sha> --hosts ... --dist frontend/dist`
+  (守門:平日 07:50–13:40 拒跑、runner 在跑 / 券商已連線 / armed 的那台不動)。

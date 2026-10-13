@@ -2,12 +2,38 @@
 
 const BASE = ''   // 前端 dev 走 Vite proxy；build 後跟 backend 同 origin
 
+// ─── API token (X-Limitup-Token) ───
+// 後端對 POST/PUT/DELETE /api/* 要求 header X-Limitup-Token (= env LIMITUP_API_TOKEN, fail-closed);
+// 前端存在 localStorage,由 header 🔑 按鈕設定。GET 不需要但一律帶上 (無害)。
+export const TOKEN_KEY = 'limitup_token'
+
+export function getToken(): string {
+  try { return localStorage.getItem(TOKEN_KEY) || '' } catch { return '' }
+}
+
+// 空字串 = 清除
+export function setToken(token: string): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch { /* localStorage 不可用 (隱私模式等) — 忽略 */ }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken()
   const r = await fetch(BASE + path, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'X-Limitup-Token': token } : {}),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
   })
-  if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`)
+  if (!r.ok) {
+    const body = await r.text()
+    const hint = r.status === 401 ? ' — 請按 🔑 設定 token' : ''
+    throw new Error(`HTTP ${r.status}: ${body}${hint}`)
+  }
   return r.json()
 }
 

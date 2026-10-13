@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, Status } from './api'
+import { api, getToken, setToken, Status } from './api'
 import FilterPage from './pages/FilterPage'
 import QuotePage from './pages/QuotePage'
 import SimPage from './pages/SimPage'
@@ -13,6 +13,28 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('filter')
   const [status, setStatus] = useState<Status | null>(null)
   const [err, setErr] = useState<string>('')
+  const [tokenSet, setTokenSet] = useState<boolean>(() => !!getToken())
+
+  // 🔑 設定 API token (X-Limitup-Token):prompt → localStorage;留空 = 清除
+  function onSetToken() {
+    const cur = getToken()
+    const v = prompt(
+      `API token (X-Limitup-Token = 後端 LIMITUP_API_TOKEN)\n` +
+      `目前: ${cur ? `已設 (${cur.slice(0, 3)}***)` : '未設'}\n` +
+      `輸入新 token;留空按確定 = 清除`,
+      '',
+    )
+    if (v === null) return          // 取消
+    const t = v.trim()
+    if (!t) {
+      if (cur && !confirm('清除已儲存的 token？')) return
+      setToken('')
+    } else {
+      setToken(t)
+    }
+    setTokenSet(!!getToken())
+    reloadStatus()
+  }
 
   async function reloadStatus() {
     try {
@@ -46,6 +68,17 @@ export default function App() {
               </>
             )}
             {err && <span className="text-red-600 text-xs">API 錯: {err}</span>}
+            <button
+              onClick={onSetToken}
+              title="設定 API token (POST 類操作需要;未設會 401)"
+              className={`text-xs px-2 py-1 rounded border ${
+                tokenSet
+                  ? 'bg-amber-50 border-amber-300 text-amber-800 hover:bg-amber-100'
+                  : 'bg-gray-100 border-gray-300 text-gray-600 hover:bg-gray-200'
+              }`}
+            >
+              🔑 token {tokenSet ? '已設' : '未設'}
+            </button>
             <button
               onClick={async () => {
                 if (confirm('立刻啟動 runner (通常靠 8:00 auto trigger)？')) {
