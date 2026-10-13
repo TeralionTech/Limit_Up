@@ -42,6 +42,8 @@ QUERY_FLIGHT_STALE_SEC = 90.0     # 在飛超過此秒數視為卡死 → 不再
 # 修法: 下單成功時 place_order 回傳的 result.data 本身就是 OrderResult (官方文件 cancel_order 的參數型別;
 # 阻塞式下單「回覆的 Order Response 即會帶回完整的資料內容」) → 記下來,撤單直接用它,不查清單。
 # 任何不順都退回快照舊路徑 (行為 = 修法前),見 RealOrderClient.cancel_cached。
+# ★ 2026-10-14 起**預設關閉** (_direct_cancel_env_on: .env 未設 CANCEL_DIRECT_OBJ = 舊路徑): 券商文件沒有示範用
+#   下單回傳物件撤單,使用者決定在真實環境驗證前不啟用。要開: .env CANCEL_DIRECT_OBJ=1 + 重啟。
 #
 # 前提 (cancel_order 收下單回傳物件) 上線前尚未實測 → 「已證實」之前從嚴、之後從寬 (2026-10-12 兩輪審查):
 #   已證實 = 本連線曾有一筆免查詢撤單**真的撤成**。(券商回終結文案不算: 認得這筆 ≠ 能用這個物件撤掉 live 單。)
@@ -77,9 +79,12 @@ _DIRECT_CANCEL_INFLIGHT_HINTS = ("檢查成交回報",)
 
 
 def _direct_cancel_env_on() -> bool:
-    """env CANCEL_DIRECT_OBJ (預設開;0/false/no/off = 關 → 所有撤單退回「先拉全清單」舊路徑)。每次現讀。"""
+    """env CANCEL_DIRECT_OBJ — **預設關** (2026-10-14 使用者定案): 未設 / 0 / false / no / off = 所有撤單走
+    「先拉全清單」舊路徑;只有明確設 1/true/yes/on 才啟用免查詢撤單。每次現讀。
+    原因: 富邦文件各語言都只寫「委託列表透過 GetOrderResults 取得」、批次刪單範例也只用查詢結果,沒有任何地方
+    示範用 place_order 回傳物件撤單 → 在真實環境驗證前不冒險 (驗證方式見 CLAUDE.md 踩雷點 12)。"""
     import os
-    return str(os.environ.get("CANCEL_DIRECT_OBJ", "1")).strip().lower() not in ("0", "false", "no", "off")
+    return str(os.environ.get("CANCEL_DIRECT_OBJ", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
 class _QueryFlight:

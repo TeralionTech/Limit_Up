@@ -133,7 +133,12 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
       `except Exception`。新增其他 SDK 呼叫點時比照處理。
     - 本地 row 已終結(回報先到)者不送撤單;但成交量曾被「券商權威補入」的列(`auth_filled`,重連補收 +
       晚到回報可能雙算成 filled 而券商仍有剩餘量 live)照送,讓券商回答。
-    - `.env` 設 `CANCEL_DIRECT_OBJ=0` 可整個關掉 — 還原的是撤單**路徑**(先查清單再撤);撤單重試退避
+    - **2026-10-14 起預設關閉**(`.env` 未設 `CANCEL_DIRECT_OBJ` = 舊路徑;要啟用設 `CANCEL_DIRECT_OBJ=1` 並重啟):
+      富邦文件各語言都只寫「委託列表透過 GetOrderResults 取得」、批次刪單範例也只用查詢結果,沒有任何地方示範
+      用 `place_order` 回傳物件撤單;使用者決定在真實環境驗證前不冒險。驗證方式(待使用者同意再做):非交易時間
+      用 1 張跌停價限價買單(= 預約單)→ 立刻用 `place_order` 回傳物件 `cancel_order` → 快照確認 status 30;
+      scratch 已有 `dc_probe.py`(quote 階段在 node6 跑過,沒下單)。
+    - `.env` 設 `CANCEL_DIRECT_OBJ=0`(或不設)= 整個關掉 — 還原的是撤單**路徑**(先查清單再撤);撤單重試退避
       「從該輪結束起算」是獨立修改、任何模式都生效(見本條最後),所以關掉後的重試節奏與修法前不完全相同
       (每次重試最多晚 min(退避, 該輪耗時),換來不再零間隔連續拉全清單)。盤後看 journal:`CANCEL … (免查詢)` =
       直接撤;`order_results ok=… n=… ms=…` 每一行 = 一次凍結;另看 orders.csv 的 `latency_ms`(下單/撤單往返)。

@@ -198,7 +198,7 @@ def fubon_stub(monkeypatch):
     monkeypatch.setitem(sys.modules, "fubon_neo", pkg)
     monkeypatch.setitem(sys.modules, "fubon_neo.sdk", sdk_mod)
     monkeypatch.setitem(sys.modules, "fubon_neo.constant", const)
-    monkeypatch.delenv("CANCEL_DIRECT_OBJ", raising=False)
+    monkeypatch.setenv("CANCEL_DIRECT_OBJ", "1")      # 2026-10-14 起預設關;這裡的測試驗的是「啟用時」的行為
     monkeypatch.setattr(ts_mod, "_UNKNOWN_CANCEL_REJECT_SEEN", set())   # 「未知拒撤文案」去重集合每個測試重來
 
 
@@ -1144,6 +1144,20 @@ class TestBrokerPanicAndInFlight:
         monkeypatch.setenv("CANCEL_DIRECT_OBJ", value)
         assert not client.has_cached_order(no) and client.status()["direct_cancel"] == "env_off"
 
+    def test_default_is_off_when_env_unset(self, client, monkeypatch):
+        # 2026-10-14 使用者定案: 券商文件沒示範用下單回傳物件撤單 → 未設 env = 舊路徑 (先拉全清單再撤)
+        monkeypatch.delenv("CANCEL_DIRECT_OBJ", raising=False)
+        no = client.place_limit_buy(SYM, LU, 1)
+        assert client.status()["direct_cancel"] == "env_off"
+        assert client.direct_cancel_route(no) == "snapshot"
+        assert not client.has_cached_order(no)
+
+    @pytest.mark.parametrize("value", ["1", "true", "Yes", " ON "])
+    def test_env_on_values(self, client, monkeypatch, value):
+        monkeypatch.setenv("CANCEL_DIRECT_OBJ", value)
+        no = client.place_limit_buy(SYM, LU, 1)
+        assert client.status()["direct_cancel"] == "on" and client.direct_cancel_route(no) == "direct"
+
 
 class TestBrokerRejectTimeLimit:
     """在途文案的時間上限: 自**第一次**被拒起算;證實前 5 s、證實後 10 s (用可控的 monotonic,不改常數)。"""
@@ -1704,7 +1718,9 @@ class TestRound3Route:
         b = client.place_limit_buy(SYM, LU, 1)
         monkeypatch.setenv("CANCEL_DIRECT_OBJ", "0")
         assert client.direct_cancel_route(b) == "snapshot"
-        monkeypatch.delenv("CANCEL_DIRECT_OBJ")
+        monkeypatch.delenv("CANCEL_DIRECT_OBJ")                  # 未設 = 預設關 (2026-10-14)
+        assert client.direct_cancel_route(b) == "snapshot"
+        monkeypatch.setenv("CANCEL_DIRECT_OBJ", "1")
         assert client.direct_cancel_route(b) == "direct"
         client._direct_cancel_off = True
         assert client.direct_cancel_route(b) == "snapshot"
