@@ -218,6 +218,17 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - `runner.py` 主流程 singleton:login → universe → 抓漲停價(節流+重試到 08:28)→ subscribe → 篩選 → trader
 - `filter.py` 8:30–9:00 mark/unmark 邏輯(漲停鎖死=只有委買+買一=漲停)
 - `trader.py` 9:00 後追蹤(第一盤檢查 → 盤中追蹤);監控與下單分離
+- **月均量硬限制 (2026-10-14 使用者定案)**:每檔張數 ≤ floor(近 20 日均量(張) × `AVGVOL_CAP_PCT`/100),預設 1%,
+  `_sized_lots` **最後一道**(疊在預算 / 個股金額覆寫「最少一張」/ 禁現沖減半 / 20% 委託量之後,預掛與盲送共用);
+  月均量**未知 → 0 張、不下單**(fail-closed,`stopped_reason=avgvol_unknown`,CRITICAL 點名)。母數來源:hub/standalone 讀
+  `input/avg_volume.json`(17:30 timer,1,943 檔),marked 裡沒資料的檔盤前 `_start_avg_lots_filler` 每 2 s 用 REST 日 K 補抓
+  (每檔最多 2 次);hub 的 marked 快照每檔帶 `avg_lots`(None = 不知道),node 由快照累積(首份 + 凍結後補收)交 `session.set_avg_lots`。
+  node 沒有 avg_volume.json,**完全靠快照** → hub 與 node 要一起部署,快照沒有任何 avg_lots 時 node CRITICAL。
+  每台 node 各自套 → **艦隊總量 = node 數 × pct**(6 台 1% ≈ 6%,加 node1 帳戶上另一套程式再多)。
+  **`AVGVOL_CAP_PCT=0` 是 node 端的放行開關**(hub 不論自己的值都讀檔 / 補抓 / 快照帶 avg_lots);母數三個 dict 每天
+  `_reset_daily_state` 清空(昨天補抓的值不可蓋今天的檔),優先序 檔 > REST 補抓;0 / NaN / inf 都算未知;凍結後補收對已知的檔
+  也會接後到的 avg_lots。
+  status 頂層 `avgvol_cap_pct / avg_lots_known`(不放 `params`,中控 shape 鎖死那四個 key),每檔 `avg_lots / avgvol_cap_lots / size_cap_reason`。
 - **「開始隔日賣」(2026-10-14)**:`POST /api/trading/arm {armed:true, overnight_only:true}` →
   `session.set_armed(True, overnight_only=True)`:一樣 armed(隔日賣 / 既有部位出場 / 撤單都看 `is_live()`),
   但 `entry_enabled=False` → **所有新進場路徑看 `entry_allowed()`**(08:59:58 `place_pre_orders`、08:59:59 盲送

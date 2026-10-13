@@ -337,6 +337,9 @@ class SymbolTrade:
         self.last_bid1_price = 0.0     # 最近委買一價 (處置股出場限價賣用)
         self.day_tradable = True       # 可現股當沖 (canDayTrade);False=禁現沖 → 部位減半
         self.limit_up_bid_vol = 0      # 08:59:58 漲停價委託量快照 (張) — 20% 上限母數
+        self.avg_lots = None           # 近 20 日均量 (張;None = 未知) — 月均量硬限制母數 (2026-10-14)
+        self.avgvol_cap_lots = None    # floor(avg_lots × AVGVOL_CAP_PCT/100);None = 未套 (停用)
+        self.size_cap_reason = ""      # "avgvol_unknown" / "avgvol_cap" = 月均量硬限制把張數壓到 0 / 壓低
         self.chase_lots = 0            # = sized target (與 target_lots 同值;風控後上限)。
         #   實際盲送每筆送 shortfall=target−已成交,非直接用此值 (2026-08-25 修正後保留作上限紀錄)
         self.chase_done = False        # 市價盲送已有一筆委託成功 (管線化: cadence 據此停送;
@@ -361,6 +364,9 @@ class SymbolTrade:
             "filled_lots": self.filled_lots,
             "avg_price": round(self.avg_price, 2),
             "stopped_reason": self.stopped_reason,
+            "avg_lots": self.avg_lots,                  # 月均量硬限制 (2026-10-14): 母數 / 上限 / 是否綁住
+            "avgvol_cap_lots": self.avgvol_cap_lots,
+            "size_cap_reason": self.size_cap_reason,
             "exited": self.exited,
             "is_disposition": self.is_disposition,
             "sell_failed": self.sell_failed,
@@ -403,6 +409,10 @@ class TradingSession:
         self.dispositions: Dict[str, bool] = {}
         # 可現股當沖名單 (runner 從 ticker.canDayTrade 填) — False=禁現沖 → 下單減半
         self.day_tradable: Dict[str, bool] = {}
+        # 月均量硬限制 (2026-10-14 使用者定案): 近 20 日均量 (張) 名單 (hub: input/avg_volume.json + REST 補抓;
+        # node: 由 hub marked 快照的 avg_lots 欄位帶來) + 上限百分比;_sized_lots 最後一道,未知 → 0 張
+        self.avg_lots: Dict[str, float] = {}
+        self.avgvol_cap_pct: float = 0.0           # 0 = 停用;runner 由 cfg.avgvol_cap_pct (預設 1.0) configure
         # 跌停價名單 (runner 從 ticker.limitDownPrice 填) — 所有出場含隔日賣
         # 都掛「跌停價限價賣」(2026-08-12 定案: 成交優先權等同市價,但集合競價
         # 時段合法、處置股合法、永不被「不可市價」拒單)
@@ -528,6 +538,22 @@ class TradingSession:
         n = sum(1 for v in self.day_tradable.values() if v is False)
         logger.info(f"[session] 禁現沖名單: {n} 檔 (canDayTrade=False → 部位減半)")
 
+    def set_avg_lots(self, avg_lots: Dict[str, float]):
+        """runner 把近 20 日均量 (張) 名單交進來 — 月均量硬限制母數 (2026-10-14)。整組取代;
+        值 None / 非數字 / ≤0 的檔不收 (= 未知 → _sized_lots 不下單)。"""
+        clean: Dict[str, float] = {}
+        for k, v in (avg_lots or {}).items():
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f == f and 0 < f < 1e9:          # NaN / inf / 0 / 負 / 離譜值 = 未知 (不下單),不讓 int() 溢位
+                clean[str(k)] = f
+        with self._lock:
+            self.avg_lots = clean
+        logger.info(f"[session] 月均量名單: {len(clean)} 檔 (硬限制 {self.avgvol_cap_pct}% → "
+                    f"每檔 ≤ floor(月均量 × {self.avgvol_cap_pct}/100) 張;未知不下單)")
+
     def set_limit_downs(self, limit_downs: Dict[str, float]):
         """runner 抓完 ticker 後把跌停價名單交進來 (出場跌停限價賣用)。"""
         with self._lock:
@@ -564,12 +590,15 @@ class TradingSession:
     def configure(self, max_stock_price: float = None,
                   order_min_interval_sec: float = None,
                   cancel_pending_time: str = None,
-                  order_max_per_sec: int = None):
+                  order_max_per_sec: int = None,
+                  avgvol_cap_pct: float = None):
         """runner 啟動時從 cfg 塞策略參數。"""
         from datetime import time as _time_cls
         with self._lock:
             if max_stock_price is not None:
                 self.max_stock_price = float(max_stock_price)
+            if avgvol_cap_pct is not None:
+                self.avgvol_cap_pct = max(0.0, float(avgvol_cap_pct))   # 月均量硬限制 (0 = 停用)
             if order_min_interval_sec is not None:
                 self.order_min_interval = max(float(order_min_interval_sec), _HARD_MIN_INTERVAL)
             if cancel_pending_time:
@@ -881,6 +910,21 @@ class TradingSession:
             lots = lots // 2
         if st.limit_up_bid_vol > 0:               # 20% 委託量上限 (預掛+盲送都套)
             lots = min(lots, int(st.limit_up_bid_vol * 0.2))
+        # 月均量硬限制 (2026-10-14 使用者定案): 每檔 ≤ floor(近 20 日均量 × pct/100) 張 — 最後一道,
+        # 疊在個股金額覆寫「最少一張」之後 (硬限制不讓步);月均量未知 → 0 張 (fail-closed)。
+        st.size_cap_reason = ""
+        if self.avgvol_cap_pct > 0:
+            a = self.avg_lots.get(st.symbol)
+            st.avg_lots = a
+            if a is None or a <= 0:
+                st.avgvol_cap_lots = 0
+                st.size_cap_reason = "avgvol_unknown"
+                return 0
+            cap = int(a * self.avgvol_cap_pct / 100.0 + 1e-9)   # floor;+1e-9 免二進位誤差把整數結果少算一張
+            st.avgvol_cap_lots = cap
+            if lots > cap:
+                lots = cap
+                st.size_cap_reason = "avgvol_cap"
         return max(0, lots)
 
     # ─── 08:59:58 預掛限價單 ───────────────────────────────
@@ -938,11 +982,23 @@ class TradingSession:
                     st.stopped_reason = "price_above_max"
                     logger.info(f"[session] {sym} 漲停價 {limit_up} > {self.max_stock_price} → 跳過")
                     continue
-                lots = self._sized_lots(st)                  # 覆寫/全域 → 禁現沖//2 → 20%上限
+                lots = self._sized_lots(st)                  # 覆寫/全域 → 禁現沖//2 → 20%上限 → 月均量硬限制
                 if lots <= 0:
-                    st.stopped_reason = "budget_exhausted"
-                    logger.info(f"[session] {sym} 張數算出 0 (預算/禁現沖/20%上限) → 跳過")
+                    if st.size_cap_reason == "avgvol_unknown":
+                        st.stopped_reason = "avgvol_unknown"
+                        logger.critical(f"[session] ⚠ {sym} 月均量未知 → 月均量硬限制不下單 (請查 hub 的 "
+                                        f"input/avg_volume.json / 快照 avg_lots 欄位;要放行請設 AVGVOL_CAP_PCT=0 重啟)")
+                    elif st.size_cap_reason == "avgvol_cap":
+                        st.stopped_reason = "avgvol_cap"
+                        logger.warning(f"[session] {sym} 月均量 {st.avg_lots} 張 × {self.avgvol_cap_pct}% "
+                                       f"= 不足 1 張 → 跳過 (月均量硬限制)")
+                    else:
+                        st.stopped_reason = "budget_exhausted"
+                        logger.info(f"[session] {sym} 張數算出 0 (預算/禁現沖/20%上限) → 跳過")
                     continue
+                if st.size_cap_reason == "avgvol_cap":
+                    logger.warning(f"[session] {sym} 月均量硬限制生效: 月均量 {st.avg_lots} 張 × "
+                                   f"{self.avgvol_cap_pct}% → 上限 {st.avgvol_cap_lots} 張 (原算 {lots} 張以上)")
                 st.target_lots = lots
                 st.chase_lots = lots                         # = target_lots (盲送上限;實送 shortfall)
                 self._reserve_budget(st, lots)               # 下單即保留
@@ -3773,6 +3829,10 @@ class TradingSession:
                     "total_budget": self.total_budget,
                     "per_symbol_budget": self.per_symbol_budget,
                 },
+                # 月均量硬限制 (2026-10-14): 百分比 (0 = 停用) 與目前已知月均量的檔數 — 放 params 之外
+                # (params 是使用者可設的四個下單參數,中控的 shape 測試鎖死那四個 key)
+                "avgvol_cap_pct": self.avgvol_cap_pct,
+                "avg_lots_known": len(self.avg_lots),
                 "budget_used": round(self.budget_used, 0),
                 "buy_cost_actual": round(self._buy_cost_actual, 0),   # 實際買進累計 (硬上限用)
                 "budget_breached": self._budget_breached,             # 總曝險硬上限已觸發

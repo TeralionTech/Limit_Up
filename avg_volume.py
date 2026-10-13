@@ -3,7 +3,8 @@
 檔案兩形都收 (Stage A5,兩半可分開部署,先到哪半 08:00 runner 都不能壞):
   新包裝形 = {"date": "YYYY-MM-DD", "generated_at": iso8601, "avg_lots": {symbol: 張}}
   舊平面形 = {symbol: avg_lots(張)}
-由 scripts/compute_avg_volume.py 交易日 07:00 timer 產。
+由 scripts/compute_avg_volume.py 交易日盤後 17:30 timer 產 (hit-limit-up-avgvol.timer;隔早 runner 讀)。
+2026-10-14 起也是月均量硬限制的母數 (runner._load_avg_lots_map / 快照 avg_lots);那條規則對缺資料的檔 fail-closed。
 fail-open (使用者定案 2026-08-24): 檔缺/某檔無資料 → **不剔除** (寧可多做,不因資料缺停交易)。
 """
 from __future__ import annotations
@@ -48,6 +49,36 @@ def load(path) -> tuple:
     except Exception as e:
         logger.error(f"[avg_volume] 讀 {path} 失敗: {e}")
         return {}, meta
+
+
+def compute_avg_lots(candles: list, days: int = 20) -> float:
+    """近 days 個交易日的「日均成交量(張)」— 與 scripts/compute_avg_volume.py 同一套算法 (那支是離線腳本,
+    import 會重設 logging,所以 runner 用這一份)。candles: [{"date", "volume"(股)}, ...];無資料回 0.0。"""
+    rows = [c for c in (candles or []) if c.get("date")]
+    if not rows:
+        return 0.0
+    rows.sort(key=lambda c: str(c["date"]))
+    recent = rows[-days:]
+    vols = [float(c.get("volume") or 0) for c in recent]
+    if not vols:
+        return 0.0
+    return round(sum(vols) / len(vols) / 1000.0, 1)
+
+
+def fetch_avg_lots(reststock, symbol: str, days: int = 20, calendar_days: int = 40):
+    """月均量硬限制的 REST 補抓 (2026-10-14): 檔裡沒有的檔 (新上市 / DR / 檔缺) 盤前補一次近 days 交易日均量。
+    回 float(張) 或 None (抓不到 / 算出 0)。歷史 K 線 REST 60/min,只對 marked 的缺資料檔用。"""
+    from datetime import timedelta
+    try:
+        frm = (datetime.now() - timedelta(days=calendar_days)).strftime("%Y-%m-%d")
+        to = datetime.now().strftime("%Y-%m-%d")
+        resp = reststock.historical.candles(**{"symbol": symbol, "from": frm, "to": to,
+                                               "timeframe": "D", "fields": "volume"})
+        v = compute_avg_lots((resp or {}).get("data") or [], days)
+        return v if v > 0 else None
+    except Exception as e:
+        logger.error(f"[avg_volume] {symbol} REST 補抓月均量失敗: {e}")
+        return None
 
 
 def filter_universe(universe: list, avg_lots: dict, min_lots: float) -> tuple:

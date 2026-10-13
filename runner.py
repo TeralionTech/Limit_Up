@@ -73,6 +73,12 @@ class Runner:
         self.day_tradable: Dict[str, bool] = {}   # symbol → canDayTrade (禁現沖減半用,風控①)
         self._t30_meta: dict = {}        # T30 載入 meta (檔案 ok/stale/missing) — /api/t30 顯示用
         self._avgvol: dict = {}          # 月均量篩選結果 (今天 ran/dropped/kept/meta) — /api/avg-volume 顯示用
+        # 月均量硬限制 (2026-10-14): hub/standalone 讀檔 (_avg_lots_map) + marked 缺資料檔 REST 補抓 (_avg_lots_fetched);
+        # node 由 hub 快照 avg_lots 欄位累積 (avg_lots)。_avg_lots_all() 合併後交給 session。
+        self._avg_lots_map: dict = {}
+        self._avg_lots_fetched: dict = {}
+        self._avg_lots_attempts: dict = {}
+        self.avg_lots: dict = {}
         self.state = None                # state.State
         self.subscriber = None
         self.trader = None
@@ -210,6 +216,8 @@ class Runner:
             "limit_down": float(self.limit_downs.get(s, 0.0)),   # 出場=跌停價限價賣 (處置股必要)
             "is_t30": s in untradable,                           # 全額交割禁單 (08-12 事故防線)
             "day_tradable": bool(self.day_tradable.get(s, True)),  # 禁現沖 → 減半 (is False 嚴格比對,務必 bool)
+            # 月均量硬限制母數 (2026-10-14): 近 20 日均量 (張);None = hub 也不知道 → node 不下這檔
+            "avg_lots": self._avg_lots_for(s),
         } for i, s in enumerate(marked)]
         return {"ts": now, "final": bool(self._marked_frozen), "role": role, "symbols": symbols,
                 "stale_excluded": [s for s in marked_all if s in stale]}
@@ -287,6 +295,12 @@ class Runner:
         self.session.set_limit_downs(self.limit_downs)      # 出場=跌停價限價賣 (處置股必要)
         self.session.set_day_tradable(self.day_tradable)    # 禁現沖 → 部位減半 (風控①)
         self.session.set_untradable(t30_set)                # T30 全額交割禁單 (08-12 事故防線)
+        self._push_avg_lots_to_session()                    # 月均量硬限制母數 (hub 快照帶來;2026-10-14)
+        cap_on = float(getattr(self.cfg, "avgvol_cap_pct", 0.0) or 0.0) > 0
+        if cap_on and snap and snap.get("symbols") and not any(
+                isinstance(s, dict) and self._avg_ok(s.get("avg_lots")) for s in snap["symbols"]):
+            logger.critical("[node] ⚠⚠ Hub 快照沒有任何可用的 avg_lots (hub 版本舊或月均量檔缺?) — 月均量硬限制會擋下"
+                            "所有預掛/盲送;要放行請在本 node 設 AVGVOL_CAP_PCT=0 重啟")
         return marked
 
     def _seed_marked_entry(self, s: dict, t30_set: set) -> str:
@@ -313,6 +327,8 @@ class Runner:
         max_vol = int(float(s.get("max_bid_vol") or 0))
         last_raw = s.get("last_bid_vol")
         last_vol = max_vol if last_raw is None else int(float(last_raw))
+        avg_raw = s.get("avg_lots")                      # 月均量硬限制母數;缺 / None / 壞值 / 0 / 非有限 = 未知 → 不下單
+        avg_lots = float(avg_raw) if (avg_raw is not None and self._avg_ok(avg_raw)) else None
         # ── 寫入 ──
         # seed Hub 峰值進 state._max_bid_size;node book handler 之後續墊高 → final_check_all 不變
         self.state.mark(sym, lu, max_vol, lu, first_tick=first_tick)
@@ -324,6 +340,8 @@ class Runner:
         self.day_tradable[sym] = day_tr
         if is_t30:
             t30_set.add(sym)
+        if avg_lots is not None and avg_lots > 0:
+            self.avg_lots[sym] = avg_lots
         # 20% 風控②母數兜底: node 08:59:58 若 subscriber 還沒有該檔 book
         # (8 秒內零 tick、訂閱 snapshot 也沒到),退用 Hub 最後已知漲停層委買量
         # → 有 cap 總比無 cap 好 (無 cap = 純預算算張,可能超過隊伍 20%)
@@ -404,6 +422,7 @@ class Runner:
         def _on_snapshot(snap):
             present: set = set()
             new_entries: list = []
+            avg_updated = False
             # hub 這一份判定「行情過期」的檔 (hub 那條行情連線斷線中 / 重連後還沒收到新五檔)。每份 final 快照整組
             # 換掉 — hub 之後收到新五檔、放回 symbols 的檔,下一輪就不在這裡了。08:59:58 預掛前看最後這一份
             _se = snap.get("stale_excluded")
@@ -416,6 +435,10 @@ class Runner:
                         continue
                     present.add(sym)
                     if sym in known:
+                        # 已知的檔也要看 avg_lots: 首次看到時 hub 可能還沒補抓到 (None),之後的快照才帶值 (審查 2026-10-14)
+                        if sym not in self.avg_lots and self._avg_ok(s.get("avg_lots")):
+                            self.avg_lots[sym] = float(s.get("avg_lots"))
+                            avg_updated = True
                         continue
                     if self.state.is_discarded(sym):
                         known.add(sym)
@@ -434,6 +457,8 @@ class Runner:
                                    f"(Hub 峰值 {s.get('max_bid_vol')} / 最後 {s.get('last_bid_vol')} 張,"
                                    f" hub ts={snap.get('ts')}) → 補訂閱 + seed")
             finally:
+                if new_entries or avg_updated:
+                    self._push_avg_lots_to_session()      # 補收的檔 / 已知檔後到的月均量都要交給 session
                 if new_entries:
                     added.extend(new_entries)
                     for sym in new_entries:
@@ -523,6 +548,12 @@ class Runner:
         self._node_unsub_and_cancel = None
         self._marked_frozen = False
         self._limit_up_progress = {"done": 0, "total": 0, "ok": 0, "fail": 0}
+        # 月均量硬限制母數每天重來 (審查 2026-10-14): 昨天 REST 補抓的值不可蓋過今天的檔、昨天 hub 給的值不可
+        # 蓋過今天的「不知道」、補抓次數每天重算。hub/standalone 的檔由 _load_avg_lots_map 每天重讀。
+        self._avg_lots_map = {}
+        self._avg_lots_fetched = {}
+        self._avg_lots_attempts = {}
+        self.avg_lots = {}
 
     def _prepare_overnight(self, output_dir) -> list:
         """載入隔日賣清單 (昨天買到未出場的持倉) + 補查今日漲停/跌停價 → 交給 session。
@@ -741,12 +772,7 @@ class Runner:
         self._reset_daily_state()
 
         # 交易會話策略參數 (500 上限 / 送單間隔 / 13:23 撤單時點)
-        self.session.configure(
-            max_stock_price=self.cfg.max_stock_price,
-            order_min_interval_sec=self.cfg.order_min_interval_sec,
-            cancel_pending_time=self.cfg.cancel_pending_time,
-            order_max_per_sec=self.cfg.order_max_per_sec,
-        )
+        self._configure_session()
 
         # Phase 1: Login
         self.phase = Phase.LOGIN
@@ -765,6 +791,7 @@ class Runner:
         self.universe = get_universe(self.sdk, self.cfg.universe)
         if not self.universe:
             raise RuntimeError("universe 空")
+        self._load_avg_lots_map()        # 月均量名單 (硬限制母數;與下一行共用同一個檔)
         self._filter_low_volume()        # 月均量 < 門檻 盤前剔除 (縮母體省下游 REST)
 
         # Phase 3: Limit ups (慢 — 12-15 分鐘) — 有當日 cache 就秒讀
@@ -834,6 +861,7 @@ class Runner:
             self._start_freeze_timer()
         else:
             self._start_pre_order_timer()
+        self._start_avg_lots_filler()     # hub/standalone: marked 裡沒月均量的檔盤前 REST 補抓 (node 內部為 no-op)
         # 13:23 (CANCEL_PENDING_TIME) 撤所有未成交委託 timer (持倉不動、留倉)
         self._start_cancel_pending_timer()
 
@@ -1196,6 +1224,110 @@ class Runner:
         self._write_overnight_file()
         return removed
 
+    def _configure_session(self):
+        """cfg → session 策略參數。月均量硬限制在生產環境**只靠這裡**打開 (session 預設 0 = 關;審查 2026-10-14 有測試鎖住)。"""
+        self.session.configure(
+            max_stock_price=self.cfg.max_stock_price,
+            order_min_interval_sec=self.cfg.order_min_interval_sec,
+            cancel_pending_time=self.cfg.cancel_pending_time,
+            order_max_per_sec=self.cfg.order_max_per_sec,
+            avgvol_cap_pct=getattr(self.cfg, "avgvol_cap_pct", 1.0),   # 月均量硬限制 (2026-10-14)
+        )
+
+    def _avg_volume_path(self) -> str:
+        return os.environ.get("AVG_VOLUME_FILE", str(Path(__file__).parent / "input" / "avg_volume.json"))
+
+    def _load_avg_lots_map(self):
+        """月均量硬限制母數 (2026-10-14): hub / standalone 讀 input/avg_volume.json 整張表 (node 沒有這個檔,
+        靠 hub 快照)。檔缺 / 過時 → CRITICAL 點名:硬限制 fail-closed,沒有月均量的檔**不會下單**。"""
+        pct = float(getattr(self.cfg, "avgvol_cap_pct", 0.0) or 0.0)
+        if self.cfg and self.cfg.role == "node":
+            return          # node 沒有檔;hub 不論自己的 pct 都要讀 (hub 不下單,pct 對它沒意義,快照一定要帶 avg_lots)
+        import avg_volume as _av
+        data, meta = _av.load(self._avg_volume_path())
+        self._avg_lots_map = {k: float(v) for k, v in (data or {}).items()
+                              if isinstance(v, (int, float)) and v == v and 0 < v < 1e9}
+        if not meta["exists"] or not self._avg_lots_map:
+            logger.critical(f"[runner] ⚠⚠ 月均量檔缺或空 ({self._avg_volume_path()}) — 月均量硬限制 {pct}% 會擋下"
+                            f"**所有**沒有補抓到月均量的檔 (marked 的檔會試 REST 補抓);要放行請設 AVGVOL_CAP_PCT=0 重啟")
+        elif meta.get("stale"):
+            logger.critical(f"[runner] ⚠ 月均量檔非近期 (mtime {meta['mtime_date']}) — 硬限制照用舊值,請檢查 avg_volume timer")
+        else:
+            logger.info(f"[runner] 月均量名單載入 {len(self._avg_lots_map)} 檔 (date={meta.get('date')}) — 硬限制 {pct}%")
+
+    @staticmethod
+    def _avg_ok(v) -> bool:
+        """月均量值可用: 有限、> 0、不離譜 (NaN/inf/0/負/字串 = 未知)。"""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        return f == f and 0 < f < 1e9
+
+    def _avg_lots_all(self) -> dict:
+        """合併三個來源交給 session.set_avg_lots。優先序: REST 補抓 < 當天的檔 (檔是權威,補抓只給檔裡沒有的檔)
+        < hub 快照 (node 唯一來源;hub 上此 dict 為空)。"""
+        out = {k: float(v) for k, v in self._avg_lots_fetched.items() if self._avg_ok(v)}
+        out.update({k: float(v) for k, v in self._avg_lots_map.items() if self._avg_ok(v)})
+        out.update({k: float(v) for k, v in self.avg_lots.items() if self._avg_ok(v)})
+        return out
+
+    def _avg_lots_for(self, sym: str):
+        """單檔月均量 (張) 或 None (= 未知;0 / 非數字 / 非有限也算未知,補抓迴圈會再試)。"""
+        for src in (self.avg_lots, self._avg_lots_map, self._avg_lots_fetched):
+            v = src.get(sym)
+            if v is not None and self._avg_ok(v):
+                return float(v)
+        return None
+
+    def _push_avg_lots_to_session(self):
+        try:
+            self.session.set_avg_lots(self._avg_lots_all())
+        except Exception as e:
+            logger.error(f"[runner] 月均量名單交給 session 失敗: {e}")
+
+    def _start_avg_lots_filler(self, period: float = 2.0, call_gap: float = 1.1, now_fn=None,
+                               end_time=dtime(9, 0, 5), max_attempts: int = 2):
+        """hub / standalone: 08:30 起每 period 秒看 marked 裡沒有月均量的檔 (新上市 / DR / 檔缺 / 檔內 0) → REST 抓近
+        20 日 K 算一次 (每檔每天最多 max_attempts 次;每次 REST 之間隔 call_gap 秒 → ≤ 55/min,歷史 K 線上限 60/min)。
+        end_time 後結束。hub 不論自己的 pct 都跑 (hub 不下單;快照要帶 avg_lots 給 node)。node 內為 no-op。
+        period / call_gap / now_fn / end_time 可注入 (測試用)。"""
+        if self.cfg and self.cfg.role == "node":
+            return
+        now_fn = now_fn or (lambda: datetime.now().time())
+
+        def _loop():
+            import avg_volume as _av
+            while not self._stop_event.is_set():
+                try:
+                    if self.state is not None and self.sdk is not None:
+                        stock = self.sdk.marketdata.rest_client.stock
+                        for sym in list(self.state.get_marked_list()):
+                            if self._stop_event.is_set():
+                                return
+                            if self._avg_lots_for(sym) is not None or self._avg_lots_attempts.get(sym, 0) >= max_attempts:
+                                continue
+                            self._avg_lots_attempts[sym] = self._avg_lots_attempts.get(sym, 0) + 1
+                            v = _av.fetch_avg_lots(stock, sym)
+                            if v is not None and self._avg_ok(v):
+                                self._avg_lots_fetched[sym] = float(v)
+                                logger.warning(f"[runner] {sym} 不在月均量檔 → REST 補抓近 20 日均量 {v} 張")
+                            else:
+                                logger.critical(f"[runner] ⚠ {sym} 不在月均量檔且 REST 補抓失敗 (第 "
+                                                f"{self._avg_lots_attempts[sym]}/{max_attempts} 次) — 硬限制將不下單")
+                            if self._stop_event.wait(call_gap):      # REST 節流 (≤ 55/min)
+                                return
+                except Exception as e:
+                    logger.error(f"[runner] 月均量補抓迴圈例外: {e}")
+                if now_fn() >= end_time:
+                    return
+                self._stop_event.wait(period)
+
+        t = threading.Thread(target=_loop, name="avg-lots-filler", daemon=True)
+        t.start()
+        self._timer_threads.append(t)
+        return t
+
     def _filter_low_volume(self):
         """月均量 < cfg.avg_volume_min_lots(張) 的股票盤前剔除 (縮母體省下游 REST)。
         資料來自 scripts/compute_avg_volume.py 夜間產的 input/avg_volume.json。
@@ -1439,6 +1571,7 @@ class Runner:
             except Exception as e:
                 # 母數算壞不能讓整批預掛消失 — 以已算出的部分繼續 (沒 cap 的檔走純預算算張)
                 logger.exception(f"[runner] 預掛 20% 母數計算例外 (以已算出的部分繼續): {e}")
+            self._push_avg_lots_to_session()              # 月均量硬限制母數 (檔 + REST 補抓 + hub 快照) 最後一次同步
             try:
                 self.session.place_pre_orders(marked, self.limit_ups, stop_event,
                                               limit_up_bid_vols=bid_vols)

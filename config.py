@@ -60,6 +60,9 @@ class Config:
     socket_count_2: int = 0    # 副帳號各自的 socket 數 (0/未設 → 同 SOCKET_COUNT)
     socket_count_3: int = 0
     avg_volume_min_lots: float = 300   # 月均量 < 此(張) 盤前剔除 (離線腳本產檔;0=不篩;2026-09-02 500→300)
+    # 月均量硬限制 (2026-10-14 使用者定案): 每檔張數 ≤ floor(近 20 日均量(張) × pct/100),疊在所有算張之後;
+    # 月均量未知 → **不下單** (fail-closed,硬限制)。0 = 停用。每台 node 各自套 (艦隊 = N 倍)。
+    avgvol_cap_pct: float = 1.0
     market_chase_start: str = "08:59:59"    # 市價盲送開始時點 (提早於 09:00 開盤暖機:此刻起 cadence
                                             #   已在跑,集合競價期市價會被拒→續送,一開盤第一筆最快排到)
     market_chase_cutoff: str = "09:03:00"   # 9:00 盲送市價單的時間兜底 (超過即停,靠預掛守)
@@ -140,6 +143,7 @@ def load_config() -> Config:
         bid_decline_sample_sec=int(os.environ.get("BID_DECLINE_SAMPLE_SEC", "60")),
         skip_trader=os.environ.get("SKIP_TRADER", "true").lower() in ("1", "true", "yes"),
         avg_volume_min_lots=float(os.environ.get("AVG_VOLUME_MIN_LOTS", "300")),
+        avgvol_cap_pct=float(os.environ.get("AVGVOL_CAP_PCT", "1.0")),
         market_chase_start=os.environ.get("MARKET_CHASE_START", "08:59:59").strip(),
         market_chase_cutoff=os.environ.get("MARKET_CHASE_CUTOFF", "09:03:00").strip(),
         role=os.environ.get("ROLE", "standalone").strip().lower(),

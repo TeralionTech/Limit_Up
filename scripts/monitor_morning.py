@@ -128,8 +128,11 @@ def _fmt_node(name, r, hub_marked, now_t):
     overnight_only = tr.get("arm_mode") == "overnight_only"
     arm_c = GREEN if (mode == "real" and armed and not overnight_only) else YEL
     arm_txt = ("ARMED(隔日賣,不搶單)" if overnight_only else "ARMED") if armed else "unarmed"
+    # 月均量硬限制 (2026-10-14): 0/缺 = 沒開 → 紅字,盤前一眼看出哪台沒套
+    cap = tr.get("avgvol_cap_pct")
+    cap_txt = f" {GREEN}cap={cap}%{RST}" if (cap or 0) > 0 else f" {RED}cap=OFF!{RST}"
     line = (f"{name} phase={st.get('phase', '?')} "
-            f"{arm_c}{mode}/{arm_txt}{RST}"
+            f"{arm_c}{mode}/{arm_txt}{RST}{cap_txt}"
             f"/{'conn' if conn else 'NOCONN'} marked({len(marked)})={' '.join(marked) or '—'}{match}")
     return line, ok
 
