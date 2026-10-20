@@ -58,6 +58,7 @@ class Holding:
         # 警示: 委買量持續遞減 (每 sample_sec 取樣,連續 decline_minutes 分鐘遞減 → warning)
         self.warning = ""
         self._sample_ts = 0.0            # 上次取樣時間 (epoch)
+        self._elim_retry_ts = 0.0        # 淘汰後出場意圖未完成時,上次用 tick 重試 exit_position 的時間 (epoch)
         self._sample_size: Optional[int] = None
         self._decline_count = 0
         self.last_bid1_price = 0.0
@@ -168,11 +169,33 @@ class Trader:
                 h.status = Holding.PULLED
                 h.pulled_reason = reason
                 logger.warning(f"[trader] {symbol} 出場訊號 — {reason}")
-            if self.session is not None and self.session.has_exposure(symbol):
-                self.session.exit_position(symbol, reason)
+            if self.session is not None:
+                if h.status == Holding.DISCARDED_FIRST:
+                    # 淘汰檔 (行情因「有委託在途」留著): pending 單交給撤單佇列,只有真的有部位才出場 —
+                    # 否則撤單往返期間 has_exposure 恆 True,每 tick 起一個等 3 s 窗口的出場 worker (2026-10-20 審查)
+                    go = self.session.get_filled_lots(symbol) > 0
+                else:
+                    go = self.session.has_exposure(symbol)
+                if go:
+                    self.session.exit_position(symbol, reason)
 
         # === 警示: 委買量持續遞減 (取樣式,只顯示不動作;基準與支撐規則同) ===
         self._update_decline_warning(h, bid_basis)
+
+        # === 淘汰後的出場意圖沒完成 → 靠行情節奏重試 (2026-10-20 審查): 第一次 exit_position 被冷卻擋下 /
+        # 賣單失敗回退 exited=False 之後,淘汰檔多半沒有 support_seen (首盤就有委賣),上面的支撐消失規則不會
+        # 替它重試;行情已因「有委託在途不退訂」留著,這裡每 5 s 最多問一次 (exit_position 自帶 exited 防重與冷卻)。
+        if h.status == Holding.DISCARDED_FIRST and self.session is not None:
+            import time as _t
+            now = _t.time()
+            if now - h._elim_retry_ts >= 5.0:
+                h._elim_retry_ts = now
+                try:
+                    why = self.session.exit_pending_after_elimination(symbol)
+                    if why:
+                        self.session.exit_position(symbol, f"fill_after_elimination: {why}")
+                except Exception as e:
+                    logger.error(f"[trader] {symbol} 淘汰後出場重試失敗: {e}")
 
         # === 第一盤: 開盤第一筆 books ===
         if not h.first_books_seen:
@@ -274,8 +297,13 @@ class Trader:
         h.status = Holding.DISCARDED_FIRST
         h.first_fail_reason = reason
         has_position = False
+        live_buy = False
         if self.session is not None:
             try:
+                # 先記「淘汰後任何買進成交都要出場」— 2026-10-20 8089 (node2/3/6): 預掛單 09:00:07.085 成交,
+                # 委賣五檔比成交回報早 97~300 ms 到 → 下面 get_filled_lots 讀到 0 → 只撤單 + 退訂,之後
+                # 回報 / 撤單被拒「已成交」把張數記上卻沒人出場 → 抱到 13:24。旗標設好後成交一落地就出場。
+                self.session.mark_exit_on_fill(h.symbol, f"first_check: {reason}")
                 has_position = self.session.get_filled_lots(h.symbol) > 0
                 if has_position:
                     # 撤 pending + 市價賣出全部已成交 (同「出現賣單→出場」路徑)
@@ -283,6 +311,9 @@ class Trader:
                 else:
                     # async — 行情 thread 上不做同步 REST
                     self.session.cancel_symbol_orders_async(h.symbol, f"first_check: {reason}")
+                live_buy = self.session.has_live_buy_order(h.symbol)
+                # 撤單 thread 可能已經跑完 (撤單被拒「已成交」→ 依快照補成交) → 退訂前再讀一次部位
+                has_position = has_position or self.session.get_filled_lots(h.symbol) > 0
             except Exception as e:
                 logger.error(f"[trader] {h.symbol} 淘汰處理委託/部位失敗: {e}")
         # 同步 filter state (FilterPage 丟棄清單看得到)
@@ -291,14 +322,18 @@ class Trader:
                 self.state.unmark_first_check(h.symbol, reason)
             except Exception:
                 pass
-        # 退訂只在「無已成交部位」時做 — 有部位要留著收行情直到市價賣掉確認
-        if self.unsub_fn and not has_position:
+        # 退訂只在「無已成交部位、也沒有任何買進委託在途」時做 — 有部位要留著收行情直到賣掉確認;
+        # 有單在途 (預掛 P / 市價 M 還沒撤成) 時它隨時可能成交,退訂了之後的出場就沒有盤面
+        # (2026-10-20 8089: 退訂後委賣一直在、行情卻斷了)。多留幾檔在 socket 上成本很低。
+        keep_feed = has_position or live_buy
+        if self.unsub_fn and not keep_feed:
             try:
                 self.unsub_fn(h.symbol)
             except Exception as e:
                 logger.warning(f"[trader] 退訂 {h.symbol} 失敗: {e}")
-        logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}"
-                       f"{' (持倉→市價出場,不退訂)' if has_position else ''}")
+        tail = (" (持倉→市價出場,不退訂)" if has_position
+                else " (買進委託在途,不退訂;成交落地即出場)" if live_buy else "")
+        logger.warning(f"[trader] {h.symbol} 第一盤淘汰 — {reason}{tail}")
 
     # ─── summary (API / 前端兩區塊) ────────────────────────
 

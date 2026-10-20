@@ -1017,11 +1017,30 @@ class Runner:
         順序與各自的 try 都是必要的: 退訂若丟例外 (filter 那層會吞掉),停單不可以跟著沒做 (2026-10-12 審查;
         舊版是先退訂、而且退訂在 try 外面)。撤單用 async 版 — unmark 在行情 thread 上觸發,同步的券商往返會卡住
         同一條 socket 其他股票的 tick;停止進場的旗標則在呼叫當下就設好 (session.stop_entry)。
-        session 未 armed 時撤單是 no-op。"""
+        session 未 armed 時撤單是 no-op。
+        2026-10-20 審查 (8089 同型): 08:59:58 預掛之後才被 unmark 的檔,撤單可能輸給 09:00 集合競價成交 → 券商拒
+        「成交單已不允許取消」補進張數,而這檔不在 trader 的名單裡、行情也退訂了 → 沒人出場。所以 (1) 先標
+        session.mark_exit_on_fill:成交一落地就整檔出場;(2) 有買進委託在途 / 有部位就不退訂 (與 trader._fail_first 同)。"""
+        mark = getattr(self.session, "mark_exit_on_fill", None)
+        if mark is not None:
+            try:
+                mark(symbol, f"unmarked:{who}")
+            except Exception as e:
+                logger.error(f"[{who}] 標記 {symbol} 淘汰後出場失敗: {e}")
         try:
             self.session.cancel_symbol_orders_async(symbol, "unmarked")
         except Exception as e:
             logger.error(f"[{who}] 撤 {symbol} 委託失敗: {e}")
+        keep_feed = False
+        try:
+            live = getattr(self.session, "has_live_buy_order", None)
+            held = getattr(self.session, "get_filled_lots", None)
+            keep_feed = bool((live is not None and live(symbol)) or (held is not None and held(symbol) > 0))
+        except Exception as e:
+            logger.warning(f"[{who}] 查 {symbol} 委託/部位失敗 (照舊退訂): {e}")
+        if keep_feed:
+            logger.warning(f"[{who}] {symbol} 淘汰但買進委託在途 / 有部位 → 不退訂行情 (成交落地即出場)")
+            return
         try:
             self._unsub_symbol(symbol)
         except Exception as e:

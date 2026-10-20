@@ -325,6 +325,10 @@ class SymbolTrade:
         self.avg_price = 0.0
         self.buy_cost_actual = 0.0     # 該檔實際買進現金累計 (單調;賣出不減) — 花費表/超額用
         self.stopped_reason: str = ""  # 非空 = 此檔不再進場
+        self.exit_on_fill: str = ""    # 非空 = 這檔已被淘汰 (第一盤檢查),**任何**買進成交落地都要立刻出場 —
+        #   2026-10-20 8089: 開盤預掛單 09:00:07.085 成交,五檔的委賣比成交回報早 97~300 ms 到,淘汰當下
+        #   filled_lots 還是 0 → 判「沒部位」只撤單 + 退訂;之後回報 / 撤單被拒「已成交」補成交只把張數記上,
+        #   沒人觸發出場 (晚成交保護要 exited 才動) → 抱到 13:24 才進隔日賣清單。值 = 淘汰原因 (log 用)。
         self.exited = False            # 已出場 (委賣出現)
         self.exit_in_progress = False  # _exit_worker 進行中 (等回報窗口→賣) — 此期間的晚成交由它接手;
         #   結束後 (exited 仍 True) 再來的買進成交 = 出場後晚成交 → _on_fill 另起 late-fill 賣 (A4b)
@@ -367,6 +371,7 @@ class SymbolTrade:
             "avg_lots": self.avg_lots,                  # 月均量硬限制 (2026-10-14): 母數 / 上限 / 是否綁住
             "avgvol_cap_lots": self.avgvol_cap_lots,
             "size_cap_reason": self.size_cap_reason,
+            "exit_on_fill": self.exit_on_fill,
             "exited": self.exited,
             "is_disposition": self.is_disposition,
             "sell_failed": self.sell_failed,
@@ -1317,6 +1322,7 @@ class TradingSession:
                 if has_items:
                     self._cancel_worker_run_once()
                 self._maybe_intraday_sweep()
+                self._maybe_retry_elimination_exits()
                 self._maybe_log_foreign_reject_summary()
             except Exception as e:
                 logger.exception(f"[session] 撤單 worker 例外 (續跑): {e}")
@@ -1907,6 +1913,74 @@ class TradingSession:
             return 0
         return delta
 
+    def _exit_on_fill_due_locked(self, st: Optional["SymbolTrade"]) -> bool:
+        """淘汰後成交落地 → 要不要觸發整檔出場 (caller 持鎖)。條件: 已標 exit_on_fill、帳上有張數、
+        尚未出場 (exited / 出場 worker 進行中都由既有路徑接手)、非使用者取消追蹤。
+        觸發的是 exit_position (整檔依帳上張數賣),不是 late-fill (只賣 delta):這檔從沒出場過。"""
+        return bool(st is not None and st.exit_on_fill and st.filled_lots > 0
+                    and not st.exited and not st.exit_in_progress
+                    and st.stopped_reason != "manual_abandon")
+
+    def _fire_exit_on_fill(self, symbol: str, st: "SymbolTrade", lots: int, order_no: str, why: str):
+        """鎖外: 淘汰後成交落地 → 出場 (exit_position 自帶 exited 防重複 / 冷卻 / broker 閘門)。"""
+        logger.critical(f"[session] ⚠ {symbol} 淘汰後買進成交 {lots} 張落地 (order {order_no}; {why};"
+                        f" 淘汰原因 {st.exit_on_fill}) → 立刻出場賣掉全部持倉")
+        self.exit_position(symbol, f"fill_after_elimination: {st.exit_on_fill}")
+
+    def mark_exit_on_fill(self, symbol: str, reason: str) -> bool:
+        """第一盤淘汰 (trader._fail_first) 一進來就呼叫 — 只改本地旗標、不碰券商,行情 thread 可直接叫。
+        之後這檔任何買進成交落地 (成交回報 / 撤單被拒「已成交」補成交 / 重連補收) 都觸發整檔出場,
+        不管淘汰當下 filled_lots 是不是 0 (2026-10-20 8089 事故)。先到的原因為準。回 True = 有這檔的 st。"""
+        if not reason:
+            return False
+        with self._lock:
+            st = self.trades.get(symbol)
+            if st is None:
+                return False
+            st.stopped_reason = st.stopped_reason or reason
+            st.exit_on_fill = st.exit_on_fill or reason
+            return True
+
+    def exit_pending_after_elimination(self, symbol: str) -> str:
+        """淘汰後的出場意圖還沒完成 (有部位、未出場、非取消追蹤) → 回淘汰原因,否則 ""。
+        trader 對已淘汰的檔每個 tick 問一次 → 第一次出場被閘門 (broker 未連線) / 冷卻擋下、或賣單失敗
+        回退 exited=False 之後,靠行情節奏重試 (審查: 淘汰檔多半沒有 support_seen,支撐消失規則不會替它重試)。"""
+        with self._lock:
+            st = self.trades.get(symbol)
+            if self._exit_on_fill_due_locked(st):
+                return st.exit_on_fill
+            return ""
+
+    def retry_elimination_exits(self, why: str) -> list:
+        """所有「淘汰後出場意圖未完成」的檔再觸發一次 exit_position (自帶 exited 防重 / 冷卻 / 閘門)。
+        trader 的 tick 重試只覆蓋它名單上的檔;盤前 unmark 的檔不在名單裡,靠這裡 (撤單 worker 迴圈每 30 s、
+        交易 WS 重連後) 兜底。回有觸發的 symbol 清單。"""
+        with self._lock:
+            due = [(sym, st.exit_on_fill) for sym, st in self.trades.items()
+                   if self._exit_on_fill_due_locked(st)]
+        for sym, reason in due:
+            logger.warning(f"[session] {sym} 淘汰後出場尚未完成 ({why}) → 重試出場")
+            self.exit_position(sym, f"fill_after_elimination: {reason}")
+        return [sym for sym, _ in due]
+
+    def _maybe_retry_elimination_exits(self):
+        """撤單 worker 迴圈每 30 s 最多一次 (鎖外;exit_position 只起 thread)。"""
+        now_m = time.monotonic()
+        if now_m - getattr(self, "_last_elim_retry", 0.0) < 30.0:
+            return
+        self._last_elim_retry = now_m
+        try:
+            self.retry_elimination_exits("periodic")
+        except Exception as e:
+            logger.error(f"[session] 淘汰後出場重試例外: {e}")
+
+    def has_live_buy_order(self, symbol: str) -> bool:
+        """這檔今天還有未終結的買進委託 (order_log 任一 buy row 仍 pending;含被市價盲送蓋掉的孤兒預掛 P) —
+        trader 淘汰時判斷要不要退訂行情:有單在途就不能退訂,成交落地還要出場。"""
+        with self._lock:
+            return any(row.get("symbol") == symbol and row.get("action") == "buy"
+                       and row.get("status") == "pending" for row in self.order_log.values())
+
     def _start_late_fill_exit(self, symbol: str, lots: int, order_no: str, why: str = ""):
         """鎖外: 出場後晚成交 → 對**這批**張數另起 late-fill 賣 (A4b;_on_fill / 撤單前成交 / 補收共用)。"""
         logger.critical(f"[session] ⚠ {symbol} 出場後晚成交 {lots} 張 (order {order_no}"
@@ -1923,22 +1997,30 @@ class TradingSession:
         threading.Thread(target=self.cancel_all_pending, args=("budget_breached",),
                          name="budget-breach-cancel", daemon=True).start()
 
-    def _apply_auth_fill(self, order_no: str, auth_lots: int, why: str) -> int:
+    def _apply_auth_fill(self, order_no: str, auth_lots: int, why: str, final: bool = False) -> int:
         """以券商權威成交張數補一列 (鎖內 _apply_auth_fill_locked) + 鎖外連鎖: 硬上限 breach → 撤所有
-        pending 買單;已出場的檔補進買進 → late-fill 賣 (A4b)。回補進 delta。"""
+        pending 買單;已出場的檔補進買進 → late-fill 賣 (A4b);淘汰檔補進買進 → 整檔出場。回補進 delta。
+        final=True = 這是**終結**快照 (status 30/40 剩餘已取消 / 50 全成) 的成交量 → 記 row["auth_final"],
+        之後同一批成交的回報不得再加 (delta 為 0 也要記:回報先到、快照後確認終量的情形)。"""
         with self._lock:
             row = self.order_log.get(order_no)
             if row is None:
                 return 0
+            if final:
+                row["auth_final"] = max(int(auth_lots), int(row.get("auth_final") or 0))
             was = self._budget_breached
             delta = self._apply_auth_fill_locked(order_no, row, auth_lots)
             breach_now = self._budget_breached and not was
             late = self._late_fill_lots_locked(row, delta)
             symbol = row["symbol"]
+            st = self.trades.get(symbol)
+            fire_exit = delta > 0 and row.get("action") == "buy" and self._exit_on_fill_due_locked(st)
         if delta > 0:
             logger.warning(f"[session] {symbol} 依券商權威補成交 {delta} 張 (order {order_no}; {why})")
         if late > 0:
             self._start_late_fill_exit(symbol, late, order_no, why)
+        if fire_exit:
+            self._fire_exit_on_fill(symbol, st, delta, order_no, why)
         if breach_now:
             self._trigger_budget_breach(f"{why}補入後")
         return delta
@@ -1997,7 +2079,8 @@ class TradingSession:
         sym, reason = it["symbol"], it["reason"]
         if stt in _BROKER_TERMINAL_CANCELLED:
             if fq:
-                self._apply_auth_fill(order_no, fq // 1000, f"快照 status {stt}")
+                # 終結快照 → 終量 (final):部分成交 1 張補入後,同筆回報晚到不可再加 (2026-10-20 審查)
+                self._apply_auth_fill(order_no, fq // 1000, f"快照 status {stt}", final=True)
             self._confirm_cancelled(order_no, sym, reason, source=f"snapshot status {stt}")
             out["cancelled"].append(order_no)
             return True
@@ -2037,6 +2120,8 @@ class TradingSession:
         delta = late = 0
         breach_now = False
         resolved = closed_partial = False
+        fire_exit = False
+        st_fire = None
         row = None
         with self._lock:
             row = self.order_log.get(order_no)
@@ -2052,6 +2137,9 @@ class TradingSession:
                     delta = self._apply_auth_fill_locked(order_no, row, auth_lots)
                     breach_now = self._budget_breached and not was_b
                     late = self._late_fill_lots_locked(row, delta)
+                    st_fire = self.trades.get(row.get("symbol", ""))
+                    fire_exit = (delta > 0 and row.get("action") == "buy"
+                                 and self._exit_on_fill_due_locked(st_fire))
                 if row["status"] != "pending":
                     resolved = True                    # 回報先到已終結 → 沒有東西要核實
                 elif auth_lots is not None and auth_lots >= row["lots"]:
@@ -2060,6 +2148,10 @@ class TradingSession:
                     resolved = True
                 elif partial and auth_lots is not None and 0 < auth_lots < row["lots"]:
                     resolved = closed_partial = True
+                if auth_lots is not None and (closed_partial or auth_lots >= row["lots"]):
+                    # 終結快照的成交量 = 這列的終量:之後同一批成交的回報 (_on_fill) 不得再加 (審查 2026-10-20:
+                    # 部分成交 1 張補入後、同筆回報被原委託量封頂又加一次 → 出場超賣)
+                    row["auth_final"] = max(int(auth_lots), int(row.get("auth_final") or 0))
                 if resolved or not can_verify:
                     self._cancel_queue.pop(order_no, None)
                     row["cancel_state"] = ""
@@ -2099,6 +2191,9 @@ class TradingSession:
         if late > 0:
             self._start_late_fill_exit(symbol or (row or {}).get("symbol", ""), late, order_no,
                                        "撤單前已成交")
+        if fire_exit:
+            self._fire_exit_on_fill(symbol or (row or {}).get("symbol", ""), st_fire, delta, order_no,
+                                    "撤單前已成交")
         if breach_now:
             self._trigger_budget_breach("撤單前成交補入後")
         if first:
@@ -3347,6 +3442,11 @@ class TradingSession:
                     cleared.append(sym)
         if cleared:
             logger.warning(f"[session] 重連 → 清除出場失敗冷卻 {cleared} (下一個出場訊號立刻可再觸發)")
+        # 淘汰後出場意圖未完成的檔 (補收 delta 0 不會再 fire) → 重連後立刻再試一次
+        try:
+            self.retry_elimination_exits("reconnected")
+        except Exception as e:
+            logger.error(f"[session] 重連後淘汰出場重試例外: {e}")
         self._cancel_wakeup.set()
         self._ensure_cancel_worker()
         try:
@@ -3375,6 +3475,7 @@ class TradingSession:
         recovered = 0
         breach_now = False
         late_sells = []
+        elim_exits = []
         with self._lock:
             was_breached = self._budget_breached
             for order_no, row in self.order_log.items():
@@ -3389,11 +3490,20 @@ class TradingSession:
                 late = self._late_fill_lots_locked(row, delta)   # 已出場的檔補進買進 → 沒有出場保護 (審查 #14)
                 if late > 0:
                     late_sells.append((row["symbol"], late, order_no))
+                st_e = self.trades.get(row.get("symbol", ""))
+                if row.get("action") == "buy" and self._exit_on_fill_due_locked(st_e):
+                    elim_exits.append((row["symbol"], st_e, delta, order_no))   # 淘汰後補進的買進 → 整檔出場
                 logger.critical(f"[session] ⚠ 補收 {row['symbol']} {row['action']} "
                                 f"{delta} 張 (order {order_no},斷線期間回報遺失)")
             breach_now = self._budget_breached and not was_breached
         for sym, lots, no in late_sells:
             self._start_late_fill_exit(sym, lots, no, "補收對帳")
+        seen = set()
+        for sym, st_e, lots, no in elim_exits:
+            if sym in seen:
+                continue
+            seen.add(sym)
+            self._fire_exit_on_fill(sym, st_e, lots, no, "補收對帳")
         if recovered:
             logger.critical(f"[session] 補收對帳完成 — 共補 {recovered} 張")
         else:
@@ -3468,6 +3578,7 @@ class TradingSession:
             return
         breach_now = False
         late_fill_lots = 0
+        fire_exit = False
         with self._lock:
             # 委託總表同步 (前端顯示)
             row = self.order_log.get(fill["order_no"])
@@ -3476,13 +3587,20 @@ class TradingSession:
             # 不會雙算 (也根絕 2026-07-29 那類重複計算)。
             lots = fill["lots"]
             if row is not None:
-                lots = max(0, min(lots, row["lots"] - row["filled_lots"]))
+                cap_total = row["lots"]
+                # 券商已給**終結**快照 (status 40 部分成交其餘取消 / 50 全成) → 終量為準,之後同一批成交的回報
+                # 不得再加 (2026-10-20 審查: 部分成交 1 張由 status 40 快照補入後,同筆回報晚到被原委託量封頂成
+                # min(1, 3−1)=1 又加一次 → 出場超賣)。未終結的補入 (重連補收活單) 維持相加封頂 — 之後到的
+                # 回報可能是另外的新成交,取大會少算部位 (隱形裸單比多算危險)。
+                if row.get("auth_final") is not None:
+                    cap_total = min(cap_total, int(row["auth_final"]))
+                lots = max(0, min(lots, cap_total - row["filled_lots"]))
                 row["filled_lots"] += lots
                 if row["filled_lots"] >= row["lots"] and row["status"] == "pending":
                     row["status"] = "filled"
                     row["terminal_ts"] = time.time()
             if lots <= 0:
-                return      # 該委託已記滿 (補收已入帳的晚到回報) → 不再動部位
+                return      # 該委託已記滿 / 終結快照已補入 (晚到回報) → 不再動部位
             # 隔日賣單成交 → 記 sold_lots (13:24 get_overnight_candidates 算 remaining 用;
             # 2026-08-14 補 — 原本恆 0,賣光的檔會以原張數帶到明天,靠隔早對帳才清)
             o = self.overnight.get(fill["symbol"])
@@ -3525,12 +3643,17 @@ class TradingSession:
                 if (st.exited and not st.exit_in_progress
                         and st.stopped_reason != "manual_abandon"):
                     late_fill_lots = lots
+                # 淘汰後成交落地 (2026-10-20 8089): 第一盤淘汰時回報還沒到 → 沒出場過、也不會再有出場訊號
+                # (trader 已丟棄這檔) → 這裡直接觸發整檔出場
+                fire_exit = self._exit_on_fill_due_locked(st)
             else:   # sell (出場)
                 st.filled_lots = max(0, st.filled_lots - lots)
                 if row is not None and row.get("kind") in ("limit_sell", "market_sell"):
                     self._reset_exit_backoff_locked(st)   # 策略出場賣單真的成交 → 出場失敗輪次/冷卻歸零
         if late_fill_lots > 0:
             self._start_late_fill_exit(fill["symbol"], late_fill_lots, fill["order_no"])
+        if fire_exit:
+            self._fire_exit_on_fill(fill["symbol"], st, lots, fill["order_no"], "成交回報")
         # ── 硬上限觸發 (鎖外): 撤所有 pending 買單止血;已成交部位不動,靠出場全量賣。 ──
         if breach_now:
             logger.critical(

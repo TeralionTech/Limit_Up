@@ -193,6 +193,17 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
       13:24,把那筆部位寫進隔日賣清單(以前提早收工 = 沒人記,隔天只剩一行「庫存有但清單沒有」的 CRITICAL)。
       ⚠ 這一項要比免查詢撤單(踩雷點 12)**先上或一起上**:舊碼撤單前的全清單查詢剛好凍住 process 0.1~0.2 s,
       反而壓低了多送的筆數;免查詢撤單拿掉那個凍結後,沒有這一項會多送更多。
+    - **第一盤淘汰 vs 成交回報的競態**(2026-10-20 8089,node2/3/6):預掛單 09:00:07.085 在券商端成交,第一筆五檔
+      (委賣)比成交回報早 97~300 ms 到 → `_fail_first` 讀本機 `filled_lots` 為 0 → 以前只撤單 + 退訂;撤單被拒
+      「成交單已不允許取消」補進 3 張後沒人出場(晚成交保護要 `exited` 才動)→ 抱到 13:24 才進隔日賣清單。修法:
+      淘汰一進來先 `session.mark_exit_on_fill`(`st.exit_on_fill` = 淘汰原因),之後**任何**買進成交落地(成交回報、
+      撤單被拒依快照補成交、重連補收)都 `_exit_on_fill_due_locked` → `exit_position("fill_after_elimination…")`
+      整檔賣;退訂只在「沒部位、也沒有買進委託在途(`has_live_buy_order`)」時做,有單在途就留著收行情。
+      盤前 unmark(`runner._unmark_stop_and_unsub`,08:59:58 預掛後才被剔除、撤單輸給集合競價)同型,同樣先標旗標。
+      出場被冷卻 / 閘門擋下的重試:trader 對淘汰檔每 5 s 問一次 `exit_pending_after_elimination`,session 撤單
+      worker 迴圈每 30 s 與重連後 `retry_elimination_exits`。終結快照(status 40/50)的成交量記成 `row["auth_final"]`,
+      之後同一批成交的回報不再加(部分成交 1 張補入後同筆回報晚到曾會雙算成 2 → 超賣);活單補入維持相加封頂。
+      新增其他補成交的地方一律加同一個檢查。
 
 ## 台股市場規則 (影響判斷邏輯)
 

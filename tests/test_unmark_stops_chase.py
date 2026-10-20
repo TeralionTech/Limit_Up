@@ -227,3 +227,29 @@ class TestUnmarkCallbackOrder:
         r.session.cancel_symbol_orders_async = _boom
         r._unmark_stop_and_unsub("6872")
         assert calls == [("unsub", "6872")]
+
+    def test_marks_exit_on_fill_first_and_keeps_feed_while_buy_live(self):
+        """2026-10-20 8089 同型 (盤前 unmark): 先標「成交落地即出場」,再撤單;買進委託在途 → 不退訂。"""
+        r, calls = self._runner()
+        r.session.mark_exit_on_fill = lambda sym, reason: calls.append(("mark", sym, reason))
+        r.session.has_live_buy_order = lambda sym: True
+        r.session.get_filled_lots = lambda sym: 0
+        r._unmark_stop_and_unsub("6872", "node")
+        assert calls == [("mark", "6872", "unmarked:node"), ("cancel", "6872", "unmarked")]
+
+    def test_unsubscribes_when_no_order_and_no_position(self):
+        r, calls = self._runner()
+        r.session.mark_exit_on_fill = lambda sym, reason: calls.append(("mark", sym, reason))
+        r.session.has_live_buy_order = lambda sym: False
+        r.session.get_filled_lots = lambda sym: 0
+        r._unmark_stop_and_unsub("6872", "node")
+        assert calls == [("mark", "6872", "unmarked:node"), ("cancel", "6872", "unmarked"), ("unsub", "6872")]
+
+    def test_mark_failure_does_not_skip_cancel(self):
+        r, calls = self._runner()
+
+        def _boom(sym, reason):
+            raise RuntimeError("boom")
+        r.session.mark_exit_on_fill = _boom
+        r._unmark_stop_and_unsub("6872")
+        assert calls == [("cancel", "6872", "unmarked"), ("unsub", "6872")]
