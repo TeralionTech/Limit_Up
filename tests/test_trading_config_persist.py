@@ -1,6 +1,8 @@
 """trading_config.py — mode / 預算 / 張數 跨重啟保留；API 改完就寫檔；啟動套回永不 arm。"""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -40,13 +42,14 @@ class TestLoadRestore:
         assert TC.persist(s) is True
         data = json.loads((out / TC.FILENAME).read_text(encoding="utf-8"))
         assert data == {"mode": "real", "sizing_mode": "budget", "fixed_lots": 0,
-                        "total_budget": 1_000_000.0, "per_symbol_budget": 300_000.0}
+                        "total_budget": 1_000_000.0, "per_symbol_budget": 300_000.0,
+                        "pull_exit": s.pull_exit.to_dict()}
         assert "armed" not in data
 
         s2 = _fresh_session()
         applied = TC.restore(s2)
         assert applied == {"mode": "real", "total_budget": 1_000_000.0, "per_symbol_budget": 300_000.0,
-                           "sizing_mode": "budget", "fixed_lots": 0}
+                           "sizing_mode": "budget", "fixed_lots": 0, "pull_exit": s.pull_exit.to_dict()}
         assert s2.mode == "real" and s2.total_budget == 1_000_000 and s2.per_symbol_budget == 300_000
         assert s2.armed is False                       # 突變必殺: 套回不可以 arm
 
@@ -123,3 +126,78 @@ class TestApiPersists:
         c, _ = client
         assert c.post("/api/trading/params", json={"total_budget": -5}).status_code == 400
         assert not (out / TC.FILENAME).exists()
+
+    @pytest.mark.parametrize("first_endpoint", ["pull_exit", "mode", "params"])
+    @pytest.mark.parametrize("second_endpoint", ["pull_exit", "mode", "params"])
+    def test_concurrent_writers_serialize_and_restart_matches_runtime(
+            self, out, client, monkeypatch, first_endpoint, second_endpoint):
+        from test_pull_signal import make_trader
+        c, runner = client
+        runner.trader, _, _, _ = make_trader("off", session=runner.session)
+        first_written, release_write, second_attempt = (threading.Event() for _ in range(3))
+        writes, acquired_by_second = [], []
+        writer_ident = []
+        original_lock = TC.CONFIG_LOCK
+        original_write = Path.write_text
+
+        class ObservedLock:
+            def __enter__(self):
+                if writer_ident and threading.get_ident() != writer_ident[0]:
+                    acquired = original_lock.acquire(blocking=False)
+                    acquired_by_second.append(acquired)
+                    second_attempt.set()
+                    if not acquired:
+                        original_lock.acquire()
+                else:
+                    original_lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                original_lock.release()
+
+        def write(path, data, *args, **kwargs):
+            if path == out / "trading_config.json.tmp":
+                writes.append(json.loads(data))
+                if len(writes) == 1:
+                    writer_ident.append(threading.get_ident())
+                    first_written.set()
+                    assert release_write.wait(5)
+            return original_write(path, data, *args, **kwargs)
+
+        monkeypatch.setattr(TC, "CONFIG_LOCK", ObservedLock())
+        monkeypatch.setattr(Path, "write_text", write)
+        first_body = {"pull_exit": {"mode": "on"}, "mode": {"mode": "real"},
+                      "params": {"total_budget": 500000}}[first_endpoint]
+        second_body = {"pull_exit": {"mode": "off"}, "mode": {"mode": "sim"},
+                       "params": {"total_budget": 100000}}[second_endpoint]
+        expected = TC.snapshot(runner.session)
+        for endpoint, body in ((first_endpoint, first_body), (second_endpoint, second_body)):
+            if endpoint == "pull_exit":
+                expected["pull_exit"].update(body)
+            else:
+                expected.update(body)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(c.post, f"/api/trading/{first_endpoint}", json=first_body)
+            try:
+                assert first_written.wait(3)
+                # While file I/O is blocked, both market/session locks stay free.
+                for lock in (runner.trader._pull_lock, runner.session._lock):
+                    assert lock.acquire(blocking=False)
+                    lock.release()
+                second = pool.submit(c.post, f"/api/trading/{second_endpoint}", json=second_body)
+                assert second_attempt.wait(3)
+                assert acquired_by_second == [False]
+                assert TC.snapshot(runner.session) == writes[0]
+            finally:
+                release_write.set()
+            for response in (first.result(timeout=3), second.result(timeout=3)):
+                assert response.status_code == 200
+                assert response.json().get("persisted", True)
+
+        persisted = json.loads((out / TC.FILENAME).read_text(encoding="utf-8"))
+        fresh = TradingSession(auto_cancel_worker=False)
+        TC.restore(fresh)
+        assert len(writes) == 2
+        assert persisted == TC.snapshot(runner.session) == TC.snapshot(fresh) == expected
+        assert not fresh.armed

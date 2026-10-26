@@ -229,6 +229,27 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
 - `runner.py` 主流程 singleton:login → universe → 抓漲停價(節流+重試到 08:28)→ subscribe → 篩選 → trader
 - `filter.py` 8:30–9:00 mark/unmark 邏輯(漲停鎖死=只有委買+買一=漲停)
 - `trader.py` 9:00 後追蹤(第一盤檢查 → 盤中追蹤);監控與下單分離
+- **大單抽掉出場訊號 (2026-10-26)**: `pull_signal.py` 純邏輯、`pull_runtime.py` 延後判斷/背景紀錄。
+  最近 `(T−10s, T]` 逐步加總 `max(0, -ΔQ-ΔV)`,扣本機 `(T−12s, T]` 買單撤單量後,
+  同時 ≥20 張、≥起點前最後 Q 的30%、≥視窗成交2倍、≥`fleet_nodes × target_lots` 且 Q≥20 才觸發。
+  與 `risk_bt.Feats` 一致:沒有起點前讀數時 Q 用當前值;首個 Q≥1 後 grace=5s 之前的步驟不計。
+  僅一般股今日 TRACKING/PULLED、09:00 真成交之後到13:20前;處置/淘汰/放棄/純隔日賣排除。
+  `Subscriber.set_handlers(with_context=True)` 傳 books/trades `time` (Unix微秒)、接收時間及連線世代;
+  books 接收後延1s,只消耗交易所時間≤T的成交。缺時間時整段重置為接收時鐘,不混用;
+  斷線/世代變動/讀數間隔>5s重等arm+grace;成交超過lag只WARNING計數,不追溯;
+  同頻道未結算成交倒序則清視窗重等。`volume` 尚缺實錄單位核對,暫只累加已確認為張的 `size`。
+  `POST /api/trading/pull_exit {"mode":"off|shadow|on","grace_sec":5}` (既有token保護);
+  另可設 `eval_lag_sec`、`max_gap_sec`、`fleet_nodes` (預設3)、`cutoff` (不可晚於13:20)。
+  預設 **off**,持久化在 `output/trading_config.json` 的獨立 `pull_exit` object;不還原armed。
+  shadow只WARNING/CSV;on同步 `stop_entry` → `mark_exit_on_fill` → 有曝險才 `exit_position`。
+  後兩者沿用既有出場/晚成交/失敗重試保護,不改撤單或auth_final語意;純訊號每天一筆,
+  已觸發後重新建立Trader/切模式/重連也不重報(每日roll_day清除)。既有隊伍歸零規則仍獨立執行。
+  `/api/trading/status` 頂層 `pull_exit`;每檔 `pull_signal` 保留最後訊號;`params`與中控status shape不變。
+  觀察: `[pull]` WARNING會依notifier規則轉中控;`output/YYYY-MM-DD_pull_signals.csv`
+  (ts為epoch秒、symbol/mode/q_before/cancels/trades/armed_s/filled_lots/has_exposure/action),背景writer寫檔。
+  同一買單請求/送撤重試/確認在視窗內只扣最大未成交張數,確認可刷新窗口;失敗請求也保守扣除。
+  本機回測對照:設 `LIMITUP_PULL_BT_STORE` 指向含 `tails/` 的warroom_data後跑新測試;
+  沒有10-14～10-19 tape或研究輔助模組就明確skip,不視為已驗證實錄一致。
 - **月均量硬限制 (2026-10-14 使用者定案)**:每檔張數 ≤ floor(近 20 日均量(張) × `AVGVOL_CAP_PCT`/100),預設 1%,
   `_sized_lots` **最後一道**(疊在預算 / 個股金額覆寫「最少一張」/ 禁現沖減半 / 20% 委託量之後,預掛與盲送共用);
   月均量**未知 → 0 張、不下單**(fail-closed,`stopped_reason=avgvol_unknown`,CRITICAL 點名)。母數來源:hub/standalone 讀

@@ -5,7 +5,7 @@ needrestart、當機) 之後 mode 退回 sim、預算歸零 → 中控 08:50 自
 (「模擬模式不能開始交易」/「先設定總預算」)，整天不交易。以前靠部署腳本手動設回 (deploy_limitup_commit.py
 ``restore_trading``)；現在 API 每次改完就寫檔、啟動時讀回。
 
-只存這五個欄位、**永遠不存 armed** (armed 每天都要重新按 / 由中控排程開)。
+存原五個欄位與獨立 pull_exit 設定、**永遠不存 armed**。
 檔案: output/trading_config.json (output/ 不進 git、搬遷時會一起搬)。壞檔 / 缺檔 → 當沒有，不影響啟動。
 """
 from __future__ import annotations
@@ -13,13 +13,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional
+
+from pull_signal import PullExitConfig
 
 logger = logging.getLogger(__name__)
 
 FILENAME = "trading_config.json"
 FIELDS = ("mode", "sizing_mode", "fixed_lots", "total_budget", "per_symbol_budget")
+# Every settings writer holds this from mutation through persistence. This is
+# independent of the quote/session locks, which must be released before file I/O.
+CONFIG_LOCK = threading.RLock()
 
 
 def config_path(output_dir: Optional[Path] = None) -> Path:
@@ -34,21 +40,24 @@ def snapshot(session) -> dict:
         "fixed_lots": int(session.fixed_lots),
         "total_budget": float(session.total_budget),
         "per_symbol_budget": float(session.per_symbol_budget),
+        "pull_exit": session.pull_exit.to_dict(),
     }
 
 
 def persist(session, output_dir: Optional[Path] = None) -> bool:
     """寫檔 (原子: 先寫 .tmp 再 replace)。失敗只 log、回 False。"""
-    path = config_path(output_dir)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(snapshot(session), ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, path)
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[trading_config] 寫 {path} 失敗: {e}")
-        return False
+    with CONFIG_LOCK:
+        path = config_path(output_dir)
+        try:
+            data = snapshot(session)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[trading_config] 寫 {path} 失敗: {e}")
+            return False
 
 
 def load(output_dir: Optional[Path] = None) -> Optional[dict]:
@@ -74,6 +83,13 @@ def load(output_dir: Optional[Path] = None) -> Optional[dict]:
         v = data.get(key)
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
             out[key] = int(v) if key == "fixed_lots" else float(v)
+    if "pull_exit" in data:
+        try:
+            if not isinstance(data["pull_exit"], dict):
+                raise ValueError("pull_exit 必須是 object")
+            out["pull_exit"] = PullExitConfig().updated(data["pull_exit"]).to_dict()
+        except (TypeError, ValueError) as e:
+            logger.warning(f"[trading_config] pull_exit 無效，維持 off: {e}")
     return out or None
 
 
@@ -91,6 +107,9 @@ def restore(session, output_dir: Optional[Path] = None) -> Optional[dict]:
         if params:
             session.set_params(**params)
             applied.update(params)
+        if "pull_exit" in cfg:
+            session.set_pull_exit(**cfg["pull_exit"])
+            applied["pull_exit"] = cfg["pull_exit"]
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[trading_config] 套回設定失敗 (維持預設): {e}")
         return applied or None

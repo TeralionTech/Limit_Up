@@ -389,12 +389,14 @@ class TradingModeReq(BaseModel):
 
 @router.post("/trading/mode")
 def trading_mode(req: TradingModeReq):
-    try:
-        Runner.get().session.set_mode(req.mode)
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(400, str(e))
-    # 2026-10-13: 落檔，重啟後套回 (armed 不存)；寫檔失敗不影響這次切換
-    trading_config.persist(Runner.get().session)
+    with trading_config.CONFIG_LOCK:
+        session = Runner.get().session
+        try:
+            session.set_mode(req.mode)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(400, str(e))
+        # 2026-10-13: 落檔，重啟後套回 (armed 不存)；寫檔失敗不影響這次切換
+        trading_config.persist(session)
     return {"ok": True, "mode": req.mode}
 
 
@@ -407,13 +409,33 @@ class TradingParamsReq(BaseModel):
 
 @router.post("/trading/params")
 def trading_params(req: TradingParamsReq):
-    try:
-        Runner.get().session.set_params(req.total_budget, req.per_symbol_budget,
-                                        req.sizing_mode, req.fixed_lots)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    trading_config.persist(Runner.get().session)     # 2026-10-13: 跨重啟保留 (見 trading_config.py)
+    with trading_config.CONFIG_LOCK:
+        session = Runner.get().session
+        try:
+            session.set_params(req.total_budget, req.per_symbol_budget,
+                               req.sizing_mode, req.fixed_lots)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        trading_config.persist(session)     # 2026-10-13: 跨重啟保留 (見 trading_config.py)
     return {"ok": True}
+
+
+@router.post("/trading/pull_exit")
+def trading_pull_exit(req: dict):
+    """Strict validation before mutation; protected by the existing API middleware."""
+    if "mode" not in req:
+        raise HTTPException(400, "mode 必填")
+    r = Runner.get()
+    with trading_config.CONFIG_LOCK:
+        try:
+            if r.trader is not None:
+                cfg = r.trader.configure_pull_exit(**req)
+            else:
+                cfg = r.session.set_pull_exit(**req)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, str(e))
+        saved = trading_config.persist(r.session)
+    return {"ok": True, "pull_exit": cfg, "persisted": saved}
 
 
 class TradingArmReq(BaseModel):
@@ -720,6 +742,8 @@ def central_status():
     cfg = r.cfg
     session = r.session
     trading = _safe("trading", lambda: session.status())
+    if trading is not None:
+        trading = {k: v for k, v in trading.items() if k != "pull_exit"}
     return {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "role": _safe("role", lambda: _central_role(cfg)),

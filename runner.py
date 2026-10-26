@@ -955,9 +955,11 @@ class Runner:
             unsub_fn=self._unsub_symbol,                        # + 退訂 (隔日賣標的不退)
             session=self.session,                               # 交易會話 (sim = 純監控)
             dispositions=self.dispositions,                     # 處置股量減半基準用限價列
+            subscriber=self.subscriber,
         )
         # trades 已在 9:00 轉場時對 watchlist 加訂 (keep_only 之後)
-        self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade)
+        self.subscriber.set_handlers(on_book=self.trader.on_book, on_trade=self.trader.on_trade,
+                                     with_context=True)
         # 收盤後才確認的撤單/成交 (撤單佇列晚結案) → 重寫隔日賣清單 (2026-09-09 A4b)
         if hasattr(self.session, "on_late_confirm"):
             self.session.on_late_confirm = self._write_overnight_file
@@ -977,7 +979,7 @@ class Runner:
                 _ts = str(_lt.get("ts") or "")
                 if len(_ts) >= 19 and _ts[11:19] < self.cfg.end_time:
                     continue
-                self.trader.on_trade(_sym, _lt)
+                self.trader.on_trade(_sym, {**_lt, "_pull_seed": True})
             except Exception:
                 pass
 

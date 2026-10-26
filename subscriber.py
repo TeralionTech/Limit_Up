@@ -109,6 +109,7 @@ class Subscriber:
         self.universe = universe
         self.on_book = on_book
         self.on_trade = on_trade             # 9:00 後 trader 掛的 trade handler; None = 忽略
+        self._context_book = self._context_trade = None
         self.login_cfg = login_cfg          # config.Config — 給 multi-SDK 用 login 資訊
         self.recorder = recorder             # TickRecorder — 存 raw tick，可 None
         self.batch_size = batch_size
@@ -258,11 +259,13 @@ class Subscriber:
             last_books = b
             last_trades = t
 
-    def set_handlers(self, on_book=None, on_trade=None):
+    def set_handlers(self, on_book=None, on_trade=None, *, with_context=False):
         """9:00 handoff — trader 換掉 on_book/on_trade 邏輯，訂閱不動."""
         if on_book is not None:
+            self._context_book = on_book if with_context else None
             self.on_book = on_book
         if on_trade is not None:
+            self._context_trade = on_trade if with_context else None
             self.on_trade = on_trade
         logger.info("[subscriber] handlers 已 handoff 給 trader")
 
@@ -368,6 +371,18 @@ class Subscriber:
             return True
         epoch = st["epoch"]                      # 這條 socket 重連成功過幾次;0 = 沒斷過
         return epoch > 0 and self._last_book_epoch.get(symbol, -1) < epoch
+
+    def feed_epoch(self, symbol: str):
+        """Connection identity remains changed after the first fresh book.
+
+        is_stale alone is already false when that book reaches Trader, so a
+        consumer must also compare this identity to reset across quick reconnects.
+        """
+        idx = self._socket_index(symbol)
+        if idx >= len(self._sock_state):
+            return None
+        st = self._sock_state[idx]
+        return idx, st["gen"], st["epoch"]
 
     def stale_symbols(self, symbols) -> set:
         """symbols 當中目前過期的 (見 is_stale)。"""
@@ -1304,10 +1319,13 @@ class Subscriber:
             self._tick_counter += 1
             # 連線活著的證據: 任何一則訊息 (data / subscribed / pong …) — 看門狗據此判停擺
             now_m = time.monotonic()
+            now_wall = time.time()
             ss = self._sock_state
+            message_epoch = None
             if socket_idx < len(ss):
                 if ss[socket_idx]["gen"] != gen:
                     return
+                message_epoch = (socket_idx, gen, ss[socket_idx]["epoch"])
                 ss[socket_idx]["last_msg_mono"] = now_m
             try:
                 # 富邦 message 是 JSON string — 先 parse (若已是 dict 也接受)
@@ -1380,7 +1398,11 @@ class Subscriber:
                     try:
                         # isContinuous = 交易所權威「已逐筆(開盤後)」旗標 → 傳給 handler
                         # (filter 靠它退場,免拿開盤市價列 bids[0]=0 反推;2026-08-27 8105/1312)
-                        self.on_book(symbol, bids, asks, bool(data.get("isContinuous")))
+                        callback = self.on_book
+                        context = ({"timestamp": data.get("time"), "received_at": now_wall,
+                                    "received_mono": now_m, "feed_epoch": message_epoch}
+                                   if callback is self._context_book else {})
+                        callback(symbol, bids, asks, bool(data.get("isContinuous")), **context)
                     except Exception as e:
                         self._log_handler_exc(socket_idx, e)
                     # 存 snapshot 給 API /api/tick/{symbol} 用
@@ -1394,7 +1416,11 @@ class Subscriber:
                     # trader on_trade dispatch (08:59:58 起就掛上)
                     if self.on_trade:
                         try:
-                            self.on_trade(symbol, data)
+                            callback = self.on_trade
+                            context = ({"received_at": now_wall, "received_mono": now_m,
+                                        "feed_epoch": message_epoch}
+                                       if callback is self._context_trade else {})
+                            callback(symbol, data, **context)
                         except Exception as e:
                             self._log_handler_exc(socket_idx, e)
                     # 存 snapshot (is_trial: 盤前試撮 tick 標記 — 9:00 種子化時要跳過)
@@ -1403,6 +1429,7 @@ class Subscriber:
                             "price": data.get("price"),
                             "size": data.get("size") or data.get("qty"),
                             "is_trial": bool(data.get("isTrial")),
+                            "time": data.get("time"),
                             "ts": datetime.now().isoformat(timespec="microseconds"),
                         }
 

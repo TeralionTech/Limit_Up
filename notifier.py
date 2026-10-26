@@ -46,6 +46,7 @@ _LEVEL_ORDER = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 
 # (最低 levelno, 正規式) — 訊息符合任一條就轉發；CRITICAL 不看正規式
 _RULES: List[Tuple[int, re.Pattern]] = [
+    (logging.WARNING, re.compile(r"\[pull\]")),
     (logging.ERROR, re.compile(r"主流程例外|連線失敗|出場|隔日賣|今日不交易|預掛|盲送|撤單例外|撤單失敗|快照失敗|pre-order")),
     (logging.WARNING, re.compile(
         r"出場 —|出場賣單|隔日賣 \S+ (觸發賣出|中止賣出)|隔日賣 \S+ 連 \d+ 次|🌙 隔日賣|緊急全平|armed = |拒絕連線|"

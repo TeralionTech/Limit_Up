@@ -25,8 +25,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, Optional
+
+from pull_runtime import PullEvents, PullSignalWriter, PullStream, exchange_time, trading_day
+from pull_signal import PullExitConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,10 @@ class Holding:
         self.last_ask1_size = 0
         self.last_trade_price = 0.0
         self.last_book_ts = ""
+        self.pull_signal = None
+        self.pull_stream = None
+        self._pull_open_day = None
+        self._pull_retry_mono = 0.0
 
 
 class Trader:
@@ -74,7 +83,8 @@ class Trader:
 
     def __init__(self, watchlist, limit_ups, cfg,
                  recorder=None, state=None, unsub_fn: Optional[Callable] = None,
-                 session=None, dispositions: Optional[dict] = None):
+                 session=None, dispositions: Optional[dict] = None,
+                 subscriber=None, pull_writer=None):
         """
         watchlist: List[str] — filter 結束時的 marked 名單
         limit_ups: Dict[str, float] — 每檔漲停價
@@ -93,6 +103,12 @@ class Trader:
         self.state = state
         self.unsub_fn = unsub_fn
         self.session = session
+        self.subscriber = subscriber
+        self._pull_lock = threading.RLock()
+        self._pull_events = PullEvents()
+        self._pull_thread = None
+        output_dir = getattr(cfg, "output_dir", None) or Path(__file__).parent / "output"
+        self._pull_writer = pull_writer or PullSignalWriter(output_dir)
         self._stop = threading.Event()
         live = bool(session and session.is_live())
         logger.info(f"[trader] 建立 — {'真實交易' if live else '純監控'} {len(self.holdings)} 檔")
@@ -102,16 +118,28 @@ class Trader:
     def start(self):
         """無獨立 thread — 邏輯全在 on_book/on_trade handlers (下單動作交給 session)。"""
         logger.info("[trader] 啟動 (下單與否由 session mode/armed 決定)")
+        self._pull_thread = threading.Thread(target=self._pull_loop, name="pull-evaluator", daemon=True)
+        self._pull_thread.start()
 
     def stop(self):
         self._stop.set()
+        if self._pull_thread is not None:
+            self._pull_thread.join(timeout=2)
+        with self._pull_lock:
+            self._pull_writer.close()
 
     # ─── 掛 subscriber 的 handlers ─────────────────────────
 
-    def on_book(self, symbol: str, bids: list, asks: list, is_continuous: bool = False):
+    def on_book(self, symbol: str, bids: list, asks: list, is_continuous: bool = False,
+                *, timestamp=None, received_at=None, received_mono=None, feed_epoch=None):
         # is_continuous: subscriber 傳來的交易所「已逐筆」旗標 — trader 不需要 (它本就是開盤後
         # 的 handler、盤中規則已防市價列),簽名對齊 subscriber 呼叫即可。
         h = self.holdings.get(symbol)
+        if h is not None:
+            mkt_lots = (int(_pick(bids[0], "size") or 0)
+                        if bids and float(_pick(bids[0], "price") or 0) <= 0 else 0)
+            self._pull_events.put("book", (h, mkt_lots, timestamp, feed_epoch),
+                                  wall=received_at, mono=received_mono)
         # 隔日賣標的: 只要在清單裡就轉送 book (顯示+算賣價),賣出規則在 session 端
         # (純盤面無狀態: 委買一跌下今日漲停 → 賣;市價列在/買牆在 = 鎖著 → 抱)。
         # 即使它同時是今日標的 (今日出場後仍要能賣昨天的量)。
@@ -210,10 +238,12 @@ class Trader:
                 self._fail_first(h, f"first_books_ask_appeared ({raw_ask1_price} × {raw_ask1_size})")
                 return
             self._maybe_enter_tracking(h)
+            self._pull_process_events()
             return
 
         # (原「委買量 tick 間減半 → 撤單/出場」規則已於 2026-08-19 移除:
         #  出場只看上面的支撐隊伍消失;單子一定會被成交,不需撤單保護)
+        self._pull_process_events()
 
     def _update_decline_warning(self, h: Holding, bid1_size: int):
         """每 BID_DECLINE_SAMPLE_SEC 取樣一次委買一量;
@@ -236,7 +266,8 @@ class Trader:
                          f"(每 {self.cfg.bid_decline_sample_sec}s 一次)")
             logger.warning(f"[trader] ⚠ {h.symbol} {h.warning}")
 
-    def on_trade(self, symbol: str, trade_data: dict):
+    def on_trade(self, symbol: str, trade_data: dict, *, received_at=None,
+                 received_mono=None, feed_epoch=None):
         # 試撮 tick (集合競價的模擬撮合,isTrial=true) 不是真成交 —
         # 不記首筆、不觸發任何單 (2026-08-10 2491 事故;深度防禦,主要過濾在 runner)
         if _pick(trade_data, "isTrial"):
@@ -248,9 +279,13 @@ class Trader:
             return
 
         price = float(_pick(trade_data, "price") or 0)
+        pull_seed_duplicate = bool(_pick(trade_data, "_pull_seed") and h.first_trade_seen)
         qty = int(_pick(trade_data, "size") or _pick(trade_data, "qty") or 0)
         if price <= 0:
             return
+        if not pull_seed_duplicate:
+            self._pull_events.put("trade", (h, {"time": _pick(trade_data, "time")}, qty, feed_epoch),
+                                  wall=received_at, mono=received_mono)
         # 首筆真成交到 → 標記「已開盤」(filter 退場,不再誤判開盤市價列;2026-08-27 8105/1312)。
         # 冪等;開盤撮種子化 (runner 建 trader 後補餵 buffer 首筆) 也走這條 → 一併立旗標。
         if self.state is not None:
@@ -275,6 +310,205 @@ class Trader:
             # (session 盲送 thread 讀 first_trade_fired 送最後一筆後停)
             if self.session is not None:
                 self.session.on_first_trade(symbol)
+
+        self._pull_process_events()
+
+    # ─── 大單抽掉訊號 (只新增觸發點;既有出場/撤單語意不動) ───
+
+    def configure_pull_exit(self, **values):
+        # API and evaluation share this lock: once mode=off returns, no queued
+        # pull evaluation can still start an exit using the old configuration.
+        with self._pull_lock:
+            result = self.session.set_pull_exit(**values)
+            self._pull_events.clear()
+            for h in self.holdings.values():
+                h.pull_stream = None
+            return result
+
+    def _pull_config(self):
+        cfg = getattr(self.session, "pull_exit", None)
+        return cfg if isinstance(cfg, PullExitConfig) else PullExitConfig()
+
+    def _pull_eligible(self, h, cfg):
+        return (not self._stop.is_set() and cfg.mode != "off"
+                and h.status in (Holding.TRACKING, Holding.PULLED)
+                and not self.dispositions.get(h.symbol)
+                and not (self.session.has_overnight(h.symbol)
+                         and self.session.get_symbol_state(h.symbol) is None))
+
+    def _pull_feed(self, h):
+        if self.subscriber is None:
+            return False, None
+        return self.subscriber.is_stale(h.symbol), self.subscriber.feed_epoch(h.symbol)
+
+    def _pull_stream(self, h, cfg, epoch):
+        if h.pull_signal is None:
+            h.pull_signal = self.session.get_pull_signal(h.symbol)
+        if h.pull_stream is None or h.pull_stream.cfg != cfg:
+            h.pull_stream = PullStream(cfg)
+        stale, current_epoch = self._pull_feed(h)
+        stream = h.pull_stream
+        stream.check_epoch(current_epoch if current_epoch is not None else epoch)
+        if stale or (epoch is not None and current_epoch is not None and epoch != current_epoch):
+            stream.reset()
+            return None
+        return stream
+
+    def _pull_book(self, h, lots, raw_ts, received_at, received_mono, epoch):
+        wall = time.time() if received_at is None else received_at
+        mono = time.monotonic() if received_mono is None else received_mono
+        with self._pull_lock:
+            cfg = self._pull_config()
+            if not self._pull_eligible(h, cfg):
+                h.pull_stream = None
+                return
+            stream = self._pull_stream(h, cfg, epoch)
+            if stream is None:
+                return
+            ts = stream.timestamp(raw_ts, wall)
+            day = trading_day(ts, cfg.cutoff)
+            if not day or day != trading_day(wall, cfg.cutoff) or h._pull_open_day != day:
+                stream.reset()
+                return
+            self._pull_retry(h, mono)
+            if h.pull_signal is not None:
+                return
+            if stream.book(ts, lots, mono):
+                self._pull_drain(h, stream, mono)
+
+    def _pull_trade(self, h, data, size, received_at, received_mono, epoch):
+        wall = time.time() if received_at is None else received_at
+        mono = time.monotonic() if received_mono is None else received_mono
+        with self._pull_lock:
+            cfg = self._pull_config()
+            raw_ts = _pick(data, "time")
+            ts = exchange_time(raw_ts)
+            day = trading_day(wall if ts is None else ts, cfg.cutoff)
+            if day and day == trading_day(wall, cfg.cutoff):
+                h._pull_open_day = day  # Includes off mode, for a later manual enable.
+            if not self._pull_eligible(h, cfg):
+                return
+            stream = self._pull_stream(h, cfg, epoch)
+            if stream is None:
+                return
+            ts = stream.timestamp(raw_ts, wall)
+            if not day or day != trading_day(wall, cfg.cutoff):
+                stream.reset()
+                return
+            if h.pull_signal is None:
+                anchor = (stream.last_book_mono if stream.last_book_mono is not None
+                          else stream.first_trade_mono)
+                if anchor is not None and mono - anchor > cfg.max_gap_sec:
+                    stream.reset()
+                if stream.first_trade_mono is None:
+                    stream.first_trade_mono = mono
+                # Seal overdue books before accepting this print. Receipt lag
+                # is a deadline even if the evaluator was descheduled.
+                self._pull_drain(h, stream, mono)
+            if h.pull_signal is not None:
+                # A late print that would have prevented a fired signal is the
+                # most important lag diagnostic; continue counting it, no replay.
+                result = "late" if ts <= h.pull_signal["ts"] else "accepted"
+            else:
+                result = stream.detector.on_trade(ts, size)
+            # `volume` unit is not verified against a captured production tape;
+            # use the locally evidenced lots-valued `size` only, per spec.
+            if result == "late":
+                stream.late_count += 1
+                if stream.late_count == 1 or stream.late_count % 100 == 0:
+                    self._pull_writer.submit(f"[pull] {h.symbol} 成交晚於判斷 lag，不追溯 count={stream.late_count}")
+            elif result == "unordered":
+                stream.reset()
+                self._pull_writer.submit(f"[pull] {h.symbol} 成交時間倒退，清空視窗重新 arm")
+
+    def _pull_drain(self, h, stream, mono):
+        while stream.pending and stream.pending[0][0] <= mono:
+            _, ts, lots = stream.pending.popleft()
+            own, target = self.session.pull_inputs(h.symbol, ts)
+            signal = stream.detector.on_book(ts, lots, own_cancels=own,
+                                             fleet_lots=stream.cfg.fleet_nodes * target)
+            if signal is not None:
+                h._pull_retry_mono = mono
+                self._pull_fire(h, signal, stream.cfg.mode)
+                stream.pending.clear()
+                return
+
+    def _pull_fire(self, h, signal, mode):
+        action = "shadow" if mode == "shadow" else "no_exposure"
+        if mode == "on":
+            exposure, filled = self.session.prepare_pull_exit(h.symbol)
+            if exposure:
+                self.session.exit_position(h.symbol, "mkt_queue_pulled")
+                action = "exit_position"
+        else:
+            exposure = self.session.has_exposure(h.symbol)
+            filled = self.session.get_filled_lots(h.symbol)
+        row = {**signal, "symbol": h.symbol, "mode": mode, "filled_lots": filled,
+               "has_exposure": exposure, "action": action}
+        h.pull_signal = row
+        self.session.record_pull_signal(h.symbol, row)
+        self._pull_writer.submit(
+            f"[pull] {h.symbol} 大單抽掉訊號({mode}) — {signal['window_sec']:g} s "
+            f"抽 {signal['cancels']:g} 張 / 隊伍 {signal['q_before']:g} 張 "
+            f"({signal['cancels'] / signal['q_before'] * 100:.1f}%) / "
+            f"成交 {signal['trades']:g} 張 / 起算後 {signal['armed_s']:g} s / "
+            f"持倉 {filled} 張 / 有委託 {exposure}", row)
+
+    def _pull_retry(self, h, mono):
+        if (h.pull_signal and h.pull_signal["mode"] == "on"
+                and mono - h._pull_retry_mono >= 5):
+            h._pull_retry_mono = mono
+            if self.session.exit_pending_after_elimination(h.symbol):
+                self.session.exit_position(h.symbol, "mkt_queue_pulled")
+
+    def poll_pull_signals(self, *, now_mono=None, now_wall=None):
+        self._pull_events.put("poll", wall=now_wall, mono=now_mono)
+        self._pull_process_events()
+
+    def _pull_process_events(self):
+        # Only this consumer may ingest prints/books or seal expired readings.
+        # Registration remains available even while a legacy callback or this
+        # consumer is waiting for state/session locks.
+        with self._pull_lock:
+            while (event := self._pull_events.pop()) is not None:
+                kind, args, wall, mono = event
+                if kind == "trade":
+                    h, data, size, epoch = args
+                    self._pull_trade(h, data, size, wall, mono, epoch)
+                elif kind == "book":
+                    h, lots, raw_ts, epoch = args
+                    self._pull_book(h, lots, raw_ts, wall, mono, epoch)
+                else:
+                    self._pull_poll(mono, wall)
+
+    def _pull_poll(self, mono, wall):
+        with self._pull_lock:
+            cfg = self._pull_config()
+            for h in self.holdings.values():
+                if not self._pull_eligible(h, cfg):
+                    h.pull_stream = None
+                    continue
+                self._pull_retry(h, mono)
+                stream = h.pull_stream
+                if stream is None:
+                    continue
+                stale, epoch = self._pull_feed(h)
+                if epoch is not None:
+                    stream.check_epoch(epoch)
+                if (stale or not trading_day(wall, cfg.cutoff)
+                        or (stream.last_book_mono is not None
+                            and mono - stream.last_book_mono > cfg.max_gap_sec)):
+                    stream.reset()
+                    continue
+                self._pull_drain(h, stream, mono)
+
+    def _pull_loop(self):
+        # Flush the last queued reading even when there is no subsequent tick.
+        while not self._stop.wait(0.05):
+            try:
+                self.poll_pull_signals()
+            except Exception:
+                logger.exception("[pull] 延後判斷失敗")
 
     # ─── 狀態轉換 ──────────────────────────────────────────
 
@@ -354,6 +588,7 @@ class Trader:
                 "first_trade": h.first_trade or None,
                 "fail_reason": h.first_fail_reason,
                 "trade": trade,
+                "pull_signal": h.pull_signal,
             })
             if h.status in (Holding.TRACKING, Holding.PULLED, Holding.ABANDONED):
                 tracking.append({
@@ -370,6 +605,7 @@ class Trader:
                     "last_trade_price": h.last_trade_price,
                     "last_book_ts": h.last_book_ts,
                     "trade": trade,
+                    "pull_signal": h.pull_signal,
                 })
         n_track = sum(1 for h in self.holdings.values() if h.status == Holding.TRACKING)
         n_pulled = sum(1 for h in self.holdings.values() if h.status == Holding.PULLED)

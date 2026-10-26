@@ -382,7 +382,12 @@ class TradingSession:
     """交易會話 — broker 連線 + 模式 + 預算 + 交易 state。"""
 
     def __init__(self, auto_cancel_worker: bool = True):
+        from pull_signal import PullExitConfig
         self._lock = threading.RLock()
+        self.pull_exit = PullExitConfig()
+        self._pull_signals = {}
+        self._pull_cancels = {}
+        self._pull_cancel_seen = set()
         self.mode: str = "sim"            # "sim" / "real"
         self.armed: bool = False          # kill switch — True 才會真下單
         # 「開始隔日賣」(2026-10-14): armed 但 entry_enabled=False → 只做隔日賣 / 既有部位出場 / 撤單
@@ -505,6 +510,9 @@ class TradingSession:
             self._trade_date = date_str
             self.trades.clear()
             self.order_log.clear()
+            self._pull_signals.clear()
+            self._pull_cancels.clear()
+            self._pull_cancel_seen.clear()
             self._processed_fills.clear()
             self.budget_used = 0.0
             self._buy_cost_actual = 0.0       # 每日重置實際買進累計
@@ -1262,6 +1270,7 @@ class TradingSession:
                 return
             if not symbol and row is not None:
                 symbol = row.get("symbol", "")
+            self._note_pull_cancel_locked(order_no, "request")
             item = self._cancel_queue.get(order_no)
             if item is None:
                 self._cancel_queue[order_no] = {
@@ -1699,6 +1708,8 @@ class TradingSession:
         def _one(no, it, entry):
             try:
                 self._rate.acquire()
+                with self._lock:
+                    self._note_pull_cancel_locked(no, "sent")
                 if entry.get("_direct"):
                     # 免查詢: broker 用它記下的下單回傳物件撤 (不查全清單)
                     broker.cancel_cached(no, it["symbol"], it["reason"])
@@ -1841,6 +1852,7 @@ class TradingSession:
         但不重複計數「已確認」、不重複告警、不重複觸發晚結案 hook。"""
         with self._lock:
             row = self.order_log.get(order_no)
+            self._note_pull_cancel_locked(order_no, "confirmed")
             fresh = ((row is not None and row["status"] == "pending")
                      or order_no in self._cancel_queue)
             self._mark_order(order_no, "cancelled")
@@ -2209,6 +2221,8 @@ class TradingSession:
         立刻補成交或留佇列核實,caller 不必再呼叫) /
         'queued' (查無/查詢失敗/非終端錯 → 已入佇列;enqueue=False 時回 'not_found'|'lookup'|'retry')。
         **任何非終端失敗都不標 cancelled、不動 st.order_no、不釋放預算。**"""
+        with self._lock:
+            self._note_pull_cancel_locked(order_no, "request")
         self._rate.acquire()
         # 只在免查詢撤單啟用時才走這條捷徑 — 停用 / CANCEL_DIRECT_OBJ=0 時撤單路徑要與修法前完全相同
         # (一律先問券商;那個模式本來每次撤單都查清單,省這一次沒有意義)
@@ -2226,6 +2240,8 @@ class TradingSession:
                     # 為一筆已撤的單凍住 process (出場 worker 撤 P 時就凍在賣單之前;第三輪審查)
                     return "already_cancelled"
         try:
+            with self._lock:
+                self._note_pull_cancel_locked(order_no, "sent")
             self.broker.cancel(order_no, symbol, reason=reason)
             return "ok"
         except Exception as e:     # noqa: BLE001 — 例外/回傳失敗都要接 (踩雷點 #8)
@@ -3607,6 +3623,7 @@ class TradingSession:
             if (o is not None and fill["action"] == "sell"
                     and fill["order_no"] == o["sell_order_no"]):
                 o["sold_lots"] = min(o["lots"], o["sold_lots"] + lots)
+                return      # This order belongs to yesterday, never today's st.
             st = self.trades.get(fill["symbol"])
             if st is None:
                 if o is None:
@@ -3646,10 +3663,11 @@ class TradingSession:
                 # 淘汰後成交落地 (2026-10-20 8089): 第一盤淘汰時回報還沒到 → 沒出場過、也不會再有出場訊號
                 # (trader 已丟棄這檔) → 這裡直接觸發整檔出場
                 fire_exit = self._exit_on_fill_due_locked(st)
-            else:   # sell (出場)
+            elif (fill["action"] == "sell" and row is not None
+                  and row.get("symbol") == st.symbol
+                  and row.get("kind") in ("limit_sell", "market_sell")):
                 st.filled_lots = max(0, st.filled_lots - lots)
-                if row is not None and row.get("kind") in ("limit_sell", "market_sell"):
-                    self._reset_exit_backoff_locked(st)   # 策略出場賣單真的成交 → 出場失敗輪次/冷卻歸零
+                self._reset_exit_backoff_locked(st)   # 策略出場賣單真的成交 → 出場失敗輪次/冷卻歸零
         if late_fill_lots > 0:
             self._start_late_fill_exit(fill["symbol"], late_fill_lots, fill["order_no"])
         if fire_exit:
@@ -3873,6 +3891,57 @@ class TradingSession:
 
     # ─── 查詢 ──────────────────────────────────────────────
 
+    def set_pull_exit(self, **values):
+        with self._lock:
+            self.pull_exit = self.pull_exit.updated(values)
+            return self.pull_exit.to_dict()
+
+    def prepare_pull_exit(self, symbol):
+        """Atomically stop entry, protect future fills and snapshot exposure.
+
+        A fill before this lock is included in the snapshot; one after it sees
+        exit_on_fill. Caller starts exit_position only after releasing the lock.
+        """
+        with self._lock:
+            self.stop_entry(symbol, "mkt_queue_pulled")
+            self.mark_exit_on_fill(symbol, "mkt_queue_pulled")
+            return self.has_exposure(symbol), self.get_filled_lots(symbol)
+
+    def _note_pull_cancel_locked(self, order_no, phase):
+        """Audit only; never changes cancellation/position state. Caller holds lock.
+
+        Requests conservatively mask the outstanding amount even if subsequently
+        rejected. A confirmation refreshes the window, but never double counts
+        the same order. Sell orders (including overnight) are excluded.
+        """
+        from pull_signal import CancelWindow
+        key = (order_no, phase)
+        row = self.order_log.get(order_no)
+        if ((phase != "sent" and key in self._pull_cancel_seen)
+                or row is None or row.get("action") != "buy"):
+            return
+        lots = max(0, int(row.get("lots") or 0) - int(row.get("filled_lots") or 0))
+        self._pull_cancel_seen.add(key)
+        if lots:
+            ledger = self._pull_cancels.setdefault(row["symbol"], CancelWindow())
+            ledger.add(time.time(), order_no, lots)
+
+    def pull_inputs(self, symbol, ts):
+        """O(1) amortized, local memory only; no broker calls or log/file I/O."""
+        with self._lock:
+            st = self.trades.get(symbol)
+            ledger = self._pull_cancels.get(symbol)
+            return (ledger.at(ts) if ledger else 0, st.target_lots if st else 0)
+
+    def record_pull_signal(self, symbol, signal):
+        with self._lock:
+            self._pull_signals[symbol] = dict(signal)
+
+    def get_pull_signal(self, symbol):
+        with self._lock:
+            signal = self._pull_signals.get(symbol)
+            return dict(signal) if signal is not None else None
+
     def has_exposure(self, symbol: str) -> bool:
         """該檔有未成交委託或持倉 (且未出場) — trader 判斷要不要觸發出場用。"""
         with self._lock:
@@ -3890,7 +3959,7 @@ class TradingSession:
     def get_symbol_state(self, symbol: str) -> Optional[dict]:
         with self._lock:
             st = self.trades.get(symbol)
-            return st.to_dict() if st else None
+            return {**st.to_dict(), "pull_signal": self._pull_signals.get(symbol)} if st else None
 
     def spending_summary(self) -> dict:
         """花費表 (前端顯示;只看實際成交)。各檔實際花費 + 超額;總實際花費 + 總預算超額。
@@ -3932,6 +4001,7 @@ class TradingSession:
                 "is_test": False, "error": ""}
             return {
                 "mode": self.mode,
+                "pull_exit": self.pull_exit.to_dict(),
                 "armed": self.armed,
                 # 「開始隔日賣」(2026-10-14): off / trade / overnight_only (armed 但不進場)
                 "entry_enabled": self.entry_enabled,
