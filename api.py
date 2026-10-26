@@ -17,12 +17,14 @@ from pydantic import BaseModel
 import pnl
 import symbol_budget
 import trading_config
+from live_days import router as live_days_router
 from config import ConfigError, load_config
 from runner import Runner
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["hit-limit-up"])
+router.include_router(live_days_router)
 
 
 # ─── 全域狀態 ────────────────────────────────────────────────

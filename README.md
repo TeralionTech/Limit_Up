@@ -3,6 +3,70 @@
 > 📌 **策略權威說明見 [docs/strategy.md](docs/strategy.md)**(反映目前實際程式行為;改策略先改它再改碼)。
 > 以下為早期模擬版說明,保留作歷史參考。
 
+## 中控實盤資料唯讀端點（live days v2）
+
+供 central hub 的 **strategy-health collector** 收集搶漲停實盤資料；本功能不建立健康燈、monitor 或回測替身。
+兩支端點只讀程式目錄下 `output/` 的既有檔案，不呼叫 Runner、券商、連線、arm、庫存刷新或寫檔。
+
+| GET 路徑 | 回應 |
+|---|---|
+| `/api/central/live-days?date=YYYY-MM-DD` | 指定日期的 CSV 成交、orders 檔存在旗標、最後持倉快照 |
+| `/api/central/live-days/dates` | `{"dates":[{"date":"2026-10-22","row_count":2,"skipped_rows":0,"truncated":false,"header_valid":true}],"truncated":false}`，日期升冪 |
+
+**認證：**兩支 GET 都要求 `X-Limitup-Token` 等於服務程序環境變數 `LIMITUP_API_TOKEN`，沿用既有修改端點的 header／env 與 UTF-8 bytes 常數時間比對。
+缺少或錯誤 header 回 401；env 未設或空字串回 503；每次請求讀取 env，loopback 也必須認證。
+既有 GET 與 POST 中介層不變。部署前操作者須逐台確認服務程序已載入非空 `LIMITUP_API_TOKEN`，並與 collector 一致；不要印出 token。
+
+`date` 必須是 ASCII `YYYY-MM-DD` 且為真實日期；缺參數、無效日期、路徑穿越回 422。
+當日 `YYYY-MM-DD_fills.csv` 不存在回 **404 `{"error":"no_data"}`**，即使 orders 或持倉檔存在也一樣。
+輸出目錄不存在不會建立；檔案讀取失敗回 503，拒絕 symlink 或解析後離開輸出目錄的檔案。
+
+單日成功回應範例（其餘診斷旗標見下）：
+
+```json
+{
+  "date": "2026-10-22",
+  "fills": [{
+    "fill_key": "<sha1>", "identity": "strong", "order_no": "A001",
+    "filled_no": "F001", "symbol": "2330", "side": "buy", "lots": 2,
+    "price": 900.5, "filled_at": "2026-10-22T09:00:00.123000+08:00",
+    "strategy": 1, "source": "fills_csv"
+  }],
+  "orders_file": true,
+  "positions_after": [],
+  "complete": {
+    "fills_file": true, "positions_snapshot": true, "all_fills": false,
+    "reason": "callback CSV only; reconcile_orders fills are not written to this CSV"
+  },
+  "skipped_rows": 0, "truncated": false,
+  "fills_truncated": false, "positions_truncated": false, "positions_skipped_rows": 0,
+  "generated_at": "2026-10-22T13:40:00+08:00"
+}
+```
+
+- CSV 欄位與 `trading_session.py::_append_fill_csv` 完全一致：
+  `recv_time,symbol,action,price,lots,quantity,order_no,filled_no,broker_filled_time,strategy`。
+  `quantity` 是股數；現有 writer 的 `lots` 來自 `quantity // 1000`，因此 API 用 `quantity / 1000` 還原，整張回 int、零股回小數。
+  `action` 只接受 `buy`／`sell`，價格須正且有限；壞列跳過並計入 `skipped_rows`。
+- `filled_at` 優先用 `broker_filled_time`（`HH:MM:SS[.ffffff]` 加指定日期，或完整 ISO 時間），空值才退回 `recv_time`；輸出一律 `+08:00`，日期不符或時間無效的列跳過。
+  `fill_key = sha1(UTF-8(date|order_no|filled_no|broker_filled_time|lots))`，lots 使用 API 張數的標準字串（如 `2`、`0.125`）。
+  `filled_no` 空值標 `identity="weak"`，可能碰撞，不保證跨系統唯一；端點不自行去重。
+- **`strategy=1` 只表示 `_on_fill` 收到回報當下 `order_no` 在本程序的 `order_log` 裡**，0 表示不在；這不是券商認證的策略歸屬，程序重啟或未認領書號可能使自家成交標成 0。
+  API 保留 0／1 所有列；hub collector 只選 1。**`reconcile_orders` 補收成交不經 `_append_fill_csv`，因此 CSV 不能證明當日所有成交齊全。**
+- `complete.fills_file=true` 僅代表 CSV header 正確、讀取到本次檔案大小、沒有壞列或截斷；不代表帳戶／策略成交完整。
+  `complete.all_fills` 固定 false，`reason` 明示補收缺口。`orders_file` 只查檔案存在，完全不解析內容。
+- `positions_after` 取 `positions_history.jsonl` 檔案順序中該日期最後一筆有效 record 的 `holdings`，保留其陣列；不依 `saved_at` 排序。
+  沒有同日快照回 null；空陣列表示有記錄但無持倉。最後同日 record 的 holdings 非陣列時回 null，不退回舊快照。
+  `complete.positions_snapshot` 表示找到快照且反向搜尋途中無壞列；不代表券商庫存完整。
+- 有界讀取：單日只解析該日一份 fills CSV，最多 **20,000 列（含壞列）、8 MiB、單行 64 KiB**；必須有換行才視為完整列，未完成的 append 不輸出。
+  持倉另讀檔尾最多 **8 MiB／20,000 行**，單行 64 KiB，過舊且不在尾段的快照回 null；可找到尾段最後快照時仍標記 `positions_truncated`。
+  `truncated` 是兩種截斷旗標的 OR；遇上限不宣稱整份資料完整。
+- dates 最多檢視 **10,000 目錄項目、回傳 366 日期**，按日期升冪；所有 CSV **共享 20,000 列及 8 MiB 預算**，只讀這些 CSV，不讀持倉或 orders。
+  `row_count` 是通過同一 parser 的有效成交列數；截斷時只是已讀部分，`header_valid=false`／未能讀取時為 null，不可當作當日成交總數。
+  目錄／日期上限或任一 CSV 截斷皆回頂層 `truncated=true`；讀取失敗項目另帶 `error`。
+
+這些端點不判斷交易日；collector 必須依共用契約執行交易日 guard，且只收 node1／2／3／4／6，永遠排除 node5／Lawyer。
+
 實驗性獨立 script，做多策略。
 
 **8:25-9:00 篩選階段** — 試撮期間找出試撮價鎖漲停 + 沒被賣單打開的股票
