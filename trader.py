@@ -452,7 +452,9 @@ class Trader:
             f"抽 {signal['cancels']:g} 張 / 隊伍 {signal['q_before']:g} 張 "
             f"({signal['cancels'] / signal['q_before'] * 100:.1f}%) / "
             f"成交 {signal['trades']:g} 張 / 起算後 {signal['armed_s']:g} s / "
-            f"持倉 {filled} 張 / 有委託 {exposure}", row)
+            f"持倉 {filled} 張 / 有委託 {exposure}"
+            # 「→ 出場」是中控轉發的標記 (notifier._RULES):只有真的出場才發 Signal,沒部位 / shadow 只記 log 與 CSV
+            f"{' → 出場 (撤買單＋跌停價賣)' if action == 'exit_position' else ''}", row)
 
     def _pull_retry(self, h, mono):
         if (h.pull_signal and h.pull_signal["mode"] == "on"

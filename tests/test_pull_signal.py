@@ -526,10 +526,36 @@ class TestGatesAndAudit:
         s.broker.cancel.assert_not_called()
         s.exit_position.assert_called_once_with(SYM, "mkt_queue_pulled")
 
-    def test_notifier_forwards_shadow_warning(self):
+    def test_notifier_forwards_only_real_exits(self):
+        """中控 / Signal 只收「真的出場」的訊號;沒部位、shadow 只記 log 與 CSV (使用者 2026-10-26)。"""
         from notifier import should_forward
-        assert should_forward(logging.WARNING, "[pull] 5386 大單抽掉訊號(shadow)")
+        base = ("[pull] 5386 大單抽掉訊號(on) — 10 s 抽 400 張 / 隊伍 1000 張 (40.0%) / 成交 10 張 / "
+                "起算後 30 s / 持倉 {lots} 張 / 有委託 {exp}")
+        assert should_forward(logging.WARNING, base.format(lots=3, exp=True) + " → 出場 (撤買單＋跌停價賣)")
+        assert not should_forward(logging.WARNING, base.format(lots=0, exp=False))
+        assert not should_forward(logging.WARNING,
+                                  base.replace("(on)", "(shadow)").format(lots=3, exp=True))
         assert not should_forward(logging.INFO, "[pull] detail")
+
+    def test_fire_message_marks_exit_only_with_exposure(self):
+        from unittest.mock import MagicMock
+        from trader import Trader
+        t = Trader.__new__(Trader)
+        t.session = MagicMock()
+        t._pull_writer = MagicMock()
+        h = MagicMock()
+        h.symbol = SYM
+        sig = {"window_sec": 10.0, "cancels": 400.0, "q_before": 1000.0, "trades": 10.0, "armed_s": 30.0}
+        t.session.prepare_pull_exit.return_value = (True, 3)
+        Trader._pull_fire(t, h, dict(sig), "on")
+        assert t._pull_writer.submit.call_args[0][0].endswith("→ 出場 (撤買單＋跌停價賣)")
+        t.session.prepare_pull_exit.return_value = (False, 0)
+        Trader._pull_fire(t, h, dict(sig), "on")
+        assert "→ 出場" not in t._pull_writer.submit.call_args[0][0]
+        t.session.has_exposure.return_value = True
+        t.session.get_filled_lots.return_value = 3
+        Trader._pull_fire(t, h, dict(sig), "shadow")
+        assert "→ 出場" not in t._pull_writer.submit.call_args[0][0]
 
 
 class TestOwnCancels:
