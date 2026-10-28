@@ -29,6 +29,12 @@ CSV_COLUMNS = (
     "recv_time", "symbol", "action", "price", "lots", "quantity",
     "order_no", "filled_no", "broker_filled_time", "strategy",
 )
+# 2026-10-28: TradingSession._append_fill_csv appends account_match ("1"/"0"/"")
+# and account_masked. A same-day restart after the deploy appends 12-cell rows
+# under a v1 header, so both headers accept both row widths.
+CSV_COLUMNS_V2 = CSV_COLUMNS + ("account_match", "account_masked")
+MAX_ACCOUNT_MASKED = 16
+ACCOUNT_MATCH = {"1": True, "0": False, "": None}
 
 
 def require_token(x_limitup_token: str = Header(default="")) -> None:
@@ -75,9 +81,16 @@ def filled_at(day: str, broker_time: str, recv_time: str) -> str:
 
 
 def parse_fill(day: str, cells: list[str]) -> dict:
-    if len(cells) != len(CSV_COLUMNS):
+    if len(cells) == len(CSV_COLUMNS):
+        row = dict(zip(CSV_COLUMNS, cells)) | {"account_match": "", "account_masked": ""}
+    elif len(cells) == len(CSV_COLUMNS_V2):
+        row = dict(zip(CSV_COLUMNS_V2, cells))
+    else:
         raise ValueError("wrong column count")
-    row = dict(zip(CSV_COLUMNS, cells))
+    if row["account_match"] not in ACCOUNT_MATCH:
+        raise ValueError("invalid account_match")
+    if len(row["account_masked"]) > MAX_ACCOUNT_MASKED:
+        raise ValueError("invalid account_masked")
     if not row["symbol"] or not row["order_no"] or row["action"] not in ("buy", "sell"):
         raise ValueError("missing identity or invalid side")
     if row["strategy"] not in ("0", "1"):
@@ -104,6 +117,8 @@ def parse_fill(day: str, cells: list[str]) -> dict:
         "order_no": row["order_no"], "filled_no": row["filled_no"],
         "symbol": row["symbol"], "side": row["action"], "lots": lots,
         "price": price, "filled_at": stamp, "strategy": int(row["strategy"]),
+        "account_match": ACCOUNT_MATCH[row["account_match"]],
+        "account_masked": row["account_masked"],
         "source": "fills_csv",
     }
 
@@ -146,7 +161,7 @@ def read_fills(path: Path, day: str, budget: Budget, *, count_only: bool = False
             return result
         try:
             header = next(csv.reader([raw.decode("utf-8-sig")], strict=True))
-            result["header_valid"] = header == list(CSV_COLUMNS)
+            result["header_valid"] = header in (list(CSV_COLUMNS), list(CSV_COLUMNS_V2))
         except (UnicodeError, csv.Error):
             pass
         if not result["header_valid"]:

@@ -38,6 +38,28 @@ def write_fills(root, rows, day=DAY):
     return path
 
 
+# v2 (2026-10-28): _append_fill_csv appends account_match / account_masked.
+COLUMNS_V2 = COLUMNS + ["account_match", "account_masked"]
+
+
+def write_raw(root, header, rows, day=DAY):
+    """Header and rows as plain cell lists, so v1/v2 headers and 10/12-cell rows can mix."""
+    path = root / f"{day}_fills.csv"
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(header)
+        writer.writerows(rows)
+    return path
+
+
+def v1_cells(**changes):
+    return [fill(**changes)[c] for c in COLUMNS]
+
+
+def v2_cells(match, masked="abc***", **changes):
+    return v1_cells(**changes) + [match, masked]
+
+
 def write_positions(root, records):
     (root / "positions_history.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
@@ -121,11 +143,11 @@ def test_fills_strategy_odd_lots_identity_and_time(client, tmp_path):
         {"fill_key": hashlib.sha1(f"{DAY}|A001|F001|09:00:00.123|2".encode()).hexdigest(),
          "identity": "strong", "order_no": "A001", "filled_no": "F001", "symbol": "2330",
          "side": "buy", "lots": 2, "price": 900.5, "filled_at": f"{DAY}T09:00:00.123000+08:00",
-         "strategy": 1, "source": "fills_csv"},
+         "strategy": 1, "account_match": None, "account_masked": "", "source": "fills_csv"},
         {"fill_key": hashlib.sha1(f"{DAY}|A001|||0.125".encode()).hexdigest(),
          "identity": "weak", "order_no": "A001", "filled_no": "", "symbol": "2330",
          "side": "sell", "lots": 0.125, "price": 900.5, "filled_at": f"{DAY}T09:00:01+08:00",
-         "strategy": 0, "source": "fills_csv"},
+         "strategy": 0, "account_match": None, "account_masked": "", "source": "fills_csv"},
     ]
     assert get_day(client).json()["fills"] == data["fills"]
     assert data["complete"]["fills_file"] is True
@@ -160,6 +182,79 @@ def test_corrupt_rows_skipped_and_counted(client, tmp_path, changes):
     assert len(data["fills"]) == 2
     assert data["skipped_rows"] == 4
     assert data["complete"]["fills_file"] is False
+
+
+def test_v2_header_twelve_cells_account_match(client, tmp_path):
+    write_raw(tmp_path, COLUMNS_V2, [
+        v2_cells("1", filled_no="F1"),
+        v2_cells("0", "xyz***", filled_no="F2", strategy="0"),
+        v2_cells("", "", filled_no="F3"),
+    ])
+    data = get_day(client).json()
+    assert [(f["filled_no"], f["account_match"], f["account_masked"]) for f in data["fills"]] == [
+        ("F1", True, "abc***"), ("F2", False, "xyz***"), ("F3", None, "")]
+    assert [f["strategy"] for f in data["fills"]] == [1, 0, 1]
+    assert data["skipped_rows"] == 0
+    assert data["complete"]["fills_file"] is True
+
+
+def test_v1_header_then_twelve_cell_rows_same_day_restart(client, tmp_path):
+    # File created before the deploy (10-column header + 10-cell row); the restarted
+    # program keeps appending 12-cell rows to the same file.
+    write_raw(tmp_path, COLUMNS, [v1_cells(filled_no="F1"), v2_cells("0", filled_no="F2")])
+    data = get_day(client).json()
+    assert [(f["filled_no"], f["account_match"], f["account_masked"]) for f in data["fills"]] == [
+        ("F1", None, ""), ("F2", False, "abc***")]
+    assert data["skipped_rows"] == 0
+    assert data["complete"]["fills_file"] is True
+
+
+def test_v1_rows_under_v2_header_accepted(client, tmp_path):
+    write_raw(tmp_path, COLUMNS_V2, [v1_cells(), v2_cells("1", filled_no="F2")])
+    data = get_day(client).json()
+    assert [(f["account_match"], f["account_masked"]) for f in data["fills"]] == [
+        (None, ""), (True, "abc***")]
+    assert data["skipped_rows"] == 0
+
+
+@pytest.mark.parametrize("cells", [
+    v2_cells("2"), v2_cells("true"), v2_cells("True"), v2_cells(" 1"), v2_cells("None"),
+    v2_cells("1", "x" * 17),                     # account_masked longer than 16 characters
+    v1_cells() + ["1"],                          # 11 cells
+    v2_cells("1") + [""],                        # 13 cells
+])
+def test_invalid_account_cells_skipped_and_counted(client, tmp_path, cells):
+    write_raw(tmp_path, COLUMNS_V2, [v2_cells("1"), cells, v2_cells("0", filled_no="F002")])
+    data = get_day(client).json()
+    assert len(data["fills"]) == 2
+    assert data["skipped_rows"] == 1
+    assert data["complete"]["fills_file"] is False
+
+
+def test_account_masked_sixteen_chars_accepted(client, tmp_path):
+    write_raw(tmp_path, COLUMNS_V2, [v2_cells("1", "x" * 16)])
+    assert get_day(client).json()["fills"][0]["account_masked"] == "x" * 16
+
+
+def test_fill_key_and_identity_unchanged_by_v2(client, tmp_path):
+    # The platform deduplicates on fill_key / identity: a v2 row must key exactly like
+    # the v1 row with the same identity cells, whatever its account cells say.
+    write_raw(tmp_path, COLUMNS, [v1_cells(), v1_cells(filled_no="")])
+    legacy = get_day(client).json()["fills"]
+    write_raw(tmp_path, COLUMNS_V2, [v2_cells("0", "xyz***"), v2_cells("1", filled_no="")])
+    current = get_day(client).json()["fills"]
+    assert [(f["fill_key"], f["identity"]) for f in current] == \
+        [(f["fill_key"], f["identity"]) for f in legacy]
+    assert [f["identity"] for f in current] == ["strong", "weak"]
+    assert current[0]["fill_key"] == hashlib.sha1(
+        f"{DAY}|A001|F001|09:00:00.123|2".encode()).hexdigest()
+
+
+def test_dates_accepts_v2_header(client, tmp_path):
+    write_raw(tmp_path, COLUMNS_V2, [v2_cells("1"), v2_cells("bad")])
+    result = client.get(BASE + "/dates", headers=HEADERS).json()
+    assert result == {"dates": [{"date": DAY, "row_count": 1, "skipped_rows": 1,
+                                 "truncated": False, "header_valid": True}], "truncated": False}
 
 
 def test_positions_last_record_for_date_and_orders_presence(client, tmp_path):

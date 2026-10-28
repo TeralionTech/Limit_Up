@@ -165,7 +165,7 @@ class RealOrderClient:
 
     caller 可掛的 callbacks:
       on_fill(dict)    — 成交回報 {symbol, action, price, lots, quantity, order_no,
-                          filled_no, filled_time}
+                          filled_no, filled_time, account_match, account_masked}
       on_order(dict)   — 委託回報 {order_no, symbol, status, filled_qty, error_message,
                           function_type, last_time} (撤單失敗走 err 參數的回報也轉發,不吞)
       on_disconnect()  — 交易 WS 斷線 (event 300)
@@ -1316,6 +1316,9 @@ class RealOrderClient:
             if acct and self.account_no and acct != self.account_no:
                 logger.warning(f"[broker] 成交回報帳號 {acct} != 登入 {self.account_no} "
                                f"— 仍轉發 (下游 order_no 過濾把關)")
+            # 帳號比對結果隨成交轉發 (2026-10-28 fills.csv v2): None = 無法判斷 (回報沒帶帳號 / 尚無登入帳號)
+            # → 下游行為與舊版完全相同;False = 同登入看得到的別的子帳號成交 → 下游只落檔、不動策略部位。
+            account_match = (acct == self.account_no) if (acct and self.account_no) else None
             qty = int(_attr(content, "filled_qty", "filledQty", default=0) or 0)
             fill = {
                 "symbol": str(_attr(content, "stock_no", "symbol", default="")),
@@ -1326,6 +1329,9 @@ class RealOrderClient:
                 "order_no": str(_attr(content, "order_no", "orderNo", default="")),
                 "filled_no": str(_attr(content, "filled_no", "filledNo", default="")),
                 "filled_time": str(_attr(content, "filled_time", "filledTime", default="")),
+                "account_match": account_match,
+                # 遮罩同 status() 的 account_masked (前 3 碼 + ***);回報沒帶帳號 → ""
+                "account_masked": (acct[:3] + "***") if acct else "",
             }
             logger.info(f"[broker] 成交回報 {fill['symbol']} {fill['action']} "
                         f"{fill['lots']} 張 @ {fill['price']} (order {fill['order_no']})")

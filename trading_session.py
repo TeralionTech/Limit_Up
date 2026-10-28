@@ -3538,6 +3538,9 @@ class TradingSession:
         """每筆成交回報落檔 output/YYYY-MM-DD_fills.csv (重啟不丟;每日戰績台帳)。
 
         含非策略單 (strategy=0) → 完整成交紀錄。IO 在 _on_fill 的鎖外呼叫。
+        v2 (2026-10-28) 尾端加兩欄: account_match ("1" 本帳號 / "0" 別的子帳號 / "" 無法判斷) 與
+        account_masked (回報帳號前 3 碼 + ***)。同日部署前已建檔 (10 欄表頭) 的檔照樣接 12 格列 —
+        live_days 讀取端兩種表頭、10/12 格列都收。
         """
         if not self._output_dir:
             return
@@ -3546,6 +3549,8 @@ class TradingSession:
             from datetime import datetime as _dt
             self._output_dir.mkdir(exist_ok=True)
             f = self._output_dir / f"{_dt.now().strftime('%Y-%m-%d')}_fills.csv"
+            account_match = fill.get("account_match")
+            match_cell = "1" if account_match is True else "0" if account_match is False else ""
             with self._fills_lock:
                 new = not f.exists()
                 with f.open("a", newline="", encoding="utf-8") as fh:
@@ -3553,30 +3558,52 @@ class TradingSession:
                     if new:
                         w.writerow(["recv_time", "symbol", "action", "price", "lots",
                                     "quantity", "order_no", "filled_no",
-                                    "broker_filled_time", "strategy"])
+                                    "broker_filled_time", "strategy",
+                                    "account_match", "account_masked"])
                     w.writerow([
                         _dt.now().isoformat(timespec="seconds"),
                         fill.get("symbol", ""), fill.get("action", ""),
                         fill.get("price", 0), fill.get("lots", 0), fill.get("quantity", 0),
                         fill.get("order_no", ""), fill.get("filled_no", ""),
                         fill.get("filled_time", ""), 1 if is_strategy else 0,
+                        match_cell, str(fill.get("account_masked") or ""),
                     ])
         except Exception as e:
             logger.error(f"[session] 寫成交台帳失敗: {e}")
 
     def _on_fill(self, fill: dict):
         """成交回報 → 更新 filled_lots/avg_price。去重 (day-trade 模式) + 落檔台帳。"""
+        account_match = fill.get("account_match")
         key = f"{fill['order_no']}:{fill['filled_no']}:{fill['filled_time']}:{fill['lots']}"
+        if account_match is False:
+            # 別的子帳號成交另立去重空間 (tuple 永不等於本帳號/無法判斷的字串 key) — 否則它先到時佔住 key,
+            # 本帳號同 key 的真成交 (書號/成交序號 [含空的]/時間/張數全同) 會被當重複丟掉 → 漏記部位、
+            # 買進金額、台帳與成交後出場保護 (Codex 審查 P1)。別帳號之間同 key 仍互相去重 (同舊版);
+            # 不用遮罩帳號區分 (前 3 碼不唯一)。
+            key = ("other", key)
         with self._lock:
             if key in self._processed_fills:
                 return
             self._processed_fills.add(key)
             # 只認「策略下過的單」(order_no ∈ order_log) — 同帳號手動單的成交
             # 不能混進策略部位 (否則差額算錯 + 出場連手動部位一起賣)
-            is_strategy = fill["order_no"] in self.order_log
+            # 2026-10-28: 且不是確定屬於別的子帳號 (account_match False) — 同登入看得到的別的子帳號成交,
+            # 書號剛好撞到本策略委託也不得動部位。account_match None (無法判斷) → 與舊版完全相同。
+            in_order_log = fill["order_no"] in self.order_log
+            is_strategy = in_order_log and account_match is not False
+        if in_order_log and account_match is False:
+            logger.warning(f"[session] ⚠ {fill.get('symbol', '')} 別的子帳號成交 "
+                           f"({fill.get('account_masked') or '-'}) 書號 {fill['order_no']} 與本策略委託相同 — "
+                           f"不視為策略成交 (不動持倉/均價/預算/出場),僅落檔")
         # 每筆成交都落檔 (鎖外 IO;含非策略單 → 完整成交台帳,重啟不丟)
         self._append_fill_csv(fill, is_strategy)
         if not is_strategy:
+            if account_match is False:
+                # 別的子帳號的成交 — 不是本帳號的策略外賣出,不發「策略外賣出成交」告警
+                logger.info(f"[session] 其他帳號成交,忽略 (僅落檔): {fill.get('symbol', '')} "
+                            f"order={fill['order_no']} {fill.get('lots', 0)} 張 "
+                            f"帳號 {fill.get('account_masked') or '-'}")
+                return
             held = 0
             if fill.get("action") == "sell":
                 with self._lock:
