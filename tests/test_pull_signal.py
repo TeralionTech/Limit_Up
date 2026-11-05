@@ -72,6 +72,15 @@ def poll(t, sec):
     t.poll_pull_signals(now_mono=sec, now_wall=BASE + sec)
 
 
+def poll_between(t, start, end):
+    """Keep the consumer alive at the production timer's 0.05s cadence."""
+    sec = start + 0.05
+    while sec < end:
+        poll(t, sec)
+        sec += 0.05
+    poll(t, end)
+
+
 def arm(t):
     for sec in (0, 2, 4, 5):
         book(t, sec, 100)
@@ -327,15 +336,167 @@ class TestLagAndClock:
         assert "時間倒退" in audit.items[-1][0]
 
     @pytest.mark.parametrize("gap_kind", ["receive", "exchange"])
-    def test_gap_resets_before_draining_pending_books(self, gap_kind):
+    def test_book_gap_preserves_arm_and_counts_pending_cancels(self, gap_kind):
+        t, _, h, _ = make_trader()
+        arm(t)
+        armed_at = h.pull_stream.detector.armed_at
+        book(t, 6, 90)  # 10 cancels alone cannot fire before the gap.
+        poll_between(t, 6, 7 if gap_kind == "exchange" else 12)
+        book(t, 12 if gap_kind == "exchange" else 7, 60,
+             received=7 if gap_kind == "exchange" else 12)
+        poll(t, 8 if gap_kind == "exchange" else 13)
+        assert h.pull_signal["cancels"] == 40
+        assert h.pull_signal["ts"] == BASE + (12 if gap_kind == "exchange" else 7)
+        assert h.pull_stream.detector.armed_at == armed_at == BASE
+
+    def test_4923_quiet_book_gap_does_not_delay_pull_until_new_grace(self, monkeypatch):
+        monkeypatch.setitem(globals(), "SYM", "4923")
+        monkeypatch.setitem(globals(), "BASE", datetime(2026, 10, 26, 9, 0, tzinfo=TAIPEI).timestamp())
+        t, _, h, _ = make_trader()
+        previous = 0
+        for sec in (0, 4, 5, 9, 13, 16.44):
+            poll_between(t, previous, sec)
+            book(t, sec, 3898)
+            previous = sec
+        # No book for 5.02s. The old trade gap reset rearmed at 21.46,
+        # so its new grace would end at 26.46, after the pull at 26.395.
+        poll_between(t, previous, 21.46)
+        trade(t, 21.46, 1)
+        book(t, 21.46, 3898)
+        poll_between(t, 21.46, 26.395)
+        book(t, 26.395, 1864)
+        assert h.pull_signal is None  # The receipt lag still applies.
+        poll_between(t, 26.395, 27.395)
+        assert h.pull_signal is not None
+        assert h.pull_signal["ts"] == pytest.approx(BASE + 26.395, rel=0, abs=1e-6)
+        assert h.pull_signal["cancels"] == 2034
+        assert h.pull_signal["trades"] == 1
+        assert h.pull_stream.detector.armed_at == BASE
+
+    def test_quiet_poll_keeps_arm_and_drains_overdue_book(self):
+        t, _, h, _ = make_trader()
+        arm(t)
+        detector = h.pull_stream.detector
+        poll_between(t, 6, 10.02)  # More than 5s since the last received book.
+        assert h.pull_stream.detector is detector and detector.armed_at == BASE
+        book(t, 10.03, 60)
+        poll_between(t, 10.03, 16.04)
+        assert h.pull_signal["cancels"] == 40
+        assert h.pull_stream.detector is detector
+
+    def test_trade_after_quiet_gap_seals_overdue_book_before_accepting_print(self):
         t, _, h, _ = make_trader()
         arm(t)
         book(t, 6, 60)
-        book(t, 12 if gap_kind == "exchange" else 7, 20,
-             received=7 if gap_kind == "exchange" else 12)
-        poll(t, 8 if gap_kind == "exchange" else 13)
+        poll_between(t, 6, 11.02)
+        trade(t, 6, 40, received=11.02)
+        assert h.pull_signal["cancels"] == 40 and h.pull_signal["trades"] == 0
+        assert h.pull_stream.late_count == 1
+
+    def test_backward_book_discards_pending_and_requires_fresh_grace(self):
+        t, _, h, _ = make_trader()
+        arm(t)
+        book(t, 6, 60)
+        book(t, 5.5, 20, received=6.5)
+        poll(t, 7)
+        assert h.pull_signal is None and not h.pull_stream.pending
+        assert h.pull_stream.detector.armed_at is None
+        book(t, 8, 100)
+        poll(t, 9)
+        book(t, 12, 60)
+        poll(t, 13)
         assert h.pull_signal is None
-        assert h.pull_stream.detector.armed_at == BASE + (12 if gap_kind == "exchange" else 7)
+        book(t, 13, 30)
+        poll(t, 14)
+        assert h.pull_signal["cancels"] == 30 and h.pull_signal["armed_s"] == 5
+
+    @pytest.mark.parametrize("kind", ["trade", "book", "poll"])
+    @pytest.mark.parametrize("gap", [5.0, 5.01])
+    def test_consumer_gap_resets_before_dispatch_only_above_limit(self, kind, gap):
+        t, s, h, audit = make_trader("on")
+        arm(t)
+        detector = h.pull_stream.detector
+        book(t, 6, 60)
+        sec = 6 + gap  # No intervening timer: this represents a process pause.
+        if kind == "trade":
+            trade(t, 6, 40, received=sec)
+        elif kind == "book":
+            book(t, sec, 60)
+        else:
+            poll(t, sec)
+        if gap > 5:
+            assert h.pull_stream.detector is not detector
+            assert h.pull_stream.detector.armed_at is None
+            assert all(ts > BASE + 6 for _, ts, _ in h.pull_stream.pending)
+            assert h.pull_signal is None
+            s.exit_position.assert_not_called()
+            assert len(audit.items) == 1
+            assert audit.items[0][0].startswith("[pull]")
+            assert "程序停頓" in audit.items[0][0] and audit.items[0][1] is None
+        else:
+            assert h.pull_stream.detector is detector
+            assert h.pull_signal["cancels"] == 40
+            s.exit_position.assert_called_once_with(SYM, "mkt_queue_pulled")
+
+    def test_consumer_gap_uses_configured_limit(self):
+        t, s, h, _ = make_trader("on", max_gap_sec=2)
+        arm(t)
+        book(t, 6, 60)
+        poll(t, 8.01)
+        assert h.pull_signal is None and not h.pull_stream.pending
+        assert h.pull_stream.detector.armed_at is None
+        s.exit_position.assert_not_called()
+
+    def test_consumer_pause_resets_all_streams_preserving_fired_signal(self):
+        from pull_runtime import PullStream
+        t, _, h, _ = make_trader()
+        arm(t)
+        book(t, 6, 60)
+        poll(t, 7)
+        signal = dict(h.pull_signal)
+        other = Holding("4923", 100)
+        other.status = Holding.TRACKING
+        other.pull_stream = PullStream(t._pull_config())
+        other.pull_stream.detector.on_book(BASE, 100)
+        other.pull_stream.book(BASE + 7, 60, 7)
+        t.holdings[other.symbol] = other
+        detector = h.pull_stream.detector
+        poll(t, 12.01)
+        assert h.pull_stream.detector is not detector
+        assert h.pull_stream.detector.armed_at is None
+        assert other.pull_stream.detector.armed_at is None and not other.pull_stream.pending
+        assert h.pull_signal == signal
+
+    def test_first_consumer_event_has_no_gap(self):
+        t, _, h, audit = make_trader()
+        book(t, 100, 100)
+        poll(t, 101)
+        assert h.pull_stream.detector.armed_at == BASE + 100
+        assert not audit.items
+
+    @pytest.mark.parametrize("boundary", ["stale", "epoch"])
+    def test_feed_boundary_poll_discards_pending_and_rewaits_grace(self, boundary):
+        t, _, h, _ = make_trader()
+        feed = SimpleNamespace(stale=False, epoch=(0, 0, 0))
+        t.subscriber = SimpleNamespace(is_stale=lambda _: feed.stale, feed_epoch=lambda _: feed.epoch)
+        arm(t)
+        book(t, 6, 60)
+        if boundary == "stale":
+            feed.stale = True
+        else:
+            feed.epoch = (0, 0, 1)
+        poll(t, 7)
+        assert h.pull_signal is None and not h.pull_stream.pending
+        assert h.pull_stream.detector.armed_at is None
+        feed.stale = False
+        book(t, 8, 100)
+        poll(t, 9)
+        book(t, 12, 60)
+        poll(t, 13)
+        assert h.pull_signal is None and h.pull_stream.detector.armed_at == BASE + 8
+        book(t, 13, 30)
+        poll(t, 14)
+        assert h.pull_signal["cancels"] == 30 and h.pull_signal["armed_s"] == 5
 
     def test_stale_and_fast_reconnect_rearm_even_first_fresh_book(self):
         t, _, h, _ = make_trader()

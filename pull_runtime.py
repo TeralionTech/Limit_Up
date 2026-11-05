@@ -77,8 +77,6 @@ class PullStream:
                                      self.cfg.trade_mult, self.cfg.min_lots, self.cfg.grace_sec)
         self.pending = deque()
         self.last_book_ts = None
-        self.last_book_mono = None
-        self.first_trade_mono = None
 
     def timestamp(self, raw, received):
         ts = exchange_time(raw)
@@ -95,14 +93,10 @@ class PullStream:
         self.epoch = epoch
 
     def book(self, ts, lots, received_mono):
-        if self.last_book_ts is not None:
-            if ts < self.last_book_ts:
-                self.reset()
-                return False
-            if (ts - self.last_book_ts > self.cfg.max_gap_sec
-                    or received_mono - self.last_book_mono > self.cfg.max_gap_sec):
-                self.reset()
-        self.last_book_ts, self.last_book_mono = ts, received_mono
+        if self.last_book_ts is not None and ts < self.last_book_ts:
+            self.reset()
+            return False
+        self.last_book_ts = ts
         self.pending.append((received_mono + self.cfg.eval_lag_sec, ts, lots))
         return True
 

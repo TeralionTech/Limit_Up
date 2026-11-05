@@ -236,10 +236,11 @@ sdk.stock.filled_history(account, "YYYYMMDD", "YYYYMMDD")
   僅一般股今日 TRACKING/PULLED、09:00 真成交之後到13:20前;處置/淘汰/放棄/純隔日賣排除。
   `Subscriber.set_handlers(with_context=True)` 傳 books/trades `time` (Unix微秒)、接收時間及連線世代;
   books 接收後延1s,只消耗交易所時間≤T的成交。缺時間時整段重置為接收時鐘,不混用;
-  斷線/世代變動/讀數間隔>5s重等arm+grace;成交超過lag只WARNING計數,不追溯;
+  斷線/世代變動仍重等arm+grace;單檔五檔安靜不重置;成交超過lag只WARNING計數,不追溯;
   同頻道未結算成交倒序則清視窗重等。`volume` 尚缺實錄單位核對,暫只累加已確認為張的 `size`。
   `POST /api/trading/pull_exit {"mode":"off|shadow|on","grace_sec":5}` (既有token保護);
-  另可設 `eval_lag_sec`、`max_gap_sec`、`fleet_nodes` (預設3)、`cutoff` (不可晚於13:20)。
+  另可設 `eval_lag_sec`、`fleet_nodes` (預設3)、`cutoff` (不可晚於13:20)。
+  `max_gap_sec` (預設5s)：消費者事件間隔超過此值視為程序停頓，重等 arm＋grace；單檔沒五檔不算。
   預設 **off**,持久化在 `output/trading_config.json` 的獨立 `pull_exit` object;不還原armed。
   shadow只WARNING/CSV;on同步 `stop_entry` → `mark_exit_on_fill` → 有曝險才 `exit_position`。
   後兩者沿用既有出場/晚成交/失敗重試保護,不改撤單或auth_final語意;純訊號每天一筆,

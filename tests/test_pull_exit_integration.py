@@ -10,7 +10,7 @@ import pytest
 
 import trading_session as ts_mod
 from fakes_cancel import fill, make_session, run_once, wait_until
-from test_pull_signal import BASE, SYM, arm, book, make_trader, poll, trade
+from test_pull_signal import BASE, SYM, arm, book, make_trader, poll, poll_between, trade
 
 
 def sells(s):
@@ -371,6 +371,58 @@ def test_legacy_subscriber_callback_signature_is_unchanged():
     assert called == [(SYM, True)]
 
 
+def test_process_pause_resets_before_poll_even_when_subscriber_stays_fresh(monkeypatch):
+    from subscriber import Subscriber
+    now = [0.0]
+    monkeypatch.setattr("subscriber.time.time", lambda: BASE + now[0])
+    monkeypatch.setattr("subscriber.time.monotonic", lambda: now[0])
+    socket = SimpleNamespace(on=Mock(), ping=Mock())
+    sub = Subscriber(None, [SYM], lambda *a: None, login_cfg=None)
+    sub._sockets = [socket]
+    sub._init_socket_health()
+    t, s, h, audit = make_trader("on")
+    t.subscriber = sub
+    sub.set_handlers(on_book=t.on_book, on_trade=t.on_trade, with_context=True)
+    handler = sub._make_msg_handler(0)
+
+    def emit(sec, channel, exchange_sec, **data):
+        now[0] = sec
+        handler({"event": "data", "channel": channel, "data": {
+            "symbol": SYM, "time": int((BASE + exchange_sec) * 1e6), **data}})
+
+    def emit_book(sec, lots):
+        emit(sec, "books", sec, bids=[{"price": 0, "size": lots}], asks=[])
+
+    for sec in (0, 2, 4, 5):
+        emit_book(sec, 100)
+        poll(t, sec + 1)
+    assert h.pull_stream.detector.armed_at == BASE
+    emit_book(6, 60)
+    assert h.pull_stream.pending and h.pull_signal is None
+    epoch = sub.feed_epoch(SYM)
+    now[0] = 12
+    sub._watchdog_once(now_m=12)
+    socket.ping.assert_called_once_with("wd")
+    assert not sub.is_stale(SYM) and sub.feed_epoch(SYM) == epoch
+    poll(t, 12)
+    assert not h.pull_stream.pending and h.pull_stream.detector.armed_at is None
+    emit(12.01, "trades", 6, price=100, size=40)
+    assert h.pull_stream.late_count == 0 and h.pull_signal is None
+    assert len(audit.items) == 1 and "程序停頓" in audit.items[0][0]
+    # The next book supplies a new baseline; reductions inside grace are ignored.
+    emit_book(12.02, 100)
+    poll(t, 13.02)
+    assert h.pull_stream.detector.armed_at == BASE + 12.02
+    emit_book(16, 60)
+    poll(t, 17)
+    assert h.pull_signal is None
+    s.exit_position.assert_not_called()
+    emit_book(17.02, 20)
+    poll(t, 18.02)
+    assert h.pull_signal["cancels"] == 40 and h.pull_signal["armed_s"] == 5
+    s.exit_position.assert_called_once_with(SYM, "mkt_queue_pulled")
+
+
 def test_message_keeps_origin_epoch_if_connection_changes_during_dispatch(monkeypatch):
     from subscriber import Subscriber
     sub = Subscriber(None, [SYM], lambda *a: None, login_cfg=None)
@@ -454,6 +506,33 @@ class TestPullApi:
             s = TradingSession(auto_cancel_worker=False)
             trading_config.restore(s)
             assert s.mode == "real" and s.pull_exit.mode == "off" and not s.armed
+
+    def test_legacy_max_gap_restores_without_quiet_book_resets(self, client):
+        import trading_config
+        from pull_signal import PullExitConfig
+        from trading_session import SymbolTrade, TradingSession
+        _, _, path = client
+        legacy = PullExitConfig(mode="shadow", max_gap_sec=0.1).to_dict()
+        path.write_text(json.dumps({"mode": "real", "pull_exit": legacy}), encoding="utf-8")
+        fresh = TradingSession(auto_cancel_worker=False)
+        applied = trading_config.restore(fresh)
+        assert applied["pull_exit"] == legacy == fresh.status()["pull_exit"]
+        assert fresh.mode == "real" and not fresh.armed
+        st = SymbolTrade(SYM, 100)
+        st.target_lots = st.filled_lots = 1
+        fresh.trades[SYM] = st
+        t, _, h, _ = make_trader(fresh.pull_exit.mode, session=fresh)
+        for sec in (0, 2, 4, 5):
+            if sec:
+                poll_between(t, previous, sec)
+            book(t, sec, 100)
+            previous = sec
+        poll_between(t, 5, 11)
+        book(t, 11, 60)
+        poll_between(t, 11, 12)
+        assert h.pull_signal["cancels"] == 40
+        assert h.pull_stream.detector.armed_at == BASE
+        assert trading_config.snapshot(fresh)["pull_exit"] == legacy
 
     def test_existing_token_middleware_protects_new_endpoint(self, client, monkeypatch):
         from test_central_token import server

@@ -20,7 +20,7 @@ class PullExitConfig:
     min_lots: float = 20.0
     grace_sec: float = 5.0
     eval_lag_sec: float = 1.0
-    max_gap_sec: float = 5.0
+    max_gap_sec: float = 5.0  # 消費者事件間隔超過此值視為程序停頓，重等 arm＋grace；單檔沒五檔不算。
     fleet_nodes: int = 3
     cutoff: str = "13:20:00"
 

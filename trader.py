@@ -106,6 +106,7 @@ class Trader:
         self.subscriber = subscriber
         self._pull_lock = threading.RLock()
         self._pull_events = PullEvents()
+        self._pull_last_event_mono = None
         self._pull_thread = None
         output_dir = getattr(cfg, "output_dir", None) or Path(__file__).parent / "output"
         self._pull_writer = pull_writer or PullSignalWriter(output_dir)
@@ -396,12 +397,6 @@ class Trader:
                 stream.reset()
                 return
             if h.pull_signal is None:
-                anchor = (stream.last_book_mono if stream.last_book_mono is not None
-                          else stream.first_trade_mono)
-                if anchor is not None and mono - anchor > cfg.max_gap_sec:
-                    stream.reset()
-                if stream.first_trade_mono is None:
-                    stream.first_trade_mono = mono
                 # Seal overdue books before accepting this print. Receipt lag
                 # is a deadline even if the evaluator was descheduled.
                 self._pull_drain(h, stream, mono)
@@ -474,6 +469,18 @@ class Trader:
         with self._pull_lock:
             while (event := self._pull_events.pop()) is not None:
                 kind, args, wall, mono = event
+                cfg = self._pull_config()
+                previous_mono = self._pull_last_event_mono
+                self._pull_last_event_mono = mono
+                if previous_mono is not None and mono - previous_mono > cfg.max_gap_sec:
+                    # Timer receipts keep this clock moving even when a symbol
+                    # has no books. Discard pre-pause readings before any drain.
+                    for holding in self.holdings.values():
+                        if holding.pull_stream is not None:
+                            holding.pull_stream.reset()
+                    self._pull_writer.submit(
+                        f"[pull] 消費者事件間隔 {mono - previous_mono:g} s 超過 "
+                        f"{cfg.max_gap_sec:g} s，程序停頓，清空視窗重新 arm＋grace")
                 if kind == "trade":
                     h, data, size, epoch = args
                     self._pull_trade(h, data, size, wall, mono, epoch)
@@ -497,9 +504,7 @@ class Trader:
                 stale, epoch = self._pull_feed(h)
                 if epoch is not None:
                     stream.check_epoch(epoch)
-                if (stale or not trading_day(wall, cfg.cutoff)
-                        or (stream.last_book_mono is not None
-                            and mono - stream.last_book_mono > cfg.max_gap_sec)):
+                if stale or not trading_day(wall, cfg.cutoff):
                     stream.reset()
                     continue
                 self._pull_drain(h, stream, mono)
